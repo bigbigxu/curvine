@@ -1,0 +1,36 @@
+[package]
+name = "curvine-fuse"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bindgen = { workspace = true }
+orpc = { workspace = true}
+curvine-common = { workspace = true }
+curvine-client = { workspace = true }
+log = { workspace = true }
+clap = { workspace = true }
+pin-project-lite = { workspace = true }
+tokio  = { workspace = true }
+tokio-util = { workspace = true }
+num_enum = { workspace = true }
+libc = { workspace = true }
+memchr = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+trait-variant = { workspace = true }
+nix = { workspace = true }
+once_cell = { workspace = true }
+mini-moka = { workspace = true }
+fxhash = { workspace = true }
+dashmap = { workspace = true }
+
+[features]
+default = ["fuse3"]
+fuse2 = []
+fuse3 = []
+
+[build-dependencies]
+pkg-config = "0.3.27"
