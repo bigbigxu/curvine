@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <defs>
+    <linearGradient id="logoGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#00d4ff;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#00ff7f;stop-opacity:1" />
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+      <feMerge> 
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/> 
+      </feMerge>
+    </filter>
+  </defs>
+  
+  <!-- Background circle -->
+  <circle cx="50" cy="50" r="45" fill="none" stroke="url(#logoGradient)" stroke-width="2" opacity="0.3"/>
+  
+  <!-- Main logo shape - representing distributed cache nodes -->
+  <g filter="url(#glow)">
+    <!-- Central node -->
+    <circle cx="50" cy="50" r="8" fill="url(#logoGradient)"/>
+    
+    <!-- Surrounding nodes -->
+    <circle cx="30" cy="30" r="6" fill="#00d4ff"/>
+    <circle cx="70" cy="30" r="6" fill="#00d4ff"/>
+    <circle cx="30" cy="70" r="6" fill="#00ff7f"/>
+    <circle cx="70" cy="70" r="6" fill="#00ff7f"/>
+    
+    <!-- Connection lines -->
+    <line x1="50" y1="50" x2="30" y2="30" stroke="url(#logoGradient)" stroke-width="2" opacity="0.7"/>
+    <line x1="50" y1="50" x2="70" y2="30" stroke="url(#logoGradient)" stroke-width="2" opacity="0.7"/>
+    <line x1="50" y1="50" x2="30" y2="70" stroke="url(#logoGradient)" stroke-width="2" opacity="0.7"/>
+    <line x1="50" y1="50" x2="70" y2="70" stroke="url(#logoGradient)" stroke-width="2" opacity="0.7"/>
+    
+    <!-- Cross connections -->
+    <line x1="30" y1="30" x2="70" y2="30" stroke="#00d4ff" stroke-width="1" opacity="0.5"/>
+    <line x1="30" y1="70" x2="70" y2="70" stroke="#00ff7f" stroke-width="1" opacity="0.5"/>
+    <line x1="30" y1="30" x2="30" y2="70" stroke="url(#logoGradient)" stroke-width="1" opacity="0.5"/>
+    <line x1="70" y1="30" x2="70" y2="70" stroke="url(#logoGradient)" stroke-width="1" opacity="0.5"/>
+  </g>
+  
+  <!-- Brand text -->
+  <text x="50" y="90" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" font-weight="bold" fill="url(#logoGradient)">CURVINE</text>
+</svg>
