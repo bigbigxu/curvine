@@ -1,0 +1,43 @@
+[package]
+name = "orpc"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance network communication framework."
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+tokio-util = { workspace = true }
+bytes ={ workspace = true }
+libc = { workspace = true }
+rand = { workspace = true }
+murmur3 = { workspace = true }
+once_cell = { workspace = true }
+crc32fast = { workspace = true }
+socket2 = { workspace = true }
+prost = { workspace = true }
+prost-build = { workspace = true }
+num_enum = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+log = { workspace = true }
+pin-project-lite = { workspace = true }
+prometheus = { workspace = true }
+sysinfo = { workspace = true }
+fs2 = { workspace = true }
+toml = { workspace = true }
+uuid = { workspace = true }
+axum = { workspace = true }
+thiserror = { workspace = true }
+mini-moka = { workspace = true }
+bincode = { workspace = true }
+crossbeam = { workspace = true }
+dashmap = { workspace = true }
+tracing-log = { workspace = true }
+fxhash = { workspace = true }
+moka = { workspace = true }
