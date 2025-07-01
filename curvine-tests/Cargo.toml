@@ -1,0 +1,20 @@
+[package]
+name = "curvine-tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+orpc = { workspace = true }
+curvine-common = { workspace = true }
+curvine-server = { workspace = true }
+curvine-client = { workspace = true }
+curvine-fuse = { workspace = true }
+curvine-ufs = { workspace = true }
+tokio  = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+log = { workspace = true }
+bytes = { workspace = true }
+once_cell = { workspace = true }
+clap = { workspace = true }

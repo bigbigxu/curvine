@@ -1,0 +1,58 @@
+
+# Whether to format it.
+# master formatting will delete rocksdb metadata
+# Worker formatting will delete the data directory.
+format_master = false
+format_worker = false
+
+
+# master configuration
+[master]
+meta_dir = "testing/meta"
+log = { level = "info", log_dir = "stdout", file_name = "master.log" }
+
+# master loading function configuration
+[master.load]
+job_ttl_seconds = 1209600
+job_cleanup_interval_seconds = 7200
+
+
+# masta ha raft configuration.
+[journal]
+journal_addrs = [
+    {id = 1, hostname = "localhost", port = 8996}
+]
+journal_dir = "testing/journal"
+
+
+# Worker configuration
+[worker]
+dir_reserved = "0"
+data_dir = [
+    "[DISK]testing/data",
+]
+log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
+
+# Worker loading function configuration
+[worker.load]
+task_status_report_interval_ms = 2000
+task_read_chunk_size_bytes = 2097152
+task_transfer_buffer_count = 32
+task_timeout_seconds = 7200
+
+
+# Customer service configuration.
+[client]
+master_addrs = [
+    { hostname = "localhost", port = 8995 }
+]
+
+
+# fuse configuration
+[fuse]
+
+# The log configuration of the customer service side, and the customer service side of rust, java, and fuse use this log file.
+[log]
+level = "info"
+log_dir = "stdout"
+file_name = "curvine.log"
