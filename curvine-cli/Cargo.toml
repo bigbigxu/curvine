@@ -1,0 +1,17 @@
+[package]
+name = "curvine-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+orpc = { workspace = true }
+curvine-common = { workspace = true }
+curvine-client = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_with = { workspace = true }
+num-bigint = { workspace = true }
+bigdecimal = { workspace = true }
+chrono = { workspace = true }
