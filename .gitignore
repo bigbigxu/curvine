@@ -1,0 +1,15 @@
+target/
+testing/
+.idea/
+.vscode
+resources/
+glacier-cache.iml
+Cargo.lock
+*.patch
+*.iml
+*.iws
+/test
+/journal
+/fs-meta
+curvine-libsdk/java/native
+build/dist/
