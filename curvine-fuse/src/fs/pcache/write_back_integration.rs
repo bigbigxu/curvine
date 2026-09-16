@@ -397,13 +397,16 @@ fn write_back_worker_flush_reclaims_clean_pages_and_keeps_reads_correct() {
         );
 
         // A later read misses the reclaimed pages and republishes through the
-        // writer, which must still surface the flushed bytes from the backend.
-        let published = cache
-            .publish_read_range(0, PAGE_SIZE as usize, 0)
+        // writer. Publishing bumps the inode block-list generation, which is the
+        // signal a cached reader reopens on.
+        let before = ctx.state.locs_epoch(Some(ino)).expect("inode is cached");
+        cache
+            .publish_read_range(0, PAGE_SIZE as usize)
             .await
             .unwrap();
+        let after = ctx.state.locs_epoch(Some(ino)).expect("inode is cached");
         assert!(
-            published.is_some(),
+            after > before,
             "read after reclaim should publish a snapshot"
         );
 
@@ -413,7 +416,7 @@ fn write_back_worker_flush_reclaims_clean_pages_and_keeps_reads_correct() {
 }
 
 #[test]
-fn write_back_dirty_read_range_snapshot_tracks_backend_versions() {
+fn write_back_dirty_read_range_publishes_each_dirty_range() {
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -426,24 +429,44 @@ fn write_back_dirty_read_range_snapshot_tracks_backend_versions() {
         ctx.write_via_fuse(&handle, PAGE_SIZE, b"tail").await;
 
         let cache = ctx.cm.get_cache(handle.ino()).await.unwrap();
-        let first_ver = cache
-            .publish_read_range(0, 4, 0)
-            .await
-            .unwrap()
-            .expect("first range flush should publish");
 
-        let unchanged_ver = cache.publish_read_range(0, 4, first_ver).await.unwrap();
-        assert_eq!(unchanged_ver, None);
+        let before = ctx
+            .state
+            .locs_epoch(Some(handle.ino()))
+            .expect("inode cached");
+        cache.publish_read_range(0, 4).await.unwrap();
+        let after_head = ctx
+            .state
+            .locs_epoch(Some(handle.ino()))
+            .expect("inode cached");
+        assert!(after_head > before, "first range flush should publish");
 
-        let second_ver = cache
-            .publish_read_range(PAGE_SIZE, 4, first_ver)
-            .await
-            .unwrap()
-            .expect("second range flush should publish");
+        // The range is already clean and published: publishing again must not
+        // bump the generation.
+        cache.publish_read_range(0, 4).await.unwrap();
+        assert_eq!(
+            ctx.state.locs_epoch(Some(handle.ino())),
+            Some(after_head),
+            "an already published range must not publish again"
+        );
 
+        // The tail page still needs its own publish.
+        cache.publish_read_range(PAGE_SIZE, 4).await.unwrap();
+        let after_tail = ctx
+            .state
+            .locs_epoch(Some(handle.ino()))
+            .expect("inode cached");
+        assert!(after_tail > after_head, "second range flush should publish");
+
+        // A global flush commits everything that is queued and leaves nothing
+        // for a later range read to publish.
         cache.flush().await.unwrap();
-        let after_global_ver = cache.publish_read_range(0, 4, second_ver).await.unwrap();
-        assert_eq!(after_global_ver, None);
+        cache.publish_read_range(0, 4).await.unwrap();
+        assert_eq!(
+            ctx.state.locs_epoch(Some(handle.ino())),
+            Some(after_tail),
+            "global flush should leave nothing to publish"
+        );
 
         let mut expected = vec![0; PAGE_SIZE as usize + 4];
         expected[..4].copy_from_slice(b"head");
@@ -838,16 +861,24 @@ fn write_back_dirty_read_range_snapshot_publishes_enospc_write_through() {
         let cache = ctx.cm.get_cache(handle.ino()).await.unwrap();
         assert_eq!(cache.page_len(), 0);
 
-        let flush_ver = cache
-            .publish_read_range(0, 6, 0)
-            .await
-            .unwrap()
-            .expect("write-through should publish");
+        let before = ctx
+            .state
+            .locs_epoch(Some(handle.ino()))
+            .expect("inode cached");
+        cache.publish_read_range(0, 6).await.unwrap();
+        let after = ctx
+            .state
+            .locs_epoch(Some(handle.ino()))
+            .expect("inode cached");
+        assert!(after > before, "write-through should publish");
         assert_backend_eq(&backend, b"direct");
 
+        // Nothing new was queued, so a second call must not publish again.
+        cache.publish_read_range(0, 6).await.unwrap();
         assert_eq!(
-            cache.publish_read_range(0, 6, flush_ver).await.unwrap(),
-            None
+            ctx.state.locs_epoch(Some(handle.ino())),
+            Some(after),
+            "an unchanged range must not publish again"
         );
     });
 }

@@ -14,7 +14,7 @@
 
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_model::{CreateFileOpts, FileAllocOpts, FileStatus, LockFlags, OpenFlags};
-use curvine_runtime::sync::{AsyncMutex, AtomicCounter};
+use curvine_runtime::sync::{AsyncMutex, AtomicBool};
 use std::sync::{Arc, Mutex};
 
 use crate::fs::operator::{Read, Write};
@@ -37,7 +37,7 @@ pub struct CacheHandle {
     pub reader: AsyncMutex<Option<FuseReader>>,
 
     fh_locks: Mutex<HandleLock>,
-    read_ver: AtomicCounter,
+    stale: AtomicBool,
 }
 
 impl CacheHandle {
@@ -58,7 +58,7 @@ impl CacheHandle {
             opts,
             reader: AsyncMutex::new(None),
             fh_locks: Mutex::new(HandleLock::default()),
-            read_ver: AtomicCounter::new(0),
+            stale: AtomicBool::new(false),
         }
     }
 
@@ -90,26 +90,19 @@ impl CacheHandle {
         }
 
         let mut lock = self.reader.lock().await;
-        let read_ver = self.read_ver.get();
-        let published_ver = self
-            .cache
-            .publish_read_range(op.arg.offset, op.arg.size as usize, read_ver)
+        self.cache
+            .publish_read_range(op.arg.offset, op.arg.size as usize)
             .await?;
+        let reopen = self.stale.get() && self.stale.compare_and_set(true, false);
         let reader = match lock.as_mut() {
-            Some(r) if published_ver.is_none() => r,
+            Some(r) if !reopen => r,
 
             _ => {
-                state.invalidate_file_blocks(self.ino);
-
                 let path = state.get_path(self.ino)?;
                 let reader = state.open_reader(Some(self.ino), &path).await?;
-                if let Some(snapshot_ver) = published_ver {
-                    self.read_ver.set(snapshot_ver);
-                }
                 lock.insert(reader)
             }
         };
-
         reader.read(op, reply).await?;
         Ok(())
     }
@@ -160,6 +153,10 @@ impl CacheHandle {
 
     pub fn status(&self) -> &FileStatus {
         &self.status
+    }
+
+    pub fn mark_stale(&self) {
+        self.stale.set(true);
     }
 
     pub fn add_lock(&self, lock_flags: LockFlags, owner_id: u64) {
@@ -243,7 +240,7 @@ impl CacheHandle {
             opts,
             reader: AsyncMutex::new(None),
             fh_locks: Mutex::new(locks),
-            read_ver: AtomicCounter::new(0),
+            stale: AtomicBool::new(false),
         })
     }
 }
