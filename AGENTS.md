@@ -68,6 +68,12 @@ Usage notes:
 </skill>
 
 <skill>
+<name>cv-error-inject</name>
+<description>Build a multi-instance Curvine deployment (3 master / 3 transfer / 5 worker) on one host and run fault-injection rounds against it. Use when verifying transfer resilience, killing transfer instances or workers mid-job, checking failover/takeover behaviour, or reproducing a fault-tolerance claim before review.</description>
+<location>project</location>
+</skill>
+
+<skill>
 <name>cv-handle-issue</name>
 <description>Fix a Curvine GitHub issue from analysis through plan approval to implementation, routing large features to cv-tasks-breakdown. Use when user asks to fix, resolve, or implement a specific issue URL or issue number.</description>
 <location>project</location>
