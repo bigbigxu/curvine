@@ -173,6 +173,7 @@ fn all_variant_batch() -> JournalBatch {
                     lock_flags: LockFlags::Flock,
                     start: 0,
                     end: 100,
+                    session_owned: false,
                 }],
             }),
             JournalEntry::Free(FreeEntry {
