@@ -66,4 +66,5 @@ pub mod space;
 pub type MetaRaftJournal = RaftJournal<RocksLogStorage, JournalLoader>;
 pub type SyncFsDir = ArcRwLock<FsDir>;
 pub type SyncWorkerManager = ArcRwLock<WorkerManager>;
+pub type SyncSessionMap = ArcRwLock<fs::state::SessionMap>;
 pub use mount::MountManager;

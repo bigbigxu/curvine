@@ -38,6 +38,7 @@ use raft::eraftpb::Entry;
 use raft::Storage;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 // Send and replay metadata operation logs based on raft.
@@ -301,7 +302,11 @@ impl JournalSystem {
         }
 
         let role_monitor = RoleMonitor::new();
-        let master_monitor = MasterMonitor::new(role_monitor.read_ctl(), StateCtl::new(0));
+        // The session lease epoch follows the raft term: the journal loader
+        // publishes it here and the leader-side session paths adopt it (#1883).
+        let term = Arc::new(AtomicU64::new(0));
+        let master_monitor =
+            MasterMonitor::with_term(role_monitor.read_ctl(), StateCtl::new(0), term.clone());
         let parts = Self::build_fs_parts(conf, rt.clone(), master_monitor.clone())?;
 
         let raft_journal = MetaRaftJournal::new(
@@ -317,6 +322,7 @@ impl JournalSystem {
                 parts.journal_writer.clone(),
                 parts.worker_manager.clone(),
                 master_monitor.recovery(),
+                term,
             )?,
             conf.journal.clone(),
             role_monitor,

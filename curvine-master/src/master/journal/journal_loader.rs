@@ -41,7 +41,7 @@ use raft::eraftpb::{Entry, EntryType};
 use raft::StateRole;
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use std::{fs, mem};
@@ -79,6 +79,9 @@ pub struct JournalLoader {
     retry_interval: Duration,
     metrics: &'static MasterMetrics,
     has_apply_worker: bool,
+    /// Shared raft-term handle, so the session lease epoch follows election
+    /// instead of process start (#1883 review).
+    term: Arc<AtomicU64>,
 }
 
 impl JournalLoader {
@@ -107,6 +110,7 @@ impl JournalLoader {
             worker_manager,
             recovery,
             true,
+            Arc::new(AtomicU64::new(0)),
         )
     }
 
@@ -121,6 +125,7 @@ impl JournalLoader {
         journal_writer: Arc<JournalWriter>,
         worker_manager: SyncWorkerManager,
         recovery: RecoveryGate,
+        term: Arc<AtomicU64>,
     ) -> CommonResult<Self> {
         Self::build(
             rt,
@@ -133,6 +138,7 @@ impl JournalLoader {
             worker_manager,
             recovery,
             false,
+            term,
         )
     }
 
@@ -148,6 +154,7 @@ impl JournalLoader {
         worker_manager: SyncWorkerManager,
         recovery: RecoveryGate,
         testing: bool,
+        term: Arc<AtomicU64>,
     ) -> CommonResult<Self> {
         // Install the fs_mode release gate before anything can serve a release:
         // with transfer enabled the replayer no longer waits for exports, so an
@@ -182,6 +189,7 @@ impl JournalLoader {
             retry_interval: Duration::from_secs(conf.retry_interval_secs),
             metrics: Master::get_metrics()?,
             has_apply_worker: !testing,
+            term,
         };
 
         loader.refresh_metrics()?;
@@ -1630,6 +1638,9 @@ impl AppStorage for JournalLoader {
     fn hard_state_changed(&self, state: &raft::eraftpb::HardState) {
         self.metrics.journal_committed.set(state.commit as i64);
         self.metrics.journal_term.set(state.term as i64);
+        // Every persisted term moves the lease epoch forward; a promotion always
+        // carries a higher term than the leadership it replaces.
+        self.term.store(state.term, Ordering::Release);
     }
 
     async fn role_change(&self, role: StateRole) -> RaftResult<()> {

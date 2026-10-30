@@ -214,6 +214,13 @@ pub struct MasterConf {
     #[serde(skip)]
     pub lock_expire_time_unit: DurationUnit,
 
+    // Client session lease: a client session that has not sent a ClientHeartbeat
+    // within this window is considered expired. Should be several times the
+    // client heartbeat interval (default 12s).
+    pub client_session_timeout: String,
+    #[serde(skip)]
+    pub client_session_timeout_unit: DurationUnit,
+
     pub buffer_size: usize,
 
     pub conn_limit: usize,
@@ -275,6 +282,10 @@ impl MasterConf {
         self.lock_expire_time_unit = DurationUnit::from_str(&self.lock_expire_time)?;
 
         self.dir_space.init()?;
+        self.client_session_timeout_unit = DurationUnit::from_str(&self.client_session_timeout)?;
+        if self.client_session_timeout_unit.as_millis() == 0 {
+            return err_box!("client_session_timeout must be greater than zero");
+        }
 
         if self.heartbeat_interval_unit > self.worker_stale_interval_unit {
             return err_box!("Worker_stale_interval must be greater than heartbeat_interval");
@@ -422,6 +433,10 @@ impl MasterConf {
         self.lock_expire_time_unit.as_millis()
     }
 
+    pub fn client_session_timeout_ms(&self) -> u64 {
+        self.client_session_timeout_unit.as_millis()
+    }
+
     pub fn trash_retention_ms(&self) -> u64 {
         self.trash_retention_unit.as_millis()
     }
@@ -566,6 +581,9 @@ impl Default for MasterConf {
 
             lock_expire_time: "5m".to_string(),
             lock_expire_time_unit: Default::default(),
+
+            client_session_timeout: "60s".to_string(),
+            client_session_timeout_unit: Default::default(),
 
             buffer_size: 128 * 1024,
 
@@ -795,5 +813,28 @@ mod tests {
         assert!(error
             .to_string()
             .contains("trash_check_interval must be greater than zero"));
+    }
+
+    #[test]
+    fn client_session_timeout_defaults_to_sixty_seconds() {
+        let mut conf = MasterConf::default();
+        conf.init().unwrap();
+
+        assert_eq!(conf.client_session_timeout_ms(), 60_000);
+    }
+
+    #[test]
+    fn client_session_timeout_must_be_positive() {
+        let mut conf = MasterConf {
+            client_session_timeout: "0s".to_string(),
+            ..Default::default()
+        };
+
+        let error = conf
+            .init()
+            .expect_err("zero client session timeout must be rejected");
+        assert!(error
+            .to_string()
+            .contains("client_session_timeout must be greater than zero"));
     }
 }

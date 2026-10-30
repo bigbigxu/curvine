@@ -20,3 +20,8 @@ pub use self::worker_intent::{WorkerIntent, WorkerIntentTable};
 
 mod block_map;
 pub use self::block_map::BlockMap;
+
+mod session_map;
+pub use self::session_map::{
+    monotonic_ms, ClientSession, SessionHeartbeat, SessionMap, DEFAULT_CLIENT_SESSION_TIMEOUT_MS,
+};
