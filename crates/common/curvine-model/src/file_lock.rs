@@ -105,6 +105,13 @@ pub struct FileLock {
     pub lock_flags: LockFlags,
     pub start: u64,
     pub end: u64,
+    /// The owner keeps a client session lease alive (it sends `ClientHeartbeat`),
+    /// so this lock is reclaimed by session expiry instead of `lock_expire_time`.
+    ///
+    /// Set by the client at the `SetLock` boundary; a client that does not send
+    /// heartbeats leaves it `false` and keeps the legacy TTL behaviour.
+    #[serde(default)]
+    pub session_owned: bool,
 }
 
 impl Encode for FileLock {
@@ -117,22 +124,37 @@ impl Encode for FileLock {
         self.lock_type.encode(writer)?;
         self.lock_flags.encode(writer)?;
         writer.put_u64(self.start)?;
-        writer.put_u64(self.end)
+        writer.put_u64(self.end)?;
+        writer.put_u8(u8::from(self.session_owned))
     }
 }
 
 impl Decode for FileLock {
     #[inline(always)]
     fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        let client_id = String::decode(reader)?;
+        let owner_id = reader.get_u64()?;
+        let pid = reader.get_u32()?;
+        let acquire_time = reader.get_u64()?;
+        let lock_type = LockType::decode(reader)?;
+        let lock_flags = LockFlags::decode(reader)?;
+        let start = reader.get_u64()?;
+        let end = reader.get_u64()?;
+        let session_owned = if reader.is_empty() {
+            false
+        } else {
+            reader.get_u8()? != 0
+        };
         Ok(Self {
-            client_id: String::decode(reader)?,
-            owner_id: reader.get_u64()?,
-            pid: reader.get_u32()?,
-            acquire_time: reader.get_u64()?,
-            lock_type: LockType::decode(reader)?,
-            lock_flags: LockFlags::decode(reader)?,
-            start: reader.get_u64()?,
-            end: reader.get_u64()?,
+            client_id,
+            owner_id,
+            pid,
+            acquire_time,
+            lock_type,
+            lock_flags,
+            start,
+            end,
+            session_owned,
         })
     }
 }

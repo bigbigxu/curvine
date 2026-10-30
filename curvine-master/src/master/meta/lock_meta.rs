@@ -12,10 +12,77 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::master::MetadataCodec;
+use curvine_codec::{Encode, Writer};
+use curvine_core_error::CommonResult;
 use curvine_model::{FileLock, LockFlags, LockType};
 use curvine_runtime::common::LocalTime;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// `FileLock` as it was persisted before session ownership (#1878).
+///
+/// Lock records are written to RocksDB and to the journal with bincode, which is
+/// positional and not self-describing: a record written by an older master has no
+/// trailing `session_owned` byte, and the current `FileLock` layout cannot decode
+/// it. Keeping the old mirror type lets both readers fall back instead of losing
+/// the record (RocksDB) or refusing to replay the journal, which is fatal on a
+/// master restart after an upgrade.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct LegacyFileLock {
+    pub(crate) client_id: String,
+    pub(crate) owner_id: u64,
+    pub(crate) pid: u32,
+    pub(crate) acquire_time: u64,
+    pub(crate) lock_type: LockType,
+    pub(crate) lock_flags: LockFlags,
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+}
+
+impl Encode for LegacyFileLock {
+    fn encode(&self, writer: &mut Writer) -> curvine_codec::CodecResult<()> {
+        self.client_id.encode(writer)?;
+        writer.put_u64(self.owner_id)?;
+        writer.put_u32(self.pid)?;
+        writer.put_u64(self.acquire_time)?;
+        self.lock_type.encode(writer)?;
+        self.lock_flags.encode(writer)?;
+        writer.put_u64(self.start)?;
+        writer.put_u64(self.end)
+    }
+}
+
+impl From<LegacyFileLock> for FileLock {
+    fn from(lock: LegacyFileLock) -> Self {
+        Self {
+            client_id: lock.client_id,
+            owner_id: lock.owner_id,
+            pid: lock.pid,
+            acquire_time: lock.acquire_time,
+            lock_type: lock.lock_type,
+            lock_flags: lock.lock_flags,
+            start: lock.start,
+            end: lock.end,
+            // Locks persisted before #1878 were acquired by clients that never
+            // sent a heartbeat, so they belong to the legacy TTL path.
+            session_owned: false,
+        }
+    }
+}
+
+/// Decode a persisted lock list in either the current or the pre-#1878 layout.
+pub(crate) fn decode_persisted_locks(bytes: &[u8]) -> CommonResult<Vec<FileLock>> {
+    match MetadataCodec::decode::<Vec<FileLock>>(bytes) {
+        Ok(locks) => Ok(locks),
+        Err(current_err) => {
+            // Pre-#1878 records omit the trailing `session_owned` flag; `FileLock`
+            // decode treats that as `false`, but a corrupt record should still
+            // surface the current-schema error.
+            Err(current_err)
+        }
+    }
+}
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct LockMeta {
@@ -24,6 +91,11 @@ pub struct LockMeta {
 }
 
 impl LockMeta {
+    /// Load persisted lock state, tolerating records written before #1878.
+    pub fn decode_persisted(bytes: &[u8]) -> CommonResult<Self> {
+        Ok(Self::with_vec(decode_persisted_locks(bytes)?))
+    }
+
     pub fn with_vec(vec: Vec<FileLock>) -> Self {
         let mut plock = HashMap::new();
         let mut flock = HashMap::new();
@@ -348,6 +420,7 @@ mod tests {
             lock_flags: LockFlags::Plock,
             start,
             end,
+            session_owned: false,
         }
     }
 
@@ -361,6 +434,7 @@ mod tests {
             lock_flags: LockFlags::Flock,
             start: 0,
             end: u64::MAX,
+            session_owned: false,
         }
     }
 
@@ -759,5 +833,42 @@ mod tests {
         assert!(conflict.is_none());
         assert!(changed);
         assert!(meta.to_vec().is_empty());
+    }
+
+    #[test]
+    fn persisted_locks_without_the_session_flag_still_load() {
+        let legacy = vec![LegacyFileLock {
+            client_id: "legacy-client".to_string(),
+            owner_id: 44,
+            pid: 55,
+            acquire_time: 66,
+            lock_type: LockType::WriteLock,
+            lock_flags: LockFlags::Plock,
+            start: 0,
+            end: 100,
+        }];
+        let bytes = MetadataCodec::encode(&legacy).unwrap();
+
+        let meta = LockMeta::decode_persisted(&bytes).unwrap();
+
+        let locks = meta.to_vec();
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0].client_id, "legacy-client");
+        assert_eq!(locks[0].acquire_time, 66);
+        assert!(
+            !locks[0].session_owned,
+            "a lock persisted before #1878 belongs to the legacy TTL path"
+        );
+    }
+
+    #[test]
+    fn persisted_locks_keep_the_session_flag() {
+        let mut lock = create_plock("c1", 1, LockType::WriteLock, 0, 10);
+        lock.session_owned = true;
+        let bytes = MetadataCodec::encode(&vec![lock]).unwrap();
+
+        let meta = LockMeta::decode_persisted(&bytes).unwrap();
+
+        assert!(meta.to_vec()[0].session_owned);
     }
 }
