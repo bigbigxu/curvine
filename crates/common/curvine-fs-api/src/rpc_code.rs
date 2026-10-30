@@ -106,8 +106,9 @@ pub enum RpcCode {
 
     // main-next remapped trash to 70-72; community uses 70 for CreateLeaderSnapshot.
     CreateLeaderSnapshot = 73,
+    // Community uses 59; main-next already assigned 59 to GetFileBlockDetails.
+    ClientHeartbeat = 74,
 
-    ClientHeartbeat = 59,
     MetricsReport = 60,
     GetBlockLocationsBatch = 61,
     UpdateRuntimeConfig = 62,
