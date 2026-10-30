@@ -151,7 +151,9 @@ impl SqlDiscovery {
         }
     }
 
-    fn list_live(&self, kind: &ServiceKind) -> DiscoveryResult<Vec<ServiceEndpoint>> {
+    /// Live endpoints of `kind`. Synchronous on purpose: callers inside an
+    /// async task must not build a nested runtime to query the registry.
+    pub fn list_live(&self, kind: &ServiceKind) -> DiscoveryResult<Vec<ServiceEndpoint>> {
         let mut conn = self.conn()?;
         let rows: Vec<(String, String, u16, Option<u16>, i64)> = conn
             .exec(
@@ -285,6 +287,12 @@ impl RegistrationControl for SqlRegistrationControl {
         self._hb.abort();
         self.discovery.deregister(&self.kind, &self.instance_id);
         Ok(())
+    }
+}
+
+impl crate::LiveEndpoints for SqlDiscovery {
+    fn live_endpoints(&self, kind: &ServiceKind) -> DiscoveryResult<Vec<ServiceEndpoint>> {
+        self.list_live(kind)
     }
 }
 

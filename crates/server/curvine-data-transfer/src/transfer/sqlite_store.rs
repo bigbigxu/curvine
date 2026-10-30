@@ -705,6 +705,10 @@ impl TransferStore for SqliteTransferStore {
         } else {
             None
         };
+        // True when the candidate is a renewal by the current owner, not a
+        // takeover of somebody else's expired lease. Set once from the renewal
+        // query below; the fallback queries are never renewals.
+        let renewal = candidate.is_some();
         if candidate.is_none() {
             candidate = tx
                 .query_row(
@@ -781,6 +785,17 @@ impl TransferStore for SqliteTransferStore {
         }
 
         let new_epoch = lease_epoch.saturating_add(1);
+        // Only a takeover of an expired lease on an executing job counts;
+        // ordinary renewals by the same owner must not inflate the counter.
+        let mut takeover_count = record.takeover_count;
+        if !renewal
+            && matches!(
+                TransferState::from(state as i32),
+                TransferState::Dispatching | TransferState::Running
+            )
+        {
+            takeover_count = takeover_count.saturating_add(1);
+        }
         let new_state = if state == TransferState::Pending as i64 {
             TransferState::Planning as i32
         } else {
@@ -804,7 +819,7 @@ impl TransferStore for SqliteTransferStore {
             .execute(
                 "update transfer_jobs
                  set state = ?1, owner = ?2, lease_epoch = ?3, lease_expire_at = ?4,
-                     summary_json = ?5, updated_at = ?6
+                     summary_json = ?5, updated_at = ?6, takeover_count = ?10
                  where job_id = ?7 and run_id = ?8 and lease_epoch = ?9",
                 params![
                     new_state,
@@ -815,7 +830,8 @@ impl TransferStore for SqliteTransferStore {
                     now_ms,
                     job_id,
                     run_id,
-                    lease_epoch
+                    lease_epoch,
+                    takeover_count as i64
                 ],
             )
             .map_err(sqlite_err)?;
@@ -1611,11 +1627,15 @@ impl TransferStore for SqliteTransferStore {
             .map_err(|_| FsError::common("Unable to encode transfer counts"))?;
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(sqlite_err)?;
+        // First writer wins for the whole row, matching MySQL/Postgres. Keeping
+        // the guard on the terminal columns only would let a later empty
+        // snapshot zero `summary_json` while `terminal_*` retained the real
+        // numbers, so the list and the detail view would disagree.
         tx.execute(
             "update transfer_jobs
-             set summary_json = ?1, terminal_summary_json = coalesce(terminal_summary_json, ?1),
-                 terminal_counts_json = coalesce(terminal_counts_json, ?2), updated_at = ?3
-             where job_id = ?4 and run_id = ?5",
+             set summary_json = ?1, terminal_summary_json = ?1,
+                 terminal_counts_json = ?2, updated_at = ?3
+             where job_id = ?4 and run_id = ?5 and terminal_summary_json is null",
             params![
                 transfer_progress_json(&summary)?,
                 counts_json,
@@ -1720,7 +1740,8 @@ fn create_base_tables(conn: &Connection) -> FsResult<()> {
             submitter text not null,
             tenant text not null,
             created_at integer not null,
-            updated_at integer not null
+            updated_at integer not null,
+            takeover_count integer not null default 0
         );
         create table if not exists transfer_cleanup_lease (
             id integer primary key check (id = 1),
@@ -2270,6 +2291,9 @@ fn sqlite_job_row(row: &Row<'_>) -> rusqlite::Result<TransferJobRecord> {
         cluster_snapshot_version: row.get::<_, i64>(9)? as u64,
         mount_snapshot_attempts: row.get::<_, i64>(10)? as u32,
         planning_attempts: row.get::<_, i64>(11)? as u32,
+        // SQLite keeps the whole record as columns; takeovers ride in the JSON
+        // payload below, so reload them from it.
+        takeover_count: takeover_from_row(row),
         cv_metadata_epoch: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
         state: TransferState::from(row.get::<_, i32>(13)?),
         owner: row.get(14)?,
@@ -2289,6 +2313,13 @@ fn sqlite_job_row(row: &Row<'_>) -> rusqlite::Result<TransferJobRecord> {
         created_at: row.get(22)?,
         updated_at: row.get(23)?,
     })
+}
+
+/// Takeover counter column, absent on databases older than the migration.
+fn takeover_from_row(row: &Row<'_>) -> u32 {
+    row.get::<_, Option<i64>>(26)
+        .unwrap_or_default()
+        .unwrap_or(0) as u32
 }
 
 fn list_filter_sqlite_params(filter: &TransferListFilter) -> (String, Vec<SqliteValue>) {

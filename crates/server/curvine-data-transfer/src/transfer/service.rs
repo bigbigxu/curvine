@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 use crossbeam::channel;
@@ -89,8 +88,6 @@ pub struct TransferService<S> {
     auto_repair_last_attempt_ms: Arc<Mutex<HashMap<String, i64>>>,
     /// File-level task state (None = every task lives in the store).
     task_cache: Option<Arc<TaskCache>>,
-    /// Cached discovery topology version, piggybacked onto report acks.
-    topology_version: Arc<AtomicI64>,
 }
 
 impl<S> Clone for TransferService<S> {
@@ -102,7 +99,6 @@ impl<S> Clone for TransferService<S> {
             report_dispatcher: self.report_dispatcher.clone(),
             auto_repair_last_attempt_ms: self.auto_repair_last_attempt_ms.clone(),
             task_cache: self.task_cache.clone(),
-            topology_version: self.topology_version.clone(),
         }
     }
 }
@@ -119,7 +115,6 @@ where
             report_dispatcher: None,
             auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
             task_cache: None,
-            topology_version: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -132,7 +127,6 @@ where
             report_dispatcher: None,
             auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
             task_cache: None,
-            topology_version: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -156,7 +150,6 @@ where
             )?),
             auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
             task_cache: None,
-            topology_version: Arc::new(AtomicI64::new(0)),
         })
     }
 
@@ -173,7 +166,6 @@ where
             report_dispatcher: None,
             auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
             task_cache: None,
-            topology_version: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -198,7 +190,6 @@ where
             )?),
             auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
             task_cache: None,
-            topology_version: Arc::new(AtomicI64::new(0)),
         })
     }
 
@@ -286,6 +277,7 @@ where
             cluster_snapshot_version: 0,
             mount_snapshot_attempts: 0,
             planning_attempts: 0,
+            takeover_count: 0,
             terminal_summary: None,
             terminal_counts: None,
             cv_metadata_epoch: None,
@@ -509,16 +501,6 @@ where
         Ok(())
     }
 
-    /// Shares the discovery topology version with report responses. 0 means
-    /// discovery is off, and the worker then ignores the field.
-    pub fn with_topology_version(&mut self, version: Arc<AtomicI64>) {
-        self.topology_version = version;
-    }
-
-    pub fn topology_version(&self) -> i64 {
-        self.topology_version.load(Ordering::Relaxed)
-    }
-
     /// Store summary merged with the file-level task cache.
     fn task_summary(&self, job_id: &str, run_id: u64) -> FsResult<TransferTaskSummary> {
         let store = self
@@ -580,6 +562,7 @@ where
                 } else {
                     TRANSFER_PROTOCOL_VERSION
                 }),
+                forwarded: None,
             },
             false,
         )
@@ -1845,6 +1828,7 @@ pub fn job_to_proto(job: TransferJobRecord) -> TransferJobStatusProto {
         lease_epoch: Some(job.lease_epoch),
         lease_expire_at: Some(job.lease_expire_at),
         cv_metadata_epoch: job.cv_metadata_epoch,
+        takeover_count: Some(job.takeover_count),
     }
 }
 

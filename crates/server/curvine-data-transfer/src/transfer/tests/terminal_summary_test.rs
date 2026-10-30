@@ -49,6 +49,7 @@ fn failed_job(
         created_at: 0,
         updated_at: 0,
         planning_attempts: 0,
+        takeover_count: 0,
         terminal_summary,
         terminal_counts,
     }
@@ -107,4 +108,56 @@ fn status_keeps_job_message_when_terminal_snapshot_is_missing() {
     assert_eq!(progress.message, message);
     assert_eq!(counts, TransferTaskCounts::default());
     assert!(expired);
+}
+
+/// A re-plan that finds every target already canonical (failover, repeated
+/// load) must report the files it skipped, not a zero-progress terminal state
+/// that reads as "copied nothing".
+#[test]
+fn incremental_noop_reports_skipped_files_instead_of_zero() {
+    use super::store::TransferStore;
+
+    let store = super::MemoryTransferStore::new();
+    let mut job = failed_job(TransferProgress::default(), None, None);
+    job.state = TransferState::Planning;
+    store.create_or_get_by_request_id(job.clone()).unwrap();
+
+    // What the empty-plan branch writes before landing the terminal state.
+    let skipped_files = 150u64;
+    let skipped_size = 157_286_400i64;
+    let snapshot = TransferProgress {
+        loaded_size: skipped_size,
+        total_size: skipped_size,
+        update_time: 10,
+        message: "incremental transfer complete".to_string(),
+    };
+    let counts = TransferTaskCounts {
+        completed: skipped_files,
+        completed_size: skipped_size,
+        ..Default::default()
+    };
+    store
+        .update_terminal_snapshot(&job.job_id, job.run_id, snapshot.clone(), counts, 10)
+        .unwrap();
+
+    // The generic terminal snapshot runs afterwards; it must not zero this.
+    store
+        .update_terminal_snapshot(
+            &job.job_id,
+            job.run_id,
+            TransferProgress::default(),
+            TransferTaskCounts::default(),
+            11,
+        )
+        .unwrap();
+
+    let stored = store.get_transfer(&job.job_id).unwrap().unwrap();
+    let progress = stored.terminal_summary.expect("terminal snapshot written");
+    let counts = stored.terminal_counts.expect("terminal counts written");
+    assert_eq!(progress.loaded_size, skipped_size);
+    assert_eq!(progress.total_size, skipped_size);
+    assert_eq!(counts.completed, skipped_files);
+    assert_eq!(counts.completed_size, skipped_size);
+    // The job row (read by the list view) must agree with the detail view.
+    assert_eq!(stored.summary.loaded_size, skipped_size);
 }

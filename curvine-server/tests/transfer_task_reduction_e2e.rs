@@ -173,6 +173,7 @@ fn e2e_job(job_id: &str) -> TransferJobRecord {
         cluster_snapshot_version: 1,
         mount_snapshot_attempts: 0,
         planning_attempts: 0,
+        takeover_count: 0,
         terminal_summary: None,
         terminal_counts: None,
         cv_metadata_epoch: None,

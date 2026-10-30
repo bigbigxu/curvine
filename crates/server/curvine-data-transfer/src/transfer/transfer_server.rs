@@ -201,9 +201,8 @@ impl TransferServer {
         // One cache shared by the scheduler (dispatch) and the service
         // (reports/reads): file-level tasks exist only here.
         let task_cache = Arc::new(TaskCache::new());
-        // Discovery topology version shared with report acks. Refreshed by the
-        // registration helper below and readable without a MySQL round trip.
-        let topology_version = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        // Placement and relay: discovery mode only.
+        let forwarder = build_forwarder(&conf, rt.clone());
         let scheduler = TransferScheduler::new(
             store.clone(),
             planner,
@@ -211,18 +210,20 @@ impl TransferServer {
             factory,
             fs,
             owner,
-            report_endpoints,
+            // Workers report back to whoever dispatched the task: that is the
+            // lease owner and the only instance holding the job's in-memory
+            // task state.
+            format!("{}:{}", conf.transfer.hostname, conf.transfer.rpc_port),
             conf.transfer.clone(),
             runtime_state.clone(),
             task_cache.clone(),
+            forwarder.clone(),
         );
 
         let ready = Arc::new(AtomicBool::new(false));
         let runtime_config = Arc::new(build_transfer_runtime_registry(runtime_state, &conf));
-        let (registration, registered_version) = register_discovery(&conf, rt.clone());
-        topology_version.store(registered_version, Ordering::Relaxed);
-        let forwarder = build_forwarder(&conf, rt.clone());
-        let mut transfer_service = TransferService::with_cache_and_report_queue(
+        let registration = register_discovery(&conf, rt.clone());
+        let transfer_service = TransferService::with_cache_and_report_queue(
             store,
             cache.clone(),
             conf.transfer.task_stale_timeout,
@@ -230,7 +231,6 @@ impl TransferServer {
             conf.transfer.worker_threads,
         )?
         .with_task_cache(task_cache.clone());
-        transfer_service.with_topology_version(topology_version.clone());
         let service = TransferRpcService::new(
             transfer_service,
             forwarder,
@@ -322,7 +322,11 @@ fn build_forwarder(
         conf.client_rpc_conf(),
         rt,
     ));
-    Some(Arc::new(Forwarder::new(discovery, self_addr, factory)))
+    Some(Arc::new(Forwarder::new(
+        Arc::new(discovery),
+        self_addr,
+        factory,
+    )))
 }
 
 /// Discovery-safe instance id for a host:port pair.
@@ -342,8 +346,8 @@ fn discovery_instance_id(host: &str, port: u16) -> String {
     id
 }
 
-/// Registration guard plus the topology version it observed.
-type Registration = (Option<curvine_service_discovery::RegistrationGuard>, i64);
+/// Registration guard, if this instance registered itself.
+type Registration = Option<curvine_service_discovery::RegistrationGuard>;
 
 /// Registers this instance in the SQL discovery registry when
 /// `transfer.discovery = sql`. Returns none for the static mode.
@@ -353,26 +357,22 @@ fn register_discovery(
 ) -> Registration {
     use curvine_config::TransferDiscovery;
     if conf.transfer.discovery != TransferDiscovery::Sql {
-        return (None, 0);
+        return None;
     }
     let url = conf.transfer.mysql_store_url();
     if url.is_empty() {
         info!("transfer.discovery=sql requires transfer.store_url=mysql://; skipping registration");
-        return (None, 0);
+        return None;
     }
-    let Some(discovery) = curvine_service_discovery::SqlDiscovery::open(url).ok() else {
-        return (None, 0);
-    };
+    let discovery = curvine_service_discovery::SqlDiscovery::open(url).ok()?;
     if let Err(err) = discovery.init_schema() {
         info!(
             "transfer discovery schema init failed, skipping registration: {}",
             err
         );
-        return (None, 0);
+        return None;
     }
-    let Some(kind) = curvine_service_discovery::ServiceKind::try_new("transfer").ok() else {
-        return (None, 0);
-    };
+    let kind = curvine_service_discovery::ServiceKind::try_new("transfer").ok()?;
     let endpoint = curvine_service_discovery::ServiceEndpoint {
         kind: kind.clone(),
         // Discovery ids allow only [A-Za-z0-9_-], so a host:port identity must
@@ -409,21 +409,20 @@ fn register_discovery(
             )
             .await
     });
-    let version = discovery.topology_version().unwrap_or(0);
     match registered {
         Ok(guard) => {
             info!(
-                "registered transfer instance in sql discovery: {}:{} topology_version={}",
-                conf.transfer.hostname, conf.transfer.rpc_port, version
+                "registered transfer instance in sql discovery: {}:{}",
+                conf.transfer.hostname, conf.transfer.rpc_port
             );
-            (Some(guard), version)
+            Some(guard)
         }
         Err(err) => {
             info!(
                 "transfer discovery registration failed, continuing unregistered: {}",
                 err
             );
-            (None, 0)
+            None
         }
     }
 }

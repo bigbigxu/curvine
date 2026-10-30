@@ -201,6 +201,49 @@ fn planned_target_replacements(
     Ok((segment_targets, replacement_targets))
 }
 
+/// Short-lived exclusion of workers that just failed a dispatch.
+///
+/// A worker that dies stays in the cluster snapshot until its next refresh, so
+/// without this a retry can keep choosing the same dead node and burn the whole
+/// retry budget without ever trying a healthy one.
+struct WorkerBlacklist {
+    until_ms: DashMap<u32, i64>,
+}
+
+impl WorkerBlacklist {
+    /// Long enough to cover a snapshot refresh, short enough that a restarted
+    /// worker is usable again quickly.
+    const TTL_MS: i64 = 15_000;
+
+    fn new() -> Self {
+        Self {
+            until_ms: DashMap::new(),
+        }
+    }
+
+    fn block(&self, worker_id: u32, now_ms: i64) {
+        self.until_ms
+            .insert(worker_id, now_ms.saturating_add(Self::TTL_MS));
+    }
+
+    fn is_blocked(&self, worker_id: u32, now_ms: i64) -> bool {
+        match self.until_ms.get(&worker_id) {
+            Some(until) if *until > now_ms => true,
+            Some(_) => {
+                // Expired entry: forget it. The guard is already released, so
+                // this cannot deadlock against a concurrent block().
+                self.until_ms.remove(&worker_id);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn clear(&self) {
+        self.until_ms.clear();
+    }
+}
+
 struct InflightLedger {
     ttl_ms: u64,
     refreshed_at_ms: AtomicU64,
@@ -427,7 +470,12 @@ pub struct TransferScheduler<S> {
     /// segmented file's block layout and issues complete_file_by_id.
     fs: CurvineFileSystem,
     owner: String,
-    report_endpoints: Vec<String>,
+    /// This instance's own rpc address, advertised to workers on every dispatch.
+    /// A report always goes back to the instance that dispatched the task,
+    /// which is the lease owner and therefore the only holder of that job's
+    /// in-memory task state. It is deliberately NOT the configured endpoint
+    /// list: that list is static, while ownership moves with the lease.
+    self_report_target: String,
     conf: TransferConf,
     /// Live knobs shared with the runtime-config registry. Held by `Arc`, never
     /// snapshotted into this struct: a pushed value must be visible to the very
@@ -439,9 +487,15 @@ pub struct TransferScheduler<S> {
     last_metrics_ms: Arc<AtomicU64>,
     last_task_counts_ms: Arc<AtomicU64>,
     inflight: Arc<InflightLedger>,
+    /// Workers that recently failed a dispatch, excluded for a short window.
+    worker_blacklist: Arc<WorkerBlacklist>,
     /// File-level task state. Those tasks are never persisted, so every task
     /// read below merges this cache with the store.
     task_cache: Arc<TaskCache>,
+    /// Placement owner lookup (discovery mode only). A job must be run by the
+    /// instance its submit was relayed to, so that instance is the one holding
+    /// the job's in-memory task state.
+    forwarder: Option<Arc<crate::transfer::Forwarder>>,
 }
 
 impl<S> Clone for TransferScheduler<S> {
@@ -453,7 +507,7 @@ impl<S> Clone for TransferScheduler<S> {
             factory: self.factory.clone(),
             fs: self.fs.clone(),
             owner: self.owner.clone(),
-            report_endpoints: self.report_endpoints.clone(),
+            self_report_target: self.self_report_target.clone(),
             conf: self.conf.clone(),
             runtime_config: self.runtime_config.clone(),
             worker_cursor: self.worker_cursor.clone(),
@@ -462,7 +516,9 @@ impl<S> Clone for TransferScheduler<S> {
             last_metrics_ms: self.last_metrics_ms.clone(),
             last_task_counts_ms: self.last_task_counts_ms.clone(),
             inflight: self.inflight.clone(),
+            worker_blacklist: self.worker_blacklist.clone(),
             task_cache: self.task_cache.clone(),
+            forwarder: self.forwarder.clone(),
         }
     }
 }
@@ -479,10 +535,11 @@ where
         factory: Arc<UfsFactory>,
         fs: CurvineFileSystem,
         owner: String,
-        report_endpoints: Vec<String>,
+        self_report_target: String,
         conf: TransferConf,
         runtime_config: Arc<TransferRuntimeConfig>,
         task_cache: Arc<TaskCache>,
+        forwarder: Option<Arc<crate::transfer::Forwarder>>,
     ) -> Self {
         let inflight_ttl =
             Duration::from_millis(TransferConf::DEFAULT_SCHEDULER_INFLIGHT_CACHE_TTL_MS);
@@ -493,7 +550,7 @@ where
             factory,
             fs,
             owner,
-            report_endpoints,
+            self_report_target,
             conf,
             runtime_config,
             worker_cursor: Arc::new(AtomicUsize::new(0)),
@@ -502,7 +559,9 @@ where
             last_metrics_ms: Arc::new(AtomicU64::new(0)),
             last_task_counts_ms: Arc::new(AtomicU64::new(0)),
             inflight: Arc::new(InflightLedger::new(inflight_ttl)),
+            worker_blacklist: Arc::new(WorkerBlacklist::new()),
             task_cache,
+            forwarder,
         }
     }
 
@@ -559,6 +618,30 @@ where
         if job.cancel_requested {
             self.cancel_transfer(&job, &lease).await?;
             return Ok(true);
+        }
+
+        // Placement: submit relays a job to the instance the ring names, and
+        // that instance is the only one holding its in-memory task state. If
+        // this instance merely won the lease race, hand the job straight back
+        // so the owner picks it up on its next tick.
+        if job.state == TransferState::Planning {
+            if let Some(forwarder) = &self.forwarder {
+                if !forwarder.owns(&job.client_request_id) {
+                    record_metric(|metrics| metrics.inc_requeue("placed_elsewhere"));
+                    self.store.requeue_transfer(TransferRequeueUpdate {
+                        job_id: job.job_id.clone(),
+                        run_id: job.run_id,
+                        owner: lease.owner.clone(),
+                        lease_epoch: lease.lease_epoch,
+                        message: job.summary.message.clone(),
+                        next_attempt_at_ms: now_ms,
+                        mount_snapshot_attempts: None,
+                        planning_attempts: None,
+                        now_ms,
+                    })?;
+                    return Ok(true);
+                }
+            }
         }
 
         match job.state {
@@ -1026,6 +1109,30 @@ where
                 "incremental transfer complete: skipped_files={} skipped_size={}",
                 planned.skipped_files, planned.skipped_size
             );
+            // Nothing was planned because every target was already canonical,
+            // which is the normal outcome of a re-plan after a failover or a
+            // repeated load. A zero-progress terminal snapshot would read as
+            // "copied nothing", so report what was already in place. This
+            // branch has no tasks by definition, so the numbers are files and
+            // cannot be confused with task counts.
+            if planned.skipped_files > 0 {
+                self.store.update_terminal_snapshot(
+                    &job.job_id,
+                    job.run_id,
+                    curvine_model::TransferProgress {
+                        loaded_size: planned.skipped_size,
+                        total_size: planned.skipped_size,
+                        update_time: now_ms(),
+                        message: message.clone(),
+                    },
+                    curvine_model::TransferTaskCounts {
+                        completed: planned.skipped_files as u64,
+                        completed_size: planned.skipped_size,
+                        ..Default::default()
+                    },
+                    now_ms(),
+                )?;
+            }
             self.transition(
                 &job,
                 &lease,
@@ -1442,9 +1549,10 @@ where
             let job_info = job_info.clone();
             let owner = lease.owner.clone();
             let lease_epoch = lease.lease_epoch;
-            let report_endpoints = self.report_endpoints.clone();
+            let report_endpoints = vec![self.self_report_target.clone()];
             let task_stale_timeout_ms = duration_ms(self.conf.task_stale_timeout);
             let task_cache = self.task_cache.clone();
+            let worker_blacklist = self.worker_blacklist.clone();
             Some(async move {
                 dispatch_one(DispatchTaskRequest {
                     store,
@@ -1458,6 +1566,7 @@ where
                     report_endpoints,
                     task_stale_timeout_ms,
                     task_cache,
+                    worker_blacklist,
                 })
                 .await
             })
@@ -1471,6 +1580,17 @@ where
 
     /// Sends a job back to Planning so the planner rebuilds its task set.
     fn requeue_for_replan(&self, job: &TransferJobRecord, lease: &TransferLease) -> FsResult<()> {
+        // `requeue_transfer` only accepts a Planning job, so an executing job
+        // must be moved back first; otherwise the requeue silently no-ops.
+        if job.state != TransferState::Planning {
+            self.transition(
+                job,
+                lease,
+                &[TransferState::Dispatching, TransferState::Running],
+                TransferState::Planning,
+                "re-planning: this instance holds no task state for the job",
+            )?;
+        }
         self.store.requeue_transfer(TransferRequeueUpdate {
             job_id: job.job_id.clone(),
             run_id: job.run_id,
@@ -1563,6 +1683,22 @@ where
         lease: TransferLease,
     ) -> FsResult<()> {
         let now = now_ms();
+        // A job in an executing state must have task state somewhere. File-level
+        // tasks live only in the process that planned them, so after a failover
+        // this instance sees neither cache entries nor rows. Concluding
+        // "all tasks completed" from that would report success for work that
+        // never ran: re-plan instead (a file-level replay is idempotent and the
+        // planner skips targets that are already canonical).
+        if self.task_cache.is_empty(&job.job_id, job.run_id)
+            && !self.store.has_transfer_tasks(&job.job_id, job.run_id)?
+        {
+            warn!(
+                "re-planning transfer {} because this instance holds no task state for it",
+                job.job_id
+            );
+            self.requeue_for_replan(&job, &lease)?;
+            return Ok(());
+        }
         // File-level tasks live only in the cache, so every store-side guard
         // below (has_recoverable_tasks, claim_pending_tasks) is blind to them
         // and would complete the job with work still in flight. Handle that
@@ -1688,6 +1824,29 @@ where
         let retryable_failed = self
             .recover_transient_failed_tasks(&job, &lease, now)
             .await?;
+
+        // Cache tasks have no rows, so the store-side transient recovery below
+        // cannot see them: retry their transport failures here, bounded by the
+        // same retry budget.
+        let cache_retried = self.task_cache.retry_failed(
+            &job.job_id,
+            job.run_id,
+            self.conf.task_max_retries as u32,
+            now,
+            is_task_retryable_message,
+        );
+        if cache_retried > 0 {
+            record_metric(|metrics| metrics.inc_stale_retry("cache_transient_retry"));
+            self.transition(
+                &job,
+                &lease,
+                &[TransferState::Running],
+                TransferState::Dispatching,
+                "retrying failed file-level tasks",
+            )?;
+            self.dispatch_pending_tasks(job, lease).await?;
+            return Ok(());
+        }
 
         if (self.store.has_failed_tasks(&job.job_id, job.run_id)?
             || self.task_cache.has_failed(&job.job_id, job.run_id))
@@ -2313,6 +2472,19 @@ where
     /// decisions observe updated accounts instead of stampeding one worker;
     /// exact ties are broken by the polling cursor.
     fn choose_worker(&self, workers: &[WorkerInfo], estimated_bytes: i64) -> Option<WorkerInfo> {
+        let now = now_ms();
+        let mut candidates: Vec<WorkerInfo> = workers
+            .iter()
+            .filter(|worker| !self.worker_blacklist.is_blocked(worker.worker_id(), now))
+            .cloned()
+            .collect();
+        if candidates.is_empty() && !workers.is_empty() {
+            // Every worker is blocked. Drop the blacklist rather than stall the
+            // job: a retry on a still-broken worker is no worse than waiting.
+            self.worker_blacklist.clear();
+            candidates.extend(workers.iter().cloned());
+        }
+        let workers = candidates.as_slice();
         let admitted = choose_worker_admitted(
             workers,
             estimated_bytes,
@@ -2424,6 +2596,7 @@ struct DispatchTaskRequest<S> {
     report_endpoints: Vec<String>,
     task_stale_timeout_ms: i64,
     task_cache: Arc<TaskCache>,
+    worker_blacklist: Arc<WorkerBlacklist>,
 }
 
 async fn dispatch_one<S>(request: DispatchTaskRequest<S>) -> FsResult<bool>
@@ -2442,6 +2615,7 @@ where
         report_endpoints,
         task_stale_timeout_ms,
         task_cache,
+        worker_blacklist,
     } = request;
     let now = now_ms();
     let attempt_id = task.attempt_id.saturating_add(1);
@@ -2457,6 +2631,9 @@ where
     let client = match factory.get_worker_client(&worker.address).await {
         Ok(client) => client,
         Err(err) => {
+            // The node is unreachable: keep it out of the next few rounds so the
+            // retry lands on a healthy worker instead of burning the budget.
+            worker_blacklist.block(worker.worker_id(), now_ms());
             warn!(
                 "connect worker for transfer task failed before submit; retry in next scheduler tick: job={} run={} task={} attempt={} worker_id={} worker_session={} source={} target={} err={}",
                 task.job_id,
@@ -2527,6 +2704,10 @@ where
         }
         Ok(response) => {
             let reason = response.reject_reason.unwrap_or_default();
+            // Capacity/session rejections are the same signal as an unreachable
+            // node for placement purposes: avoid it for a short window so the
+            // retry has a chance to land elsewhere.
+            worker_blacklist.block(worker.worker_id(), now_ms());
             warn!(
                 "worker rejected transfer task before accepting it: job={} run={} task={} attempt={} worker_id={} worker_session={} source={} target={} reason={}",
                 task.job_id,
@@ -2708,6 +2889,33 @@ fn choose_worker_admitted(
 /// unready segment layout are transient — the retry is idempotent
 /// (positional segment writes, batch commit markers, temp+rename singles)
 /// and bounded by task_max_retries with stale-style backoff.
+/// Message-only form of [`is_task_retryable`], for callers that hold a task
+/// record outside the store (file-level tasks live only in the cache).
+fn is_task_retryable_message(msg: &str) -> bool {
+    if msg.contains(curvine_error::RetryClass::RetryElsewhere.token())
+        || msg.contains(curvine_error::RetryClass::RetryAfter.token())
+        || msg.contains(curvine_error::RetryClass::RetryMaster.token())
+    {
+        return true;
+    }
+    msg.contains("RateLimited")
+        || msg.contains("TooManyRequests")
+        || msg.contains("too many requests")
+        || msg.contains("Timed out")
+        || msg.contains("timed out")
+        || msg.contains("exceed timeout")
+        || msg.contains(crate::worker::task::WORKER_AT_CAPACITY_REJECT_PREFIX)
+        || msg.contains("Connection reset by peer")
+        || msg.contains("Broken pipe")
+        || msg.contains("Connection refused")
+        || msg.contains("channel closed")
+        || msg.contains("os error 104")
+        || msg.contains("os error 32")
+        || msg.contains("os error 111")
+        || msg.contains("not found in target layout")
+        || msg.contains("Transfer task report timed out")
+}
+
 fn is_task_retryable(task: &TransferTaskRecord) -> bool {
     // Storage/health failures carry the retry class the worker computed; the
     // token keeps that decision intact across the text-only report path.
@@ -2726,6 +2934,18 @@ fn is_task_retryable(task: &TransferTaskRecord) -> bool {
         // Worker task timeout copy: "Task {} exceed timeout {} ms".
         || msg.contains("exceed timeout")
         || msg.contains(crate::worker::task::WORKER_AT_CAPACITY_REJECT_PREFIX)
+        // Transport-level failures mean a peer (worker or master data path)
+        // went away mid-copy. Replaying a file-level task is idempotent and
+        // segment writes are positional, so these are transient: retrying on a
+        // healthy worker is strictly better than failing the whole job because
+        // one worker died.
+        || msg.contains("Connection reset by peer")
+        || msg.contains("Broken pipe")
+        || msg.contains("Connection refused")
+        || msg.contains("channel closed")
+        || msg.contains("os error 104")
+        || msg.contains("os error 32")
+        || msg.contains("os error 111")
         || msg.contains("not found in target layout")
         || msg.contains("Transfer task report timed out")
         || msg.contains("WorkerSessionGone")

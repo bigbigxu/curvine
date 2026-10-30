@@ -1664,6 +1664,7 @@ mod tests {
             cluster_snapshot_version: 0,
             mount_snapshot_attempts: 0,
             planning_attempts: 0,
+            takeover_count: 0,
             terminal_summary: None,
             terminal_counts: None,
             cv_metadata_epoch: None,

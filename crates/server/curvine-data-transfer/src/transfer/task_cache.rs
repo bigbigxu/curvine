@@ -191,6 +191,37 @@ impl TaskCache {
         tasks
     }
 
+    /// Returns failed tasks to Pending so the dispatcher can re-run them.
+    ///
+    /// A file-level task has no row, so the store-side transient-failure
+    /// recovery cannot see it. Without this, one dead worker would fail the
+    /// whole job on a transport error that a replay would have fixed.
+    pub fn retry_failed(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        max_retries: u32,
+        now_ms: i64,
+        retryable: impl Fn(&str) -> bool,
+    ) -> usize {
+        let Some(bucket) = self.jobs.get(&(job_id.to_string(), run_id)) else {
+            return 0;
+        };
+        let mut requeued = 0;
+        for mut task in bucket.tasks.iter_mut() {
+            if task.state != TransferTaskState::Failed
+                || task.retry_count > max_retries
+                || !retryable(&task.progress.message)
+            {
+                continue;
+            }
+            task.state = TransferTaskState::Pending;
+            task.updated_at = now_ms;
+            requeued += 1;
+        }
+        requeued
+    }
+
     pub fn has_failed(&self, job_id: &str, run_id: u64) -> bool {
         self.jobs
             .get(&(job_id.to_string(), run_id))
@@ -449,6 +480,34 @@ mod tests {
         assert_eq!(merged.counts.pending, 1);
         assert_eq!(merged.progress.loaded_size, 110);
         assert!(!merged.all_completed);
+    }
+
+    /// A worker death surfaces as a transport error on the task. With no row to
+    /// recover, the cache itself must put the task back for a replay.
+    #[test]
+    fn retryable_failure_returns_to_pending_within_budget() {
+        let cache = TaskCache::new();
+        cache.seed("job-1", 7, vec![task("t1")]);
+        cache.start_attempt(&start("t1", 1));
+        let mut failed = report("t1", TransferTaskState::Failed, 1);
+        failed.progress.message = "batch task t1 file x: Connection reset by peer".to_string();
+        assert_eq!(cache.apply_report(&failed), Some(true));
+        assert!(cache.has_failed("job-1", 7));
+
+        let is_retryable = |msg: &str| msg.contains("Connection reset by peer");
+        assert_eq!(cache.retry_failed("job-1", 7, 3, 500, is_retryable), 1);
+        assert!(!cache.has_failed("job-1", 7), "task is pending again");
+        assert_eq!(cache.claim_pending("job-1", 7, 10, 500).len(), 1);
+
+        // A permanent failure is never requeued.
+        let cache = TaskCache::new();
+        cache.seed("job-1", 7, vec![task("t1")]);
+        cache.start_attempt(&start("t1", 1));
+        let mut permanent = report("t1", TransferTaskState::Failed, 1);
+        permanent.progress.message = "schema mismatch".to_string();
+        cache.apply_report(&permanent);
+        assert_eq!(cache.retry_failed("job-1", 7, 3, 500, is_retryable), 0);
+        assert!(cache.has_failed("job-1", 7));
     }
 
     #[test]

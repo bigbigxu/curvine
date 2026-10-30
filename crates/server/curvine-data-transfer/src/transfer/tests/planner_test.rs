@@ -517,6 +517,7 @@ fn load_replicas_override_mount_and_service_defaults() {
         created_at: 0,
         updated_at: 0,
         planning_attempts: 0,
+        takeover_count: 0,
         terminal_summary: None,
         terminal_counts: None,
     };

@@ -574,6 +574,9 @@ impl TransferStore for MemoryTransferStore {
         } else {
             None
         };
+        // Whether the candidate came from the renewal query (same owner) rather
+        // than from an expired lease belonging to someone else.
+        let mut renewal = candidate_id.is_some();
         let candidate_id =
             candidate_id
                 .or_else(|| {
@@ -604,6 +607,9 @@ impl TransferStore for MemoryTransferStore {
                     if executing.len() as u64 >= max_executing_transfers {
                         return None;
                     }
+                    // This fallback branch never renews: the candidate is a
+                    // pending job, so a takeover counter bump cannot apply.
+                    renewal = false;
                     let executing_targets = executing
                         .iter()
                         .filter(|job| !TransferCommand::is_fs_mode_submitter(&job.submitter))
@@ -674,6 +680,11 @@ impl TransferStore for MemoryTransferStore {
         let Some(job) = inner.jobs.get_mut(&candidate_id) else {
             return Ok(None);
         };
+        // A takeover is an expired lease on an executing job that this owner
+        // did not hold; renewals must not inflate the counter.
+        if !renewal && job.state.is_executing() && job.owner != owner {
+            job.takeover_count = job.takeover_count.saturating_add(1);
+        }
 
         if job.state == TransferState::Pending {
             job.state = TransferState::Planning;
@@ -1230,12 +1241,15 @@ impl TransferStore for MemoryTransferStore {
         if job.run_id != run_id {
             return Ok(());
         }
+        // First writer wins for the whole row, matching the SQL backends: a
+        // later empty snapshot must not zero a summary that already reported
+        // real progress.
         if job.terminal_summary.is_none() {
             job.terminal_summary = Some(summary.clone());
             job.terminal_counts = Some(counts);
+            job.summary = summary;
+            job.updated_at = now_ms;
         }
-        job.summary = summary;
-        job.updated_at = now_ms;
         Ok(())
     }
 }
@@ -1329,6 +1343,7 @@ mod tests {
             cluster_snapshot_version: 1,
             mount_snapshot_attempts: 0,
             planning_attempts: 0,
+            takeover_count: 0,
             terminal_summary: None,
             terminal_counts: None,
             cv_metadata_epoch: None,

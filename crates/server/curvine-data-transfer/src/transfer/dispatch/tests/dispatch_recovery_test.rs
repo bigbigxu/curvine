@@ -41,10 +41,11 @@ fn scheduler_with_state(
         factory,
         fs,
         "test-owner".to_string(),
-        vec![],
+        "127.0.0.1:9012".to_string(),
         TransferConf::default(),
         runtime_config,
         std::sync::Arc::new(crate::transfer::TaskCache::new()),
+        None,
     )
 }
 
@@ -62,6 +63,7 @@ fn running_job(job_id: &str) -> TransferJobRecord {
         cluster_snapshot_version: 1,
         mount_snapshot_attempts: 0,
         planning_attempts: 0,
+        takeover_count: 0,
         terminal_summary: None,
         terminal_counts: None,
         cv_metadata_epoch: None,

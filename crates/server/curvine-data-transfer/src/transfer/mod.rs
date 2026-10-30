@@ -11,9 +11,7 @@ pub use self::store::*;
 mod task_cache;
 pub use self::task_cache::{merge_summaries, JobRunKey, TaskCache};
 
-#[cfg(feature = "transfer-store-mysql")]
 mod forwarder;
-#[cfg(feature = "transfer-store-mysql")]
 pub use self::forwarder::{is_forwarded, Forwarder};
 
 mod memory_store;

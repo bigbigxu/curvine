@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use curvine_error::{FsError, FsResult};
 use curvine_rpc::client::ClientFactory;
 use curvine_rpc::RpcUtils;
-use curvine_service_discovery::{ConsistentHashRing, ServiceKind, ServiceResolver, SqlDiscovery};
+use curvine_service_discovery::{ConsistentHashRing, LiveEndpoints, ServiceKind};
 use log::warn;
 use parking_lot::RwLock;
 use prost::Message as PMessage;
@@ -29,7 +29,7 @@ const RING_TTL: Duration = Duration::from_secs(3);
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Forwarder {
-    discovery: SqlDiscovery,
+    discovery: Arc<dyn LiveEndpoints>,
     /// This instance's own rpc `host:port`, matching the ring's address form.
     self_addr: String,
     factory: Arc<ClientFactory>,
@@ -38,7 +38,7 @@ pub struct Forwarder {
 
 impl Forwarder {
     pub fn new(
-        discovery: SqlDiscovery,
+        discovery: Arc<dyn LiveEndpoints>,
         self_addr: impl Into<String>,
         factory: Arc<ClientFactory>,
     ) -> Self {
@@ -56,6 +56,18 @@ impl Forwarder {
         let ring = self.ring_snapshot()?;
         let owner = ring.owner(job_id)?.addr.clone();
         Some(owner)
+    }
+
+    /// True when this instance is the placement owner of `key`, or when the
+    /// topology cannot be resolved (then anyone may run it: availability wins
+    /// over placement).
+    pub fn owns(&self, key: &str) -> bool {
+        let Some(ring) = self.ring_snapshot() else {
+            return true;
+        };
+        ring.owner(key)
+            .map(|entry| entry.addr == self.self_addr)
+            .unwrap_or(true)
     }
 
     /// Owner address to relay to, or None when this instance should answer.
@@ -88,24 +100,22 @@ impl Forwarder {
     fn fetch_ring(&self) -> FsResult<ConsistentHashRing> {
         let kind = ServiceKind::try_new("transfer")
             .map_err(|err| FsError::common(format!("invalid service kind: {err}")))?;
-        // The resolver trait is async but its SQL implementation is a plain
-        // query; poll it on a short-lived runtime to keep the caller sync.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|err| FsError::common(format!("forwarder runtime: {err}")))?;
-        let snapshot = rt
-            .block_on(async { self.discovery.list(kind).await })
+        // Synchronous registry read: this runs inside an async request handler,
+        // where building a nested runtime to await the resolver would panic (or
+        // hang the caller forever).
+        let endpoints = self
+            .discovery
+            .live_endpoints(&kind)
             .map_err(|err| FsError::common(format!("transfer topology list failed: {err}")))?;
-        Ok(ConsistentHashRing::build(
-            snapshot.endpoints.into_iter().map(|endpoint| {
+        Ok(ConsistentHashRing::build(endpoints.into_iter().map(
+            |endpoint| {
                 (
                     endpoint.id,
                     format!("{}:{}", endpoint.host, endpoint.rpc_port),
                     endpoint.start_time_ms,
                 )
-            }),
-        ))
+            },
+        )))
     }
 
     /// Relays one request to `addr` and returns the owner's own response.

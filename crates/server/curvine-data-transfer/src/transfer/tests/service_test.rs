@@ -37,6 +37,7 @@ fn load_submit_request(client_request_id: &str) -> SubmitTransferRequest {
         tenant: "default".to_string(),
         command: Vec::new(),
         protocol_version: Some(1),
+        forwarded: None,
     }
 }
 

@@ -657,6 +657,9 @@ impl TransferStore for MysqlTransferStore {
         } else {
             None
         };
+        // Whether the candidate came from the renewal query (this owner already
+        // holds the lease) rather than from a takeover of an expired lease.
+        let mut renewal = job.is_some();
         if job.is_none() {
             job = tx
                 .exec_first(
@@ -668,6 +671,7 @@ impl TransferStore for MysqlTransferStore {
                     params! { "now_ms" => now_ms },
                 )
                 .map_err(mysql_err)?;
+            renewal = false;
         }
         if job.is_none() && has_pending_transfer(&mut tx, now_ms)? {
             let executing = tx
@@ -680,6 +684,7 @@ impl TransferStore for MysqlTransferStore {
             if executing < max_executing_transfers {
                 let active_targets = select_executing_targets(&mut tx)?;
                 job = select_pending_transfer(&mut tx, now_ms, &active_targets)?;
+                renewal = false;
             }
         }
         let Some((job_id, run_id, lease_epoch, state)) = job else {
@@ -711,6 +716,19 @@ impl TransferStore for MysqlTransferStore {
             exec_update_job(&mut tx, &record)?;
             tx.commit().map_err(mysql_err)?;
             return Ok(None);
+        }
+        // A lease won over an expired one while the job was still executing
+        // means the previous owner stopped renewing: this acquisition is a
+        // takeover, and it is the only user-visible sign that work was
+        // interrupted. Ordinary renewals by the same owner must not count, or
+        // the counter would grow on every running-status tick.
+        if !renewal
+            && matches!(
+                TransferState::from(state),
+                TransferState::Dispatching | TransferState::Running
+            )
+        {
+            record.takeover_count = record.takeover_count.saturating_add(1);
         }
         if state == TransferState::Pending as i32 {
             record.state = TransferState::Planning;

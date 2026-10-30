@@ -474,6 +474,7 @@ fn status_to_job(response: &GetTransferStatusResponse) -> TransferJobStatusProto
         owner: response.owner.clone(),
         lease_epoch: response.lease_epoch,
         lease_expire_at: response.lease_expire_at,
+        takeover_count: response.takeover_count,
         cv_metadata_epoch: response.cv_metadata_epoch,
     }
 }
@@ -537,6 +538,16 @@ impl From<TransferStateArg> for TransferState {
     }
 }
 
+/// State cell for the compact list, with a takeover marker when the job was
+/// interrupted and resumed on another instance.
+fn state_cell(job: &TransferJobStatusProto) -> String {
+    let state = state_name(job.state);
+    match job.takeover_count.filter(|count| *count > 0) {
+        Some(count) => format!("{state} (takeover x{count})"),
+        None => state.to_string(),
+    }
+}
+
 fn print_jobs_table(jobs: &[TransferJobStatusProto], full_id: bool, verbose: bool) {
     let mut table = md_table();
     if verbose {
@@ -553,7 +564,7 @@ fn print_jobs_table(jobs: &[TransferJobStatusProto], full_id: bool, verbose: boo
         let mut row = vec![
             display_id(&job.job_id, full_id),
             kind_name(job.kind).to_string(),
-            state_name(job.state).to_string(),
+            state_cell(job),
             progress_text(job.progress.loaded_size, job.progress.total_size),
         ];
         if verbose {
@@ -626,6 +637,12 @@ fn print_status_summary(
         table.add_row(["Target".to_string(), job.target_path.clone()]);
     }
     table.add_row(["Updated".to_string(), format_timestamp(job.updated_at)]);
+    if let Some(count) = job.takeover_count.filter(|count| *count > 0) {
+        // Shown without --verbose on purpose: an operator checking a job after
+        // an incident needs to see that it was interrupted and continued
+        // elsewhere, not just its final state.
+        table.add_row(["Takeovers".to_string(), count.to_string()]);
+    }
     if verbose {
         if !job.submitter.is_empty() {
             table.add_row(["Submitter".to_string(), job.submitter.clone()]);
@@ -855,5 +872,33 @@ fn task_state_name(state: i32) -> &'static str {
         5 => "Canceled",
         6 => "Stale",
         _ => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod takeover_display_tests {
+    use super::state_cell;
+    use curvine_proto::TransferJobStatusProto;
+
+    fn job(state: i32, takeover_count: Option<u32>) -> TransferJobStatusProto {
+        TransferJobStatusProto {
+            state,
+            takeover_count,
+            ..Default::default()
+        }
+    }
+
+    /// An interrupted job must be recognisable in the compact list without any
+    /// extra flag: the marker is the only trace that work moved to another
+    /// instance after its owner died.
+    #[test]
+    fn compact_state_marks_takeovers_only_when_present() {
+        assert_eq!(state_cell(&job(6, None)), "Completed");
+        assert_eq!(state_cell(&job(6, Some(0))), "Completed");
+        assert_eq!(
+            state_cell(&job(6, Some(2))),
+            "Completed (takeover x2)",
+            "a taken-over job keeps its state but shows the interruption"
+        );
     }
 }

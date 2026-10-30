@@ -32,8 +32,7 @@ use crate::transfer::{
 
 pub struct TransferHandler<S> {
     service: TransferService<S>,
-    /// Present in discovery mode; relays status/watch to the job's owner.
-    #[cfg(feature = "transfer-store-mysql")]
+    /// Present in discovery mode; relays submit/status/watch to the owner.
     forwarder: Option<std::sync::Arc<crate::transfer::Forwarder>>,
 }
 
@@ -44,18 +43,15 @@ where
     pub fn new(service: TransferService<S>) -> Self {
         Self {
             service,
-            #[cfg(feature = "transfer-store-mysql")]
             forwarder: None,
         }
     }
 
-    #[cfg(feature = "transfer-store-mysql")]
     pub fn with_forwarder(mut self, forwarder: std::sync::Arc<crate::transfer::Forwarder>) -> Self {
         self.forwarder = Some(forwarder);
         self
     }
 
-    #[cfg(feature = "transfer-store-mysql")]
     /// Relays a status/watch request to the owning instance, if there is one.
     /// Returns None whenever the request should be served here: no forwarder,
     /// already forwarded (one hop only), no resolvable owner, or the relay
@@ -124,6 +120,7 @@ where
             cv_metadata_epoch: job.cv_metadata_epoch,
             task_summary: Some(task_summary_to_proto(task_summary)),
             task_details_expired: Some(task_details_expired),
+            takeover_count: Some(job.takeover_count),
         })
     }
 
@@ -212,12 +209,7 @@ where
             metrics.inc_report_batch_tasks(req.reports.len());
         }
         let accepted = self.service.report_tasks(req)?;
-        // Piggyback the cached topology version so a worker only re-fetches the
-        // instance list when membership actually changed.
-        let response = TransferTaskReportBatchResponse {
-            accepted,
-            topology_version: Some(self.service.topology_version()),
-        };
+        let response = TransferTaskReportBatchResponse { accepted };
         Ok(Builder::success(msg).proto_header(response).build())
     }
 }
@@ -230,20 +222,49 @@ where
 
     /// Status/watch move to the async path only when relaying is configured;
     /// everything else keeps running on the blocking pool as before.
-    #[cfg(feature = "transfer-store-mysql")]
     fn is_sync(&self, msg: &Message) -> bool {
         if self.forwarder.is_none() {
             return true;
         }
         !matches!(
             RpcCode::from(msg.code()),
-            RpcCode::GetTransferStatus | RpcCode::WatchTransfer
+            RpcCode::GetTransferStatus | RpcCode::WatchTransfer | RpcCode::SubmitTransfer
         )
     }
 
-    #[cfg(feature = "transfer-store-mysql")]
     async fn async_handle(&self, msg: Message) -> FsResult<Message> {
         match RpcCode::from(msg.code()) {
+            RpcCode::SubmitTransfer => {
+                let req: SubmitTransferRequest = msg.parse_header()?;
+                // A new job is placed by its request identity, so a retried
+                // submit lands where its idempotency record is. Relaying here
+                // (rather than in the scheduler) is what makes the lease owner
+                // equal to the hash owner, which every later report relies on.
+                if !crate::transfer::is_forwarded(req.forwarded) {
+                    let relay = self
+                        .relay::<_, SubmitTransferResponse>(
+                            &req.client_request_id,
+                            RpcCode::SubmitTransfer,
+                            SubmitTransferRequest {
+                                forwarded: Some(true),
+                                ..req.clone()
+                            },
+                        )
+                        .await;
+                    if let Some(response) = relay {
+                        return Ok(Builder::success(&msg).proto_header(response).build());
+                    }
+                }
+                // No owner, or the relay failed: accept the job here so a
+                // submit never fails just because placement could not run.
+                let job = self.service.submit_transfer(req)?;
+                let response = SubmitTransferResponse {
+                    job_id: job.job_id,
+                    run_id: job.run_id,
+                    state: transfer_state_code(job.state),
+                };
+                Ok(Builder::success(&msg).proto_header(response).build())
+            }
             RpcCode::GetTransferStatus => {
                 let mut req: GetTransferStatusRequest = msg.parse_header()?;
                 if !crate::transfer::is_forwarded(req.forwarded) {

@@ -336,6 +336,14 @@ pub struct TransferJobRecord {
     /// public-struct additive-evolution convention.
     #[serde(default)]
     pub planning_attempts: u32,
+    /// Number of times this job was taken over from a dead owner: a lease was
+    /// acquired while the job was still Dispatching/Running, which only happens
+    /// after the previous owner stopped renewing. The only user-visible sign
+    /// that work was interrupted and continued elsewhere, so it must be
+    /// persisted rather than inferred from the lease epoch (which also moves on
+    /// every ordinary acquisition).
+    #[serde(default)]
+    pub takeover_count: u32,
     /// Terminal task snapshot (progress + structured counts) persisted
     /// synchronously before the job lands terminal, so TTL task purge never
     /// renders detail as 0/empty. JSON-only additive; None means not snapshotted.

@@ -76,6 +76,8 @@ message TransferJobStatusProto {
   optional string owner = 12;
   optional uint64 lease_epoch = 13;
   optional int64 lease_expire_at = 14;
+  // Takeovers from a dead owner; non-zero means the job was interrupted.
+  optional uint32 takeover_count = 20 [default = 0];
   optional uint64 cv_metadata_epoch = 15;
 }
 
@@ -88,6 +90,9 @@ message SubmitTransferRequest {
   required string tenant = 6;
   required bytes command = 7;
   optional uint32 protocol_version = 8 [default = 1];
+  // Set by an instance relaying this submit to the job's hash owner. A
+  // forwarded submit is always served locally, so the relay is one hop.
+  optional bool forwarded = 9 [default = false];
 }
 
 message SubmitTransferResponse {
@@ -125,6 +130,9 @@ message GetTransferStatusResponse {
   optional uint64 cv_metadata_epoch = 17;
   optional TransferTaskSummaryProto task_summary = 18;
   optional bool task_details_expired = 19;
+  // How many times this job was taken over from a dead owner. Non-zero
+  // means the job was interrupted and continued on another instance.
+  optional uint32 takeover_count = 20 [default = 0];
 }
 
 message ListTransfersRequest {
@@ -260,10 +268,6 @@ message TransferTaskReportBatchRequest {
 
 message TransferTaskReportBatchResponse {
   repeated bool accepted = 1;
-  // Responding instance's cached topology version. The worker compares it with
-  // its own and only re-fetches the instance list when it moved, so a steady
-  // state costs no topology queries at all. 0 = not advertised.
-  optional int64 topology_version = 2 [default = 0];
 }
 
 message QueryTransferTaskRequest {
