@@ -270,6 +270,12 @@ pub trait HandlerService: Send + Sync + 'static {
         StreamHandler::new(rt, frame, handler, conf)
     }
 
+    /// `true` (default): requests on a connection are processed one at a time
+    /// by [`StreamHandler`]. Required for stateful streams.
+    ///
+    /// `false`: requests are processed concurrently by [`BufferHandler`] and
+    /// responses may be out of order. The service must also implement
+    /// [`get_limit`](Self::get_limit).
     fn is_stream(&self) -> bool {
         true
     }
@@ -278,6 +284,9 @@ pub trait HandlerService: Send + Sync + 'static {
         panic!("BufferHandler service must provide a shared LimitConf")
     }
 
+    /// Builds a [`BufferHandler`], which processes requests of one connection
+    /// concurrently. Used by `RpcServer` when [`is_stream`](Self::is_stream)
+    /// returns false.
     fn get_buffer_handler<F: Frame>(
         &self,
         rt: Arc<Runtime>,
