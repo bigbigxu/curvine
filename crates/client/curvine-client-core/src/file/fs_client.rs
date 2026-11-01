@@ -327,14 +327,8 @@ impl FsClient {
             && self.can_alloc_first_block()
             && !flags.read_only()
             && (flags.create() || flags.truncate());
-        self.open_file0(
-            path,
-            opts,
-            flags,
-            alloc,
-            &self.context.clone_client_name(),
-        )
-        .await
+        self.open_file0(path, opts, flags, alloc, &self.context.clone_client_name())
+            .await
     }
 
     async fn open_file0(
@@ -745,6 +739,31 @@ impl FsClient {
         only_flush: bool,
         set_attr_opts: Option<SetAttrOpts>,
     ) -> FsResult<Option<FileBlocks>> {
+        self.complete_file_release(
+            path,
+            inode_id,
+            len,
+            commit_blocks,
+            only_flush,
+            set_attr_opts,
+            None,
+        )
+        .await
+    }
+
+    /// `complete_file_by_id` that also drops `release_block_id`, a block that
+    /// was pre-allocated at create time and never written.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn complete_file_release(
+        &self,
+        path: &Path,
+        inode_id: i64,
+        len: i64,
+        commit_blocks: impl IntoIterator<Item = CommitBlock>,
+        only_flush: bool,
+        set_attr_opts: Option<SetAttrOpts>,
+        release_block_id: Option<i64>,
+    ) -> FsResult<Option<FileBlocks>> {
         self.complete_file0(
             path,
             Some(inode_id),
@@ -754,7 +773,7 @@ impl FsClient {
                 only_flush,
                 set_attr_opts,
                 return_file_blocks: true,
-                release_block_id: None,
+                release_block_id,
             },
         )
         .await
@@ -766,6 +785,7 @@ impl FsClient {
         inode_id: i64,
         len: i64,
         commit_blocks: impl IntoIterator<Item = CommitBlock>,
+        release_block_id: Option<i64>,
     ) -> FsResult<()> {
         self.complete_file0(
             path,
@@ -776,7 +796,7 @@ impl FsClient {
                 only_flush: true,
                 set_attr_opts: None,
                 return_file_blocks: false,
-                release_block_id: None,
+                release_block_id,
             },
         )
         .await
@@ -1291,6 +1311,7 @@ impl FsClient {
             path: path.encode(),
             opts: ProtoUtils::create_opts_to_pb(opts, self.context.clone_client_name()),
             flags: flags.value(),
+            first_block_client: None,
             client_context: None,
         };
         let rep_header: CreateFileResponse = self.rpc(RpcCode::CreateFile, header).await?;

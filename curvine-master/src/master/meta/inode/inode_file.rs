@@ -16,6 +16,7 @@ use crate::master::meta::feature::{AclFeature, FileFeature, WriteFeature};
 use crate::master::meta::inode::{Inode, EMPTY_PARENT_ID};
 use crate::master::meta::store::InodeStore;
 use crate::master::meta::{BlockMeta, InodeId};
+use curvine_codec::{CodecResult, Decode, Encode, Reader, Writer};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;
 use curvine_model::{
@@ -668,6 +669,49 @@ impl Inode for InodeFile {
 impl PartialEq for InodeFile {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
+    }
+}
+
+impl Encode for InodeFile {
+    #[inline(always)]
+    fn encode(&self, writer: &mut Writer) -> CodecResult<()> {
+        writer.reserve(self.blocks.len().saturating_mul(16).saturating_add(256));
+        writer.put_i64(self.id)?;
+        writer.put_i64(self.parent_id)?;
+        self.file_type.encode(writer)?;
+        writer.put_i64(self.mtime)?;
+        writer.put_i64(self.atime)?;
+        writer.put_i64(self.len)?;
+        writer.put_u32(self.block_size)?;
+        writer.put_u8(self.replicas)?;
+        self.storage_policy.encode(writer)?;
+        self.features.encode(writer)?;
+        self.blocks.encode(writer)?;
+        writer.put_u32(self.nlink)?;
+        writer.put_u32(self.next_seq)?;
+        self.target.encode(writer)
+    }
+}
+
+impl Decode for InodeFile {
+    #[inline(always)]
+    fn decode(reader: &mut Reader<'_>) -> CodecResult<Self> {
+        Ok(Self {
+            id: reader.get_i64()?,
+            parent_id: reader.get_i64()?,
+            file_type: FileType::decode(reader)?,
+            mtime: reader.get_i64()?,
+            atime: reader.get_i64()?,
+            len: reader.get_i64()?,
+            block_size: reader.get_u32()?,
+            replicas: reader.get_u8()?,
+            storage_policy: StoragePolicy::decode(reader)?,
+            features: FileFeature::decode(reader)?,
+            blocks: Vec::<BlockMeta>::decode(reader)?,
+            nlink: reader.get_u32()?,
+            next_seq: reader.get_u32()?,
+            target: Option::<String>::decode(reader)?,
+        })
     }
 }
 
