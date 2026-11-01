@@ -45,6 +45,7 @@ struct CompleteFileOptions {
     only_flush: bool,
     set_attr_opts: Option<SetAttrOpts>,
     return_file_blocks: bool,
+    release_block_id: Option<i64>,
 }
 
 pub trait WithClientContext {
@@ -213,6 +214,7 @@ impl FsClient {
                 path,
                 opts: ProtoUtils::create_opts_to_pb(opts, self.context.clone_client_name()),
                 flags: flags.value(),
+                first_block_client: None,
                 client_context: None,
             })
             .collect();
@@ -235,6 +237,38 @@ impl FsClient {
         opts: CreateFileOpts,
         overwrite: bool,
     ) -> FsResult<FileStatus> {
+        let (status, _) = self.create_file0(path, opts, overwrite, false).await?;
+        Ok(status)
+    }
+
+    /// Like `create_with_opts`, but also asks the master for the first block
+    /// when `client.alloc_first_block_on_create` is enabled. The returned block
+    /// is owned by the caller: write it or pass it to `release_block_id` of the
+    /// final CompleteFile.
+    pub async fn create_for_write(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        overwrite: bool,
+    ) -> FsResult<(FileStatus, Option<LocatedBlock>)> {
+        let alloc = self.can_alloc_first_block();
+        self.create_file0(path, opts, overwrite, alloc).await
+    }
+
+    /// Pre-allocation is skipped while workers are excluded: the master picks
+    /// the first block without the exclusion list that AddBlock carries, so it
+    /// could hand back a worker this client just failed to write to.
+    fn can_alloc_first_block(&self) -> bool {
+        self.conf().client.alloc_first_block_on_create && self.context.exclude_workers().is_empty()
+    }
+
+    async fn create_file0(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        overwrite: bool,
+        alloc_first_block: bool,
+    ) -> FsResult<(FileStatus, Option<LocatedBlock>)> {
         let flags = OpenFlags::new_write_only()
             .set_create(true)
             .set_overwrite(overwrite);
@@ -242,11 +276,16 @@ impl FsClient {
             path: path.encode(),
             opts: ProtoUtils::create_opts_to_pb(opts, self.context.clone_client_name()),
             flags: flags.value(),
+            first_block_client: alloc_first_block.then(|| self.context.client_addr_pb()),
             client_context: None,
         };
         let rep_header: CreateFileResponse = self.rpc(RpcCode::CreateFile, header).await?;
         let status = ProtoUtils::file_status_from_pb(rep_header.file_status);
-        Ok(status)
+        let first_block = rep_header
+            .first_block
+            .map(ProtoUtils::located_block_from_pb)
+            .filter(|v| !v.should_assign());
+        Ok((status, first_block))
     }
 
     pub async fn open_with_opts(
@@ -269,15 +308,57 @@ impl FsClient {
         flags: OpenFlags,
         client_name: &str,
     ) -> FsResult<FileBlocks> {
+        let (file_blocks, _) = self
+            .open_file0(path, opts, flags, false, client_name)
+            .await?;
+        Ok(file_blocks)
+    }
+
+    /// Write-open counterpart of `create_for_write`. The master only returns a
+    /// first block when the open leaves the file empty (O_CREAT or O_TRUNC).
+    pub async fn open_for_write(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+        alloc_first_block: bool,
+    ) -> FsResult<(FileBlocks, Option<LocatedBlock>)> {
+        let alloc = alloc_first_block
+            && self.can_alloc_first_block()
+            && !flags.read_only()
+            && (flags.create() || flags.truncate());
+        self.open_file0(
+            path,
+            opts,
+            flags,
+            alloc,
+            &self.context.clone_client_name(),
+        )
+        .await
+    }
+
+    async fn open_file0(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+        alloc_first_block: bool,
+        client_name: &str,
+    ) -> FsResult<(FileBlocks, Option<LocatedBlock>)> {
         let header = OpenFileRequest {
             path: path.encode(),
             opts: ProtoUtils::create_opts_to_pb(opts, client_name.to_string()),
             flags: flags.value(),
+            first_block_client: alloc_first_block.then(|| self.context.client_addr_pb()),
             client_context: None,
         };
         let rep_header: OpenFileResponse = self.rpc(RpcCode::OpenFile, header).await?;
-        let status = ProtoUtils::file_blocks_from_pb(rep_header.file_blocks);
-        Ok(status)
+        let file_blocks = ProtoUtils::file_blocks_from_pb(rep_header.file_blocks);
+        let first_block = rep_header
+            .first_block
+            .map(ProtoUtils::located_block_from_pb)
+            .filter(|v| !v.should_assign());
+        Ok((file_blocks, first_block))
     }
 
     /// Release the writer record registered by OpenFile. Idempotent and
@@ -649,6 +730,7 @@ impl FsClient {
                 only_flush,
                 set_attr_opts,
                 return_file_blocks: true,
+                release_block_id: None,
             },
         )
         .await
@@ -672,6 +754,7 @@ impl FsClient {
                 only_flush,
                 set_attr_opts,
                 return_file_blocks: true,
+                release_block_id: None,
             },
         )
         .await
@@ -693,6 +776,7 @@ impl FsClient {
                 only_flush: true,
                 set_attr_opts: None,
                 return_file_blocks: false,
+                release_block_id: None,
             },
         )
         .await
@@ -722,6 +806,7 @@ impl FsClient {
             inode_id,
             set_attr_opts: options.set_attr_opts.map(ProtoUtils::set_attr_opts_to_pb),
             return_file_blocks: Some(options.return_file_blocks),
+            release_block_id: options.release_block_id,
             client_context: None,
         };
 
@@ -756,6 +841,7 @@ impl FsClient {
                     inode_id: None,
                     set_attr_opts: None,
                     return_file_blocks: Some(false),
+                    release_block_id: None,
                     client_context: None,
                 }
             })

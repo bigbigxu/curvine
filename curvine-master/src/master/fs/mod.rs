@@ -45,7 +45,8 @@ mod full_block_report;
 mod master_filesystem;
 pub(crate) use self::master_filesystem::BlockInodeState;
 pub use self::master_filesystem::{
-    BlockReportResult, DeleteMode, FreeOutcome, FsModeSnapshot, MasterFilesystem,
+    BlockReportResult, CompleteFileOptions, DeleteMode, FreeOutcome, FsModeSnapshot,
+    MasterFilesystem,
 };
 
 mod delete_result;
