@@ -5347,6 +5347,7 @@ mod transfer_tests {
                 completed_size: 2048,
             }),
             task_details_expired: None,
+            takeover_count: None,
         };
         let value = transfer_status_payload(status);
         assert_eq!(value["total_files"], 10);

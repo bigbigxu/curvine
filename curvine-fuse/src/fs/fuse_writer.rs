@@ -33,6 +33,7 @@ use curvine_runtime::sync::{AtomicCounter, AtomicLong, ErrorMonitor};
 use log::{debug, error, warn};
 use std::sync::Arc;
 
+#[allow(clippy::large_enum_variant)]
 enum WriteTask {
     Write(i64, Bytes, Option<FuseResponse>),
     Flush(CallSender<FsResult<()>>, Option<FuseResponse>),

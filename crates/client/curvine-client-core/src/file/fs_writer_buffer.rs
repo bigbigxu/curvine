@@ -29,6 +29,7 @@ use log::{debug, error};
 use std::sync::Arc;
 
 // Control task type
+#[allow(clippy::large_enum_variant)]
 enum WriterTask {
     Flush(CallSender<i8>),
     Complete((bool, Option<SetAttrOpts>, CallSender<i8>)),
@@ -37,6 +38,7 @@ enum WriterTask {
     Resize((FileAllocOpts, CallSender<FileBlocks>)),
 }
 
+#[allow(clippy::large_enum_variant)]
 enum SelectTask {
     Control(WriterTask),
     Data(DataSlice),

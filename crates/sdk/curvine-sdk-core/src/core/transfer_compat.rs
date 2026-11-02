@@ -564,6 +564,7 @@ mod tests {
             cv_metadata_epoch: None,
             task_summary: None,
             task_details_expired: None,
+            takeover_count: None,
         };
         let job_status = job_status_from_transfer(status);
         assert_eq!(job_status.state, JobTaskState::Loading);
@@ -619,6 +620,7 @@ mod tests {
                 completed_size: 80,
             }),
             task_details_expired: None,
+            takeover_count: None,
         };
 
         let job_status = job_status_from_transfer(status);

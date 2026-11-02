@@ -158,10 +158,15 @@ fn shell_cache_with_empty_block_locations_is_not_readable() {
 
     // A replica on a worker that stopped serving is not readable, even though
     // the master still lists its location until it expires the worker.
-    let mut dead_worker = WorkerAddress::default();
-    dead_worker.worker_id = 7;
+    let dead_worker = WorkerAddress {
+        worker_id: 7,
+        ..Default::default()
+    };
     let on_dead = LocatedBlock::new(ExtendedBlock::with_id(4), vec![dead_worker.clone()]);
-    assert!(!located_blocks_readable(&[on_dead.clone()], Some(&live)));
+    assert!(!located_blocks_readable(
+        std::slice::from_ref(&on_dead),
+        Some(&live)
+    ));
 
     // One live replica is enough.
     let mixed = LocatedBlock::new(

@@ -21,7 +21,7 @@ use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;
 use curvine_model::{
     is_special_file_type, BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts,
-    FileGen, FileType, StoragePolicy, INTERNAL_CTIME_XATTR, INTERNAL_TTL_TYPE_XATTR,
+    FileGen, FileType, StoragePolicy, INTERNAL_CTIME_XATTR,
 };
 use curvine_runtime::common::LocalTime;
 use serde::{Deserialize, Serialize};

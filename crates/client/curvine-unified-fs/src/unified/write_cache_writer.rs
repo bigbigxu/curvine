@@ -29,6 +29,7 @@ use tokio::time;
 const WRITE_CACHE_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_CACHE_COMPLETE_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[allow(clippy::large_enum_variant)]
 enum MirrorTask {
     Write {
         pos: i64,
