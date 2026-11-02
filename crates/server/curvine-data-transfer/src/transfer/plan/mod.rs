@@ -1402,12 +1402,27 @@ impl TransferPlanner {
     /// with empty locations, e.g. after a worker restart dropped the only
     /// replica without triggering lost-worker invalidation) must be
     /// re-copied; a failed location query also forces a re-copy.
+    /// Worker ids that may still serve a replica. `None` means the cluster view
+    /// is not usable, which makes every cached target look unreadable: better to
+    /// re-copy than to claim success for data nobody can read.
+    fn live_worker_ids(&self) -> Option<std::collections::HashSet<u32>> {
+        let snapshot = self.cache.snapshot();
+        let ids: std::collections::HashSet<u32> = snapshot
+            .workers
+            .iter()
+            .filter(|worker| worker.is_live())
+            .map(|worker| worker.worker_id())
+            .collect();
+        (!ids.is_empty()).then_some(ids)
+    }
+
     async fn target_cache_readable(&self, path: &Path) -> bool {
         let start = Instant::now();
         let blocks = self.master_fs.get_block_locations(path).await;
         record_metadata_operation("cv", "get_block_locations", blocks.is_ok(), start);
+        let live = self.live_worker_ids();
         match blocks {
-            Ok(blocks) if located_blocks_readable(&blocks.block_locs) => true,
+            Ok(blocks) if located_blocks_readable(&blocks.block_locs, live.as_ref()) => true,
             Ok(_) => {
                 log::warn!(
                     "incremental load re-copies {}: cached blocks have no live locations",
@@ -1427,12 +1442,22 @@ impl TransferPlanner {
     }
 }
 
-/// A target with allocated blocks but no live locations is an unusable cache
-/// shell: metadata looks complete while every cached byte is gone. Matches the
-/// master's `cache_unreadable` semantics — partial replicas still count as
-/// readable.
-pub(crate) fn located_blocks_readable(block_locs: &[LocatedBlock]) -> bool {
-    block_locs.iter().all(|l| !l.locs.is_empty())
+/// A target whose blocks have no location the cluster can serve is an unusable
+/// cache shell: metadata looks complete while every cached byte is gone.
+///
+/// A location is only worth trusting when its worker still serves: the master
+/// keeps a dead worker's block locations until it expires the worker, so a job
+/// that skipped its targets on that snapshot would report success for data that
+/// no longer has a replica anywhere. Re-copying is idempotent, so an unknown
+/// worker set (`live == None`) is treated as not readable too.
+pub(crate) fn located_blocks_readable(
+    block_locs: &[LocatedBlock],
+    live: Option<&std::collections::HashSet<u32>>,
+) -> bool {
+    block_locs.iter().all(|l| match live {
+        Some(live) => l.locs.iter().any(|loc| live.contains(&loc.worker_id)),
+        None => false,
+    })
 }
 
 pub(crate) fn unchanged_load_target(source: &FileStatus, target: Option<&FileStatus>) -> bool {

@@ -139,19 +139,39 @@ fn incomplete_or_cv_missing_target_is_not_skipped() {
 #[test]
 fn shell_cache_with_empty_block_locations_is_not_readable() {
     use super::plan::located_blocks_readable;
+    use std::collections::HashSet;
+
+    let live: HashSet<u32> = [0u32].into_iter().collect();
 
     // No data blocks: nothing to lose (empty file).
-    assert!(located_blocks_readable(&[]));
+    assert!(located_blocks_readable(&[], Some(&live)));
 
     // Healthy blocks keep at least one live location.
     let healthy = LocatedBlock::new(ExtendedBlock::with_id(1), vec![WorkerAddress::default()]);
-    assert!(located_blocks_readable(&[healthy]));
+    assert!(located_blocks_readable(&[healthy], Some(&live)));
 
     // A single shell block makes the whole file unreadable.
     let partial = LocatedBlock::new(ExtendedBlock::with_id(2), vec![WorkerAddress::default()]);
     let shell = LocatedBlock::new(ExtendedBlock::with_id(3), vec![]);
-    assert!(located_blocks_readable(&[partial]));
-    assert!(!located_blocks_readable(&[shell]));
+    assert!(located_blocks_readable(&[partial], Some(&live)));
+    assert!(!located_blocks_readable(&[shell], Some(&live)));
+
+    // A replica on a worker that stopped serving is not readable, even though
+    // the master still lists its location until it expires the worker.
+    let mut dead_worker = WorkerAddress::default();
+    dead_worker.worker_id = 7;
+    let on_dead = LocatedBlock::new(ExtendedBlock::with_id(4), vec![dead_worker.clone()]);
+    assert!(!located_blocks_readable(&[on_dead.clone()], Some(&live)));
+
+    // One live replica is enough.
+    let mixed = LocatedBlock::new(
+        ExtendedBlock::with_id(5),
+        vec![dead_worker, WorkerAddress::default()],
+    );
+    assert!(located_blocks_readable(&[mixed], Some(&live)));
+
+    // An unusable cluster view must not be read as "all good".
+    assert!(!located_blocks_readable(&[on_dead], None));
 }
 
 #[test]
