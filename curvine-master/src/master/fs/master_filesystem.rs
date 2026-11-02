@@ -21,6 +21,9 @@ use crate::master::meta::{
     trash, CacheInvalidationResult, FsDir, RestoredTrashEntry, TrashListing, TrashScanPage,
 };
 
+use crate::master::fs::state::WorkerIntent;
+#[cfg(test)]
+use crate::master::fs::state_from_legacy;
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
@@ -35,7 +38,7 @@ use curvine_raft::conf::JournalConfExt;
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::GroupExecutor;
 use curvine_runtime::sync::ArcRwLock;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use std::borrow::Cow;
@@ -84,6 +87,9 @@ pub struct MasterFilesystem {
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
     worker_location_locks: Arc<Vec<Mutex<()>>>,
+    /// Drain progress for `DECOMMISSIONING` workers. Rebuilt from metadata after
+    /// a restart, so it is deliberately not journaled.
+    pub(crate) worker_drains: std::sync::Arc<std::sync::Mutex<crate::master::fs::worker_state::WorkerDrainRegistry>>,
     /// Serialises drains of `/.Trash/.pending`. The blocking empty-trash call
     /// owns the staging directory across staging and draining, and the
     /// background purger skips a cycle while that lock is held, so the two can
@@ -216,6 +222,7 @@ impl MasterFilesystem {
             ),
             pending_drain: Default::default(),
             fs_mode_releaser: Default::default(),
+            worker_drains: Default::default(),
         }
     }
 
@@ -250,6 +257,7 @@ impl MasterFilesystem {
             ),
             pending_drain: Default::default(),
             fs_mode_releaser: Default::default(),
+            worker_drains: Default::default(),
         }
     }
 
@@ -1504,9 +1512,9 @@ impl MasterFilesystem {
                         let (address, state) = if let Some(worker) =
                             worker_manager.get_worker(worker_id)
                         {
-                            (Some(worker.address.clone()), worker.status)
+                            (Some(worker.address.clone()), worker.status())
                         } else if let Some(worker) = worker_manager.get_known_worker(worker_id) {
-                            (Some(worker.address.clone()), WorkerStatus::Lost)
+                            (Some(worker.address.clone()), worker.status())
                         } else {
                             (None, WorkerStatus::Unknown)
                         };
@@ -1690,18 +1698,25 @@ impl MasterFilesystem {
             info.reserved_bytes += worker.reserved_bytes;
             info.block_num += worker.block_num;
 
-            match worker.status {
-                WorkerStatus::Live => {
-                    info.live_workers.push(worker.clone());
-                    // Only Live workers are eligible for new allocations, so the
-                    // allocatable view mirrors the allocation policy. Failed
-                    // storage dirs are already excluded from worker.capacity.
-                    info.allocatable_capacity += worker.capacity;
-                    info.allocatable_available += worker.allocatable_available().max(0);
-                }
-                WorkerStatus::Blacklist => info.blacklist_workers.push(worker.clone()),
-                WorkerStatus::Decommission => info.decommission_workers.push(worker.clone()),
-                _ => (),
+            // Buckets keep their wire names so a mixed-version console still
+            // works, but their meaning now follows the state model:
+            //   live_workers        -> writable (NORMAL + RUNNING)
+            //   blacklist_workers   -> alive but not taking new data
+            //                          (CORDONED / DECOMMISSIONING / STALE)
+            //   decommission_workers-> DECOMMISSIONED (drained, bytes retained)
+            //   lost_workers        -> LOST / SHUTDOWN entries pushed out of the map
+            let state = worker.state();
+            if state.writable() {
+                info.live_workers.push(worker.clone());
+                // Only writable workers are eligible for new allocations, so the
+                // allocatable view mirrors the allocation policy. Failed storage
+                // dirs are already excluded from worker.capacity.
+                info.allocatable_capacity += worker.capacity;
+                info.allocatable_available += worker.allocatable_available().max(0);
+            } else if state.admin() == AdminState::Decommissioned {
+                info.decommission_workers.push(worker.clone());
+            } else {
+                info.blacklist_workers.push(worker.clone());
             }
         }
 
@@ -1722,6 +1737,22 @@ impl MasterFilesystem {
     }
 
     // Add a test worker and unit tests will use it.
+    /// Records what an operator asked `host` to do and journals it.
+    ///
+    /// This is the only writer of operator intent. Heartbeats never call it, so
+    /// a restart or a leader failover cannot lose or overwrite a decision.
+    pub fn set_worker_intent(
+        &self,
+        host: &str,
+        intent: WorkerIntent,
+    ) -> FsResult<Option<WorkerIntent>> {
+        let previous = self.worker_manager.write().record_intent(host, intent.clone());
+
+        let fs_dir = self.fs_dir.read();
+        fs_dir.journal_writer.log_worker_intent(&fs_dir, host, intent)?;
+        Ok(previous)
+    }
+
     pub fn add_test_worker(&self, worker: WorkerInfo) {
         let mut wm = self.worker_manager.write();
         wm.add_test_worker(worker);
@@ -1872,7 +1903,12 @@ impl MasterFilesystem {
             .worker_manager
             .read()
             .get_worker(list.worker_id)
-            .is_some_and(|worker| worker.is_live() && worker.worker_session_id.is_empty())
+            .is_some_and(|worker| {
+                // Protocol compatibility, not placement: a legacy worker without a
+                // session still has to be able to report its blocks.
+                worker.liveness() == curvine_model::Liveness::Running
+                    && worker.worker_session_id.is_empty()
+            })
         {
             return Ok(None);
         }
@@ -1880,11 +1916,48 @@ impl MasterFilesystem {
             .map(Some)
     }
 
+    /// Whether block reports from `worker_id` may change the replica set.
+    ///
+    /// A node that is being drained or has been drained keeps its bytes on disk
+    /// but its locations belong to the drain, not to the node: accepting a
+    /// report would resurrect a location the drain just removed and the drain
+    /// could never converge. Deletes are suppressed for the same reason —
+    /// removing bytes from disk is an explicit operator action, never a side
+    /// effect of a state change.
+    fn suppresses_block_report(&self, worker_id: u32) -> bool {
+        let wm = self.worker_manager.read();
+        wm.get_worker(worker_id).is_some_and(|worker| {
+            matches!(
+                worker.admin(),
+                AdminState::Decommissioning | AdminState::Decommissioned
+            )
+        })
+    }
+
     fn block_report_locked(
         &self,
         list: BlockReportList,
         replication_handler: Option<MasterReplicationHandler>,
     ) -> FsResult<BlockReportResult> {
+        // A draining or drained worker keeps its data but not its locations.
+        // Ignore the report and return no delete commands: the bytes must stay
+        // on disk until an explicit recommission reconciles them.
+        if self.suppresses_block_report(list.worker_id) {
+            info!(
+                "Ignore block report from {} worker {} ({} blocks)",
+                self.worker_manager
+                    .read()
+                    .get_worker(list.worker_id)
+                    .map(|worker| worker.state().to_string())
+                    .unwrap_or_else(|| "gone".to_string()),
+                list.worker_id,
+                list.blocks.len()
+            );
+            return Ok(BlockReportResult {
+                delete_blocks: Vec::new(),
+            });
+        }
+
         // @todo check cluster.
         let limit_replicas = list.full_report;
         let invalidate_full_reconcile = !list.full_report
@@ -2048,6 +2121,13 @@ impl MasterFilesystem {
         delete_blocks.extend(applied?);
         delete_blocks.sort_unstable();
         delete_blocks.dedup();
+        debug!(
+            "block report from worker {}: full={}, reported={}, deletes={}",
+            list.worker_id,
+            limit_replicas,
+            list.total_len,
+            delete_blocks.len()
+        );
 
         Ok(BlockReportResult { delete_blocks })
     }
@@ -2167,6 +2247,12 @@ impl MasterFilesystem {
             let fs_dir = self.fs_dir.read();
             fs_dir.get_worker_block_ids(worker_id)?
         };
+        debug!(
+            "full block reconcile for worker {}: {} recorded location(s), {} reported block(s)",
+            worker_id,
+            existing_blocks.len(),
+            reported_blocks.len()
+        );
 
         let mut stale_block_ids = Vec::new();
         let mut batch = Vec::new();
@@ -2226,12 +2312,28 @@ impl MasterFilesystem {
                     .iter()
                     .any(|current| current.worker_id == worker_id)
                 {
+                    debug!(
+                        "block report: block {} already recorded on worker {}",
+                        block_id, worker_id
+                    );
                     continue;
                 }
                 if limit_replicas && state.locations.len() >= state.replicas as usize {
+                    debug!(
+                        "block report: block {} ask worker {} to delete, already at {} of {} replicas ({:?})",
+                        block_id,
+                        worker_id,
+                        state.locations.len(),
+                        state.replicas,
+                        state.locations
+                    );
                     delete_blocks.push(block_id);
                     continue;
                 }
+                debug!(
+                    "block report: add block {} location for worker {} ({:?}, replicas {})",
+                    block_id, worker_id, state.locations, state.replicas
+                );
                 accepted.push((true, block_id, location));
             }
             fs_dir.block_report(accepted)?;
@@ -2256,6 +2358,11 @@ impl MasterFilesystem {
         self.delete_locations_unchecked(worker_id)
     }
 
+    /// Session-guarded location cleanup, kept for the recovery tests.
+    ///
+    /// The heartbeat path no longer calls it on `End`: a graceful shutdown keeps
+    /// its locations until the grace period expires (see `HeartbeatChecker`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn delete_lost_worker_locations(
         &self,
         worker_id: u32,
@@ -2277,6 +2384,11 @@ impl MasterFilesystem {
             let fs_dir = self.fs_dir.write();
             fs_dir.delete_locations(worker_id)?
         };
+        info!(
+            "Dropped all {} block location(s) of worker {} from metadata",
+            removed_block_ids.len(),
+            worker_id
+        );
         let mut invalidated = CacheInvalidationResult::default();
 
         for chunk in removed_block_ids.chunks(Self::LOST_WORKER_INVALIDATION_CHUNK) {
@@ -2616,13 +2728,13 @@ mod tests {
     }
 
     #[test]
-    fn multiblock_open_preserves_order_and_filters_current_worker_state() {
+    fn multiblock_open_preserves_order_and_filters_unreadable_workers() {
         for count in [0, 1, 16, 256] {
             let fs = test_fs(&format!("multiblock-open-{count}"));
             let worker = |id, status| {
                 let mut worker = WorkerInfo::default();
                 worker.address.worker_id = id;
-                worker.status = status;
+                worker.apply_state(state_from_legacy(status));
                 worker
             };
             for id in [100, 200] {
@@ -2711,7 +2823,11 @@ mod tests {
                 expected_ids
             );
 
+            // STALE degrades but still serves reads (design §5.2).
             fs.add_test_worker(worker(100, WorkerStatus::Blacklist));
+            check(fs.get_block_locations(path).unwrap(), &[100, 200]);
+            // DECOMMISSIONED does not.
+            fs.add_test_worker(worker(100, WorkerStatus::Decommission));
             check(fs.get_block_locations(path).unwrap(), &[200]);
             fs.add_test_worker(worker(200, WorkerStatus::Decommission));
             if count == 0 {
@@ -2724,6 +2840,520 @@ mod tests {
                     .contains("all replicas has been lost"));
             }
         }
+    }
+
+    // ---- worker state machine + drain -------------------------------------
+
+    fn drain_conf(name: &str) -> ClusterConf {
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.block_replication_enabled = true;
+        conf.master.worker_drain_scan_interval = "0s".to_string();
+        conf.master.meta_dir = Utils::test_sub_dir(format!(
+            "worker-state-test/meta-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!(
+            "worker-state-test/journal-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        conf
+    }
+
+    fn drain_fs(name: &str) -> MasterFilesystem {
+        Master::init_test_metrics();
+        let conf = drain_conf(name);
+        JournalSystem::fs_only_for_test(&conf).unwrap()
+    }
+
+    fn worker_on(id: u32, host: &str) -> WorkerInfo {
+        let mut worker = WorkerInfo::new(
+            WorkerAddress {
+                worker_id: id,
+                hostname: host.to_string(),
+                ..Default::default()
+            },
+            1,
+        );
+        worker.available = 1 << 30;
+        worker.capacity = 1 << 30;
+        worker
+    }
+
+    /// Creates a file with one block whose only location is `worker_id`.
+    fn block_on_worker(fs: &MasterFilesystem, path: &str, worker_id: u32) -> i64 {
+        let opts = CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .replicas(1)
+            .build();
+        fs.create_with_opts(path, opts, OpenFlags::new_create())
+            .unwrap();
+        let block = fs
+            .add_block(
+                path,
+                None,
+                ClientAddress::default(),
+                vec![],
+                vec![],
+                0,
+                None,
+            )
+            .unwrap();
+        let block_id = block.block.id;
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(worker_id))
+            .unwrap();
+        block_id
+    }
+
+    fn locations_of(fs: &MasterFilesystem, block_id: i64) -> Vec<u32> {
+        let mut ids = fs
+            .fs_dir
+            .read()
+            .get_block_locations(block_id)
+            .unwrap()
+            .into_iter()
+            .map(|location| location.worker_id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn cordon_stops_placement_keeps_reads_and_journals_the_intent() {
+        let fs = drain_fs("cordon");
+        fs.add_test_worker(worker_on(1, "h1"));
+
+        let outcome = fs
+            .apply_operator_action("h1", Trigger::Cordon, "alice", "disk is slow")
+            .unwrap();
+
+        assert_eq!(outcome.to_label(), "cordoned/running");
+        let worker = fs.worker_manager.read().get_worker(1).unwrap().clone();
+        assert_eq!(worker.admin(), curvine_model::AdminState::Cordoned);
+        assert!(!worker.writable(), "a cordoned worker takes no new data");
+        assert!(worker.readable(), "a cordoned worker still serves reads");
+
+        let intents = fs.worker_intents();
+        let intent = intents.get("h1").expect("intent must be recorded");
+        assert_eq!(intent.operator, "alice");
+        assert_eq!(intent.reason, "disk is slow");
+    }
+
+    #[test]
+    fn decommission_requires_the_replication_pipeline() {
+        let fs = test_fs("decommission-requires-replication");
+        fs.add_test_worker(worker_on(1, "h1"));
+
+        let err = fs
+            .apply_operator_action("h1", Trigger::Decommission, "alice", "retire")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("block_replication_enabled"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn decommission_then_drain_completion_lands_on_decommissioned() {
+        let fs = drain_fs("drain-complete");
+        fs.add_test_worker(worker_on(1, "h1"));
+        fs.add_test_worker(worker_on(2, "h2"));
+        let block_id = block_on_worker(&fs, "/drain.log", 1);
+
+        fs.apply_operator_action("h1", Trigger::Decommission, "alice", "retire")
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager.read().get_worker(1).unwrap().admin(),
+            curvine_model::AdminState::Decommissioning
+        );
+
+        // The tick queues the block, and the replication pipeline would then copy
+        // it. Simulate the committed copy.
+        let tick = fs.drain_tick().unwrap();
+        assert_eq!(tick.to_queue, vec![(1, block_id)]);
+
+        let moved = fs
+            .commit_drain_move(block_id, BlockLocation::with_id(2), 1)
+            .unwrap();
+        assert!(moved);
+        assert_eq!(
+            locations_of(&fs, block_id),
+            vec![2],
+            "the location must move, not duplicate"
+        );
+        assert!(fs.drain_pending(1).is_empty());
+
+        let tick = fs.drain_tick().unwrap();
+        assert_eq!(tick.completed.len(), 1);
+        let worker = fs.worker_manager.read().get_worker(1).unwrap().clone();
+        assert_eq!(worker.admin(), curvine_model::AdminState::Decommissioned);
+        assert!(!worker.readable());
+        assert_eq!(
+            fs.worker_intents().admin_of("h1"),
+            curvine_model::AdminState::Decommissioned
+        );
+    }
+
+    #[test]
+    fn drain_does_not_duplicate_replicas_when_the_target_already_has_one() {
+        let fs = drain_fs("drain-idempotent");
+        fs.add_test_worker(worker_on(1, "h1"));
+        fs.add_test_worker(worker_on(2, "h2"));
+        let block_id = block_on_worker(&fs, "/drain-idem.log", 1);
+        fs.apply_operator_action("h1", Trigger::Decommission, "alice", "retire")
+            .unwrap();
+        fs.drain_tick().unwrap();
+
+        // Target already holds a copy: only the draining location is dropped.
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(2))
+            .unwrap();
+        assert!(fs
+            .commit_drain_move(block_id, BlockLocation::with_id(2), 1)
+            .unwrap());
+        assert_eq!(locations_of(&fs, block_id), vec![2]);
+        // Idempotent retry: the draining location is gone, nothing changes.
+        assert!(!fs
+            .commit_drain_move(block_id, BlockLocation::with_id(2), 1)
+            .unwrap());
+    }
+
+    #[test]
+    fn force_completion_drops_locations_and_records_orphans() {
+        let fs = drain_fs("force-drain");
+        fs.add_test_worker(worker_on(1, "h1"));
+        fs.add_test_worker(worker_on(2, "h2"));
+        let block_id = block_on_worker(&fs, "/force.log", 1);
+        fs.apply_operator_action("h1", Trigger::Decommission, "alice", "retire")
+            .unwrap();
+        fs.drain_tick().unwrap();
+
+        // Deadline in the past.
+        let mut intent = fs.worker_intents().get("h1").cloned().unwrap();
+        intent.drain_deadline_ms = 1;
+        fs.set_worker_intent("h1", intent).unwrap();
+        {
+            let mut registry = fs.drains().lock().unwrap();
+            registry.set_deadline(1, 1);
+        }
+
+        // A passed deadline must NOT complete the drain on its own: forcing drops
+        // locations and can lose the last copy, so it stays an operator decision
+        // (design §4.1 #6). The tick only reports the stall.
+        let tick = fs.drain_tick().unwrap();
+        assert!(tick.completed.is_empty());
+        assert_eq!(locations_of(&fs, block_id), vec![1]);
+        assert!(
+            fs.drain_progress(1).unwrap().past_deadline,
+            "a passed deadline must be reported without completing the drain"
+        );
+        assert_eq!(
+            fs.worker_manager.read().get_worker(1).unwrap().admin(),
+            curvine_model::AdminState::Decommissioning
+        );
+
+        // The operator forces it explicitly: locations are dropped AND the residual
+        // bytes are deleted on the worker, so the disk can be returned.
+        fs.apply_operator_action("h1", Trigger::ForceDecommission, "alice", "data is retired")
+            .unwrap();
+        assert!(locations_of(&fs, block_id).is_empty());
+        let cmds = fs.worker_manager.write().block_map.handle_heartbeat(1);
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [curvine_model::WorkerCommand::DeleteBlock(cmd)] if cmd.blocks == vec![block_id]
+            ),
+            "a forced completion must tell the worker to delete the residual block"
+        );
+        let worker = fs.worker_manager.read().get_worker(1).unwrap().clone();
+        assert_eq!(worker.admin(), curvine_model::AdminState::Decommissioned);
+
+        let intent = fs.worker_intents().get("h1").cloned().unwrap();
+        assert_eq!(intent.orphan_count, 1, "the orphan must be recorded");
+        assert_eq!(intent.orphan_blocks, vec![block_id]);
+    }
+
+    #[test]
+    fn forced_completion_does_not_report_a_block_with_another_copy_as_lost() {
+        let fs = drain_fs("force-with-copy");
+        fs.add_test_worker(worker_on(1, "h1"));
+        fs.add_test_worker(worker_on(2, "h2"));
+        let block_id = block_on_worker(&fs, "/force-copy.log", 1);
+        // The same block also lives on h2: forcing only removes a duplicate.
+        fs.fs_dir
+            .write()
+            .add_block_location(block_id, BlockLocation::with_id(2))
+            .unwrap();
+        fs.apply_operator_action("h1", Trigger::Decommission, "alice", "retire")
+            .unwrap();
+        fs.drain_tick().unwrap();
+
+        // No deadline influence here: force directly (guard only needs the deadline
+        // when it is set; a missing deadline means "never report", so set one that
+        // has passed to exercise the operator path).
+        let mut intent = fs.worker_intents().get("h1").cloned().unwrap();
+        intent.drain_deadline_ms = 1;
+        fs.set_worker_intent("h1", intent).unwrap();
+        fs.drains().lock().unwrap().set_deadline(1, 1);
+        fs.apply_operator_action("h1", Trigger::ForceDecommission, "alice", "forced")
+            .unwrap();
+
+        assert_eq!(
+            locations_of(&fs, block_id),
+            vec![2],
+            "the surviving replica must stay"
+        );
+        let intent = fs.worker_intents().get("h1").cloned().unwrap();
+        assert_eq!(
+            intent.orphan_count, 0,
+            "a block with another copy is not lost data"
+        );
+        assert!(intent.orphan_blocks.is_empty());
+        // The deleted copy is still announced to the worker.
+        let cmds = fs.worker_manager.write().block_map.handle_heartbeat(1);
+        assert!(matches!(
+            cmds.as_slice(),
+            [curvine_model::WorkerCommand::DeleteBlock(cmd)] if cmd.blocks == vec![block_id]
+        ));
+    }
+
+    #[test]
+    fn recommission_clears_the_intent_and_restores_placement() {
+        let fs = drain_fs("recommission");
+        fs.add_test_worker(worker_on(1, "h1"));
+        fs.add_test_worker(worker_on(2, "h2"));
+        let block_id = block_on_worker(&fs, "/recommission.log", 1);
+        fs.apply_operator_action("h1", Trigger::Decommission, "alice", "retire")
+            .unwrap();
+        fs.drain_tick().unwrap();
+
+        // Forcing before the deadline is refused: the guard the design asks for.
+        assert!(fs
+            .apply_operator_action("h1", Trigger::ForceDecommission, "alice", "forced")
+            .is_err());
+
+        let mut intent = fs.worker_intents().get("h1").cloned().unwrap();
+        intent.drain_deadline_ms = 1;
+        fs.set_worker_intent("h1", intent).unwrap();
+        fs.drains().lock().unwrap().set_deadline(1, 1);
+        fs.apply_operator_action("h1", Trigger::ForceDecommission, "alice", "forced")
+            .unwrap();
+
+        fs.apply_operator_action("h1", Trigger::Recommission, "alice", "returned")
+            .unwrap();
+        assert!(fs.worker_intents().get("h1").is_none());
+        let worker = fs.worker_manager.read().get_worker(1).unwrap().clone();
+        assert!(worker.writable());
+        let _ = block_id;
+    }
+
+    #[test]
+    fn draining_worker_block_report_cannot_undo_the_drain() {
+        let fs = drain_fs("drain-report-ignored");
+        fs.add_test_worker(worker_on(1, "h1"));
+        fs.add_test_worker(worker_on(2, "h2"));
+        let block_id = block_on_worker(&fs, "/drain-report.log", 1);
+        fs.apply_operator_action("h1", Trigger::Decommission, "alice", "retire")
+            .unwrap();
+        fs.drain_tick().unwrap();
+        fs.commit_drain_move(block_id, BlockLocation::with_id(2), 1)
+            .unwrap();
+
+        // A full report from the draining worker still lists the block it has on
+        // disk. Accepting it would put the location back and the drain would
+        // never converge.
+        let report = BlockReportList {
+            cluster_id: "test".into(),
+            worker_id: 1,
+            full_report: true,
+            total_len: 1,
+            report_id: 1,
+            blocks: vec![BlockReportInfo {
+                id: block_id,
+                status: BlockReportStatus::Finalized,
+                storage_type: StorageType::Disk,
+                block_size: 1,
+            }],
+        };
+        let result = fs.block_report_locked(report, None).unwrap();
+        assert!(result.delete_blocks.is_empty());
+        assert_eq!(locations_of(&fs, block_id), vec![2]);
+    }
+
+    #[test]
+    fn decommission_preflight_counts_single_replica_blocks() {
+        let fs = drain_fs("drain-preflight");
+        fs.add_test_worker(worker_on(1, "h1"));
+        fs.add_test_worker(worker_on(2, "h2"));
+        let block_id = block_on_worker(&fs, "/preflight.log", 1);
+
+        fs.apply_operator_action("h1", Trigger::Decommission, "alice", "retire")
+            .unwrap();
+
+        let intent = fs.worker_intents().get("h1").cloned().unwrap();
+        assert_eq!(intent.preflight_blocks, 1);
+        assert_eq!(
+            intent.preflight_single_replica, 1,
+            "the only copy is on the draining worker"
+        );
+        let progress = fs.drain_progress(1).unwrap();
+        assert_eq!(progress.remaining_count(), 1);
+        assert_eq!(progress.single_replica_blocks, 1);
+        assert_eq!(progress.remaining.iter().copied().collect::<Vec<_>>(), vec![block_id]);
+    }
+
+    #[test]
+    fn drain_starts_after_a_stale_node_recovers() {
+        let fs = drain_fs("drain-after-recovery");
+        fs.add_test_worker(worker_on(1, "h1"));
+        fs.add_test_worker(worker_on(2, "h2"));
+        block_on_worker(&fs, "/recovered-drain.log", 1);
+
+        // Operator decides while the node is stale: only the intent changes.
+        fs.worker_manager.write().mark_stale(1);
+        fs.apply_operator_action("h1", Trigger::Decommission, "alice", "retire")
+            .unwrap();
+        assert_eq!(
+            fs.worker_manager.read().get_worker(1).unwrap().admin(),
+            curvine_model::AdminState::Decommissioning
+        );
+        assert!(fs.drain_progress(1).is_none(), "no drain while unreachable");
+
+        // The node comes back: the next tick rebuilds the drain and journals the
+        // preflight it could not take before.
+        {
+            // Simulate the heartbeat restoring liveness.
+            let mut wm = fs.worker_manager.write();
+            let worker = wm.worker_map.workers.get_mut(&1).unwrap();
+            worker.apply_state(curvine_model::WorkerState::new(
+                worker.admin(),
+                curvine_model::Liveness::Running,
+            ));
+        }
+        let tick = fs.drain_tick().unwrap();
+        assert_eq!(tick.to_queue.len(), 1);
+        let progress = fs.drain_progress(1).unwrap();
+        assert_eq!(progress.remaining_count(), 1);
+        assert_eq!(progress.single_replica_blocks, 1);
+        assert!(progress.deadline_ms > 0, "the intent deadline is restored");
+        let intent = fs.worker_intents().get("h1").cloned().unwrap();
+        assert_eq!(intent.preflight_blocks, 1);
+    }
+
+    #[test]
+    fn drain_stalls_without_a_target_and_when_stale() {
+        let fs = drain_fs("drain-stalls");
+        fs.add_test_worker(worker_on(1, "h1"));
+        block_on_worker(&fs, "/stall.log", 1);
+        fs.apply_operator_action("h1", Trigger::Decommission, "alice", "retire")
+            .unwrap();
+
+        // Only one worker exists: there is nowhere to copy to.
+        let tick = fs.drain_tick().unwrap();
+        assert!(tick.to_queue.is_empty());
+        assert_eq!(
+            fs.drain_progress(1).unwrap().stalled,
+            Some(crate::master::fs::DrainStall::NoTarget)
+        );
+
+        // Add a target: work is queued again.
+        fs.add_test_worker(worker_on(2, "h2"));
+        let tick = fs.drain_tick().unwrap();
+        assert_eq!(tick.to_queue.len(), 1);
+        assert_eq!(fs.drain_progress(1).unwrap().stalled, None);
+
+        // A stale node cannot move its own data.
+        fs.worker_manager.write().mark_stale(1);
+        let tick = fs.drain_tick().unwrap();
+        assert!(tick.to_queue.is_empty());
+        assert_eq!(
+            fs.drain_progress(1).unwrap().stalled,
+            Some(crate::master::fs::DrainStall::Stale)
+        );
+    }
+
+    #[test]
+    fn heartbeat_transitions_never_touch_the_intent_table() {
+        let fs = drain_fs("heartbeat-no-intent");
+        fs.add_test_worker(worker_on(1, "h1"));
+
+        fs.apply_heartbeat_action(1, Trigger::StaleTimeout, "late heartbeat")
+            .unwrap();
+        assert!(fs.worker_intents().is_empty(), "liveness is not intent");
+        assert_eq!(
+            fs.worker_manager.read().get_worker(1).unwrap().liveness(),
+            curvine_model::Liveness::Stale
+        );
+
+        // A heartbeat recovers liveness but keeps the admin axis.
+        fs.worker_manager.write().record_intent(
+            "h1",
+            WorkerIntent::new(
+                curvine_model::AdminState::Cordoned,
+                "alice",
+                "maintenance",
+                0,
+            ),
+        );
+        fs.apply_heartbeat_action(1, Trigger::HeartbeatOk, "heartbeat")
+            .unwrap();
+        let worker = fs.worker_manager.read().get_worker(1).unwrap().clone();
+        assert_eq!(worker.admin(), curvine_model::AdminState::Cordoned);
+        assert_eq!(worker.liveness(), curvine_model::Liveness::Running);
+    }
+
+    #[test]
+    fn promotion_drops_locations_of_decommissioned_hosts() {
+        let fs = drain_fs("promotion-sweep");
+        fs.add_test_worker(worker_on(1, "h1"));
+        let block_id = block_on_worker(&fs, "/promotion.log", 1);
+
+        // The intent is journaled; the location set is not, so a follower that
+        // becomes leader still has the pre-drain location.
+        fs.worker_manager.write().record_intent(
+            "h1",
+            WorkerIntent::new(
+                curvine_model::AdminState::Decommissioned,
+                "alice",
+                "retired",
+                0,
+            ),
+        );
+        assert_eq!(locations_of(&fs, block_id), vec![1]);
+
+        let cleanup = fs.drop_locations_of_decommissioned_hosts().unwrap();
+
+        assert_eq!(cleanup.dropped, 1);
+        assert_eq!(
+            cleanup.under_replicated,
+            vec![block_id],
+            "the block dropped below its replica count and must be repaired"
+        );
+        assert!(locations_of(&fs, block_id).is_empty());
+        assert_eq!(
+            fs.worker_intents().admin_of("h1"),
+            curvine_model::AdminState::Decommissioned,
+            "the cleanup must not touch the intent"
+        );
+        // Bytes stay on the worker: only metadata is cleaned.
+        assert_eq!(
+            fs.worker_manager.read().get_worker(1).unwrap().admin(),
+            curvine_model::AdminState::Decommissioned
+        );
+    }
+
+    #[test]
+    fn purge_refuses_a_heartbeating_worker() {
+        let fs = drain_fs("purge-guard");
+        fs.add_test_worker(worker_on(1, "h1"));
+        let err = fs.purge_worker("h1", "alice").unwrap_err();
+        assert!(err.to_string().contains("still heartbeating"), "{err}");
     }
 
     #[test]
@@ -3010,7 +3640,7 @@ mod tests {
             },
             1,
         );
-        worker.status = status;
+        worker.apply_state(state_from_legacy(status));
         worker.capacity = capacity;
         worker.available = available;
         worker
@@ -3056,6 +3686,74 @@ mod tests {
     }
 
     #[test]
+    fn set_worker_intent_records_and_clears_the_record() {
+        let fs = test_fs("set-worker-intent");
+        let host = "host-a";
+
+        let previous = fs
+            .set_worker_intent(
+                host,
+                WorkerIntent::new(AdminState::Decommissioned, "alice", "return", 0),
+            )
+            .unwrap();
+        assert!(previous.is_none());
+        assert_eq!(
+            fs.worker_manager.read().worker_map.intents.admin_of(host),
+            AdminState::Decommissioned
+        );
+
+        let previous = fs
+            .set_worker_intent(host, WorkerIntent::new(AdminState::Normal, "alice", "back", 0))
+            .unwrap();
+        assert_eq!(previous.map(|intent| intent.admin), Some(AdminState::Decommissioned));
+        assert_eq!(
+            fs.worker_manager.read().worker_map.intents.admin_of(host),
+            AdminState::Normal,
+            "a Normal intent must clear the record"
+        );
+    }
+
+    #[test]
+    fn decommissioned_worker_block_report_is_ignored_without_deletes() {
+        let fs = test_fs("decommissioned-report-ignored");
+        let mut worker = WorkerInfo::new(
+            WorkerAddress {
+                worker_id: 99,
+                hostname: "host-99".into(),
+                ..Default::default()
+            },
+            1,
+        );
+        worker.apply_state(state_from_legacy(WorkerStatus::Decommission));
+        fs.add_test_worker(worker);
+
+        let report = BlockReportList {
+            cluster_id: "test".into(),
+            worker_id: 99,
+            full_report: true,
+            total_len: 1,
+            report_id: 1,
+            blocks: vec![BlockReportInfo {
+                id: 1,
+                status: BlockReportStatus::Finalized,
+                storage_type: StorageType::Disk,
+                block_size: 1,
+            }],
+        };
+
+        let result = fs.block_report_locked(report, None).unwrap();
+
+        assert!(
+            result.delete_blocks.is_empty(),
+            "a decommissioned worker must not be asked to delete its data"
+        );
+        assert!(
+            fs.fs_dir.read().get_worker_block_ids(99).unwrap().is_empty(),
+            "a decommissioned worker must not re-enter the replica set"
+        );
+    }
+
+    #[test]
     fn filesystem_info_allocatable_excludes_failed_storage_dirs() {
         // A Live worker with a healthy dir plus a failed dir: add_storage already
         // skips failed dirs, so neither total nor allocatable capacity should
@@ -3068,7 +3766,7 @@ mod tests {
             },
             1,
         );
-        worker.status = WorkerStatus::Live;
+        worker.apply_state(state_from_legacy(WorkerStatus::Live));
         worker.add_storage(StorageInfo {
             dir_id: 1,
             storage_id: "healthy".into(),

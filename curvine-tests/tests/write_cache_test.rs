@@ -113,7 +113,7 @@ fn test_cache_mode_recaches_after_lost_worker_cleanup() {
         // the cache reload while still allowing the mini-cluster to start.
         .mutate_conf(|conf| {
             conf.master.heartbeat_interval = "10s".to_string();
-            conf.master.worker_blacklist_interval = "20s".to_string();
+            conf.master.worker_stale_interval = "20s".to_string();
             conf.master.worker_lost_interval = "30s".to_string();
         })
         .build()

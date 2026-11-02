@@ -18,7 +18,7 @@ use crate::master::replication::master_replication_manager::MasterReplicationMan
 use crate::master::MasterMonitor;
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_runtime::common::{LocalTime, TimeSpent};
+use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::{GroupExecutor, LoopTask};
 use curvine_runtime::sync::{AtomicBool, AtomicCounter};
 use log::{error, info, warn};
@@ -28,8 +28,9 @@ pub struct HeartbeatChecker {
     fs: MasterFilesystem,
     monitor: MasterMonitor,
     executor: Arc<GroupExecutor>,
-    worker_blacklist_ms: u64,
+    worker_stale_ms: u64,
     worker_lost_ms: u64,
+    worker_shutdown_grace_ms: u64,
     replication_manager: Arc<MasterReplicationManager>,
     quota_manager: Arc<QuotaManager>,
     last_active: AtomicBool,
@@ -48,14 +49,16 @@ impl HeartbeatChecker {
         replication_manager: Arc<MasterReplicationManager>,
         quota_manager: Arc<QuotaManager>,
     ) -> Self {
-        let worker_blacklist_ms = fs.conf.worker_blacklist_interval_ms();
+        let worker_stale_ms = fs.conf.worker_stale_interval_ms();
         let worker_lost_ms = fs.conf.worker_lost_interval_ms();
+        let worker_shutdown_grace_ms = fs.conf.worker_shutdown_grace_ms();
         Self {
             fs,
             monitor,
             executor,
-            worker_blacklist_ms,
+            worker_stale_ms,
             worker_lost_ms,
+            worker_shutdown_grace_ms,
             replication_manager,
             quota_manager,
             last_active: AtomicBool::new(false),
@@ -78,7 +81,7 @@ impl LoopTask for HeartbeatChecker {
             return Ok(());
         }
 
-        let mut blacklisted_workers = Vec::new();
+        let mut stale_workers = Vec::new();
         let mut expired_workers = Vec::new();
         let baseline = self.heartbeat_baseline_ms.get();
         {
@@ -104,6 +107,31 @@ impl LoopTask for HeartbeatChecker {
                         workers.len()
                     );
                 }
+                if promoted {
+                    // Block locations are not journaled, so this node may hold the
+                    // pre-drain set. The journaled intent is authoritative; restore
+                    // it off the tick thread.
+                    let fs = self.fs.clone();
+                    let rm = self.replication_manager.clone();
+                    if let Err(e) = self.executor.spawn(move || {
+                        match fs.drop_locations_of_decommissioned_hosts() {
+                            Ok(cleanup) if !cleanup.under_replicated.is_empty() => {
+                                if let Err(e) = rm.report_under_replicated_blocks(
+                                    0,
+                                    cleanup.under_replicated,
+                                ) {
+                                    error!("cannot repair blocks after the promotion cleanup: {}", e);
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!("cannot restore decommissioned locations on promotion: {}", e)
+                            }
+                        }
+                    }) {
+                        warn!("cannot schedule the promotion location cleanup: {}", e);
+                    }
+                }
                 return Ok(());
             }
 
@@ -111,88 +139,63 @@ impl LoopTask for HeartbeatChecker {
 
             for (id, last_update) in workers {
                 let heartbeat = last_update.max(baseline);
-                if now > heartbeat + self.worker_blacklist_ms {
-                    // Worker blacklist timeout
-                    if let Some(worker) = wm.add_blacklist_worker(id) {
-                        blacklisted_workers.push((id, worker.address, worker.last_update));
+                if now > heartbeat + self.worker_stale_ms {
+                    // Liveness only: `STALE` keeps the locations and the admin
+                    // intent (design #9). The state change is applied under this
+                    // write lock, so remember the previous state and record the
+                    // event after the lock is released.
+                    let before = wm
+                        .worker_map
+                        .workers
+                        .get(&id)
+                        .map(|worker| worker.state());
+                    if let Some(worker) = wm.mark_stale(id) {
+                        stale_workers.push((id, worker.address, worker.last_update, before));
                     }
                 }
-
                 if now > heartbeat + self.worker_lost_ms {
-                    // Heartbeat timeout
                     expired_workers.push(id);
                 }
             }
         }
 
-        for (id, address, last_update) in blacklisted_workers {
+        for (id, address, last_update, before) in stale_workers {
             warn!(
-                "Worker {} ({}) last heartbeat {} has exceeded blacklist timeout {} ms",
-                id, address, last_update, self.worker_blacklist_ms
+                "Worker {} ({}) last heartbeat {} exceeded stale timeout {} ms; \
+                 no new data is placed there, reads degrade",
+                id, address, last_update, self.worker_stale_ms
             );
+            if let Some(before) = before {
+                self.fs.record_direct_state_change(
+                    id,
+                    before,
+                    curvine_model::Trigger::StaleTimeout,
+                    "heartbeat late",
+                );
+            }
         }
 
         for id in expired_workers {
-            let removed = {
+            let worker = {
                 let mut wm = self.fs.worker_manager.write();
-                if self.monitor.is_active() {
-                    wm.remove_expired_worker_if_stale(id, now, baseline, self.worker_lost_ms)
-                } else {
-                    None
-                }
-            };
-
-            let worker = match removed {
-                Some(worker) => worker,
-                None => {
-                    if !self.monitor.is_active() {
-                        warn!(
-                            "Skip lost-worker {} cleanup: node is no longer the active master",
-                            id
-                        );
-                        break;
-                    }
-                    continue;
-                }
-            };
-
-            let worker_session_id = worker.worker_session_id.clone();
-            warn!(
-                "Worker {} ({}) last heartbeat {} has exceeded lost timeout {} ms and will be removed",
-                id, worker.address, worker.last_update, self.worker_lost_ms
-            );
-
-            // Asynchronously delete all block location data.
-            let fs = self.fs.clone();
-            let rm = self.replication_manager.clone();
-            let res = self.executor.spawn(move || {
-                let spend = TimeSpent::new();
-                let cleanup = match fs.delete_lost_worker_locations(id, &worker_session_id) {
-                    Err(e) => {
-                        warn!("{}", curvine_core_error::err_msg!(e));
-                        Default::default()
-                    }
-                    Ok(Some(res)) => res,
-                    Ok(None) => return,
-                };
-                let replication_block_num = cleanup.replication_block_ids.len();
-                if let Err(e) = rm.report_under_replicated_blocks(id, cleanup.replication_block_ids)
-                {
-                    error!(
-                        "Errors on reporting under-replicated {} blocks. err: {:?}",
-                        replication_block_num, e
+                if !self.monitor.is_active() {
+                    warn!(
+                        "Skip lost-worker {} cleanup: node is no longer the active master",
+                        id
                     );
+                    break;
                 }
-                info!(
-                    "Delete worker {} all locations used {} ms",
-                    id,
-                    spend.used_ms()
-                );
-            });
-            if let Err(e) = &res {
-                warn!("{}", e);
-            }
+                wm.remove_expired_worker_if_stale(id, now, baseline, self.worker_lost_ms)
+            };
+
+            let Some(worker) = worker else {
+                continue;
+            };
+            self.retire_worker(id, &worker, "heartbeat lost");
         }
+
+        self.expire_shutdown_workers(now);
+        self.run_drain_tick();
 
         if let Ok(info) = self.fs.filesystem_info() {
             self.quota_manager.detector(Some(info));
@@ -204,6 +207,165 @@ impl LoopTask for HeartbeatChecker {
     fn terminate(&self) -> bool {
         self.monitor.is_stop()
     }
+}
+
+impl HeartbeatChecker {
+    /// `LOST`: the transition drops this worker's locations and asks for repairs.
+    /// Runs off the tick thread: dropping locations for a large worker is a
+    /// metadata write that must not stretch the heartbeat tick.
+    fn retire_worker(&self, id: u32, worker: &curvine_model::WorkerInfo, reason: &str) {
+        let worker_session_id = worker.worker_session_id.clone();
+        let address = worker.address.clone();
+        let last_update = worker.last_update;
+        warn!(
+            "Worker {} ({}) last heartbeat {} exceeded lost timeout {} ms; retiring",
+            id, address, last_update, self.worker_lost_ms
+        );
+        self.spawn_retire(id, worker_session_id, reason.to_string());
+    }
+
+    fn spawn_retire(&self, id: u32, worker_session_id: String, reason: String) {
+        let fs = self.fs.clone();
+        let rm = self.replication_manager.clone();
+        let res = self.executor.spawn(move || {
+            match fs.retire_lost_worker(id, &worker_session_id, &reason) {
+                Ok(Some(transition)) => {
+                    warn!(
+                        "Worker {} retired: {} -> {} ({} block locations dropped)",
+                        id,
+                        transition.from_label(),
+                        transition.to_label(),
+                        transition.under_replicated.len()
+                    );
+                    if let Err(e) = rm.report_under_replicated_blocks(
+                        id,
+                        transition.under_replicated.clone(),
+                    ) {
+                        error!(
+                            "Errors on reporting under-replicated {} blocks. err: {:?}",
+                            transition.under_replicated.len(),
+                            e
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => warn!("cannot retire worker {}: {}", id, e),
+            }
+        });
+        if let Err(e) = res {
+            warn!("cannot schedule retirement of worker {}: {}", id, e);
+        }
+    }
+
+    /// `SHUTDOWN` -> `LOST` once the grace period that protects a normal restart
+    /// from a replication storm has expired (design #11/#12).
+    /// Runs the grace-expiry transition off the tick thread.
+    fn spawn_shutdown_expiry(&self, id: u32, worker_session_id: String, now: u64) {
+        let fs = self.fs.clone();
+        let rm = self.replication_manager.clone();
+        let res = self.executor.spawn(move || {
+            match fs.expire_shutdown_worker(id, &worker_session_id, now, 0) {
+                Ok(Some(transition)) => {
+                    warn!(
+                        "Worker {} retired after its shutdown grace: {} -> {} ({} block locations dropped)",
+                        id,
+                        transition.from_label(),
+                        transition.to_label(),
+                        transition.under_replicated.len()
+                    );
+                    if let Err(e) = rm.report_under_replicated_blocks(
+                        id,
+                        transition.under_replicated.clone(),
+                    ) {
+                        error!(
+                            "Errors on reporting under-replicated {} blocks. err: {:?}",
+                            transition.under_replicated.len(),
+                            e
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => warn!("cannot expire shutdown grace of worker {}: {}", id, e),
+            }
+        });
+        if let Err(e) = res {
+            warn!("cannot schedule shutdown-grace expiry of worker {}: {}", id, e);
+        }
+    }
+
+    fn expire_shutdown_workers(&self, now: u64) {
+        let grace_ms = self.worker_shutdown_grace_ms;
+        let candidates: Vec<(u32, String)> = {
+            let wm = self.fs.worker_manager.read();
+            wm.worker_map
+                .lost_workers()
+                .iter()
+                .filter(|(_, worker)| worker.liveness() == curvine_model::Liveness::Shutdown)
+                .map(|(id, worker)| (*id, worker.worker_session_id.clone()))
+                .collect()
+        };
+        for (id, session) in candidates {
+            // Re-check under the same lock that guards the deadline, then retire
+            // off the tick thread like any other lost worker.
+            let due = {
+                let fs = self.fs.clone();
+                let wm = fs.worker_manager.read();
+                wm.get_known_worker(id).is_some_and(|worker| {
+                    worker.liveness() == curvine_model::Liveness::Shutdown
+                        && worker.worker_session_id == session
+                        && now >= worker.last_update.saturating_add(grace_ms)
+                })
+            };
+            if !due {
+                continue;
+            }
+            warn!("Shutdown grace of worker {} expired", id);
+            // A distinct trigger: `ShutdownGraceExpired` and `LostTimeout` have the
+            // same effects, but an operator reading the log must be able to tell a
+            // timeout from a grace expiry.
+            self.spawn_shutdown_expiry(id, session, now);
+        }
+    }
+
+    /// Feeds the drain loop: queue copy jobs and publish finished drains.
+    fn run_drain_tick(&self) {
+        let tick = match self.fs.drain_tick() {
+            Ok(tick) => tick,
+            Err(e) => {
+                warn!("drain tick failed: {}", e);
+                return;
+            }
+        };
+        if tick.is_empty() {
+            return;
+        }
+        for (_, block_id) in &tick.to_queue {
+            if let Err(e) = self.replication_manager.queue_drain_block(*block_id) {
+                warn!("cannot queue drain copy of block {}: {}", block_id, e);
+            }
+        }
+        for transition in tick.completed.iter() {
+            info!(
+                "Worker {} finished draining ({} -> {})",
+                transition.host,
+                transition.from_label(),
+                transition.to_label()
+            );
+            for worker_id in &transition.worker_ids {
+                if let Err(e) = self.replication_manager.report_under_replicated_blocks(
+                    *worker_id,
+                    transition.under_replicated.clone(),
+                ) {
+                    error!(
+                        "Errors on reporting under-replicated {} blocks. err: {:?}",
+                        transition.under_replicated.len(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+
 }
 
 #[cfg(test)]
@@ -306,6 +468,84 @@ mod tests {
     // (owner of the only GroupExecutor reference) is leaked instead of dropped.
     fn forget_checker(checker: HeartbeatChecker) {
         std::mem::forget(checker);
+    }
+
+    fn age_lost_worker(fs: &MasterFilesystem, age_ms: u64) {
+        let mut wm = fs.worker_manager.write();
+        let worker = wm.worker_map.lost_workers.get_mut(&WORKER_ID).unwrap();
+        worker.last_update = LocalTime::mills().saturating_sub(age_ms);
+    }
+
+    #[test]
+    fn stale_tick_keeps_locations_and_operator_intent() {
+        let (fs, checker) = fixture("stale-tick");
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+        // First tick is the promotion tick: it only re-bases the baseline.
+        checker.run().unwrap();
+
+        fs.worker_manager.write().record_intent(
+            "",
+            crate::master::fs::state::WorkerIntent::new(
+                curvine_model::AdminState::Cordoned,
+                "alice",
+                "maintenance",
+                0,
+            ),
+        );
+        let stale_ms = fs.conf.worker_stale_interval_ms();
+        set_heartbeat_age(&fs, stale_ms + 1_000);
+        checker
+            .heartbeat_baseline_ms
+            .set(LocalTime::mills().saturating_sub(stale_ms + 2_000));
+        checker.run().unwrap();
+
+        assert!(worker_present(&fs), "STALE keeps the worker registered");
+        assert_eq!(
+            location_count(&fs),
+            1,
+            "STALE must not drop block locations"
+        );
+        let worker = fs.worker_manager.read().get_worker(WORKER_ID).unwrap().clone();
+        assert_eq!(worker.liveness(), curvine_model::Liveness::Stale);
+        assert_eq!(
+            worker.admin(),
+            curvine_model::AdminState::Cordoned,
+            "a heartbeat timeout must not overwrite the operator intent"
+        );
+        forget_checker(checker);
+    }
+
+    #[test]
+    fn graceful_shutdown_keeps_locations_until_the_grace_expires() {
+        let (fs, checker) = fixture("shutdown-grace");
+        fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
+        checker.run().unwrap();
+        fs.worker_manager.write().shutdown_worker(WORKER_ID).unwrap();
+
+        assert_eq!(location_count(&fs), 1, "an End heartbeat keeps data");
+        assert_eq!(
+            fs.worker_manager
+                .read()
+                .get_known_worker(WORKER_ID)
+                .unwrap()
+                .liveness(),
+            curvine_model::Liveness::Shutdown
+        );
+
+        // Inside the grace period nothing happens: a restart must not trigger a
+        // replication storm.
+        checker.run().unwrap();
+        assert_eq!(location_count(&fs), 1);
+
+        age_lost_worker(&fs, fs.conf.worker_shutdown_grace_ms() + 1_000);
+        checker.run().unwrap();
+        // The retirement runs off the tick thread.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while location_count(&fs) > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(location_count(&fs), 0, "grace expiry drops the locations");
+        forget_checker(checker);
     }
 
     // Heartbeats stop arriving while the node is a follower, so the recorded

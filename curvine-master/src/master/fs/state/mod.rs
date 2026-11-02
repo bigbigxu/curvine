@@ -15,5 +15,8 @@
 mod worker_map;
 pub use self::worker_map::WorkerMap;
 
+mod worker_intent;
+pub use self::worker_intent::{WorkerIntent, WorkerIntentTable};
+
 mod block_map;
 pub use self::block_map::BlockMap;

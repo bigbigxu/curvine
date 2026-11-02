@@ -394,6 +394,49 @@ impl ProtoUtils {
         }
     }
 
+    /// Prefers the explicit state axes and falls back to the legacy single-axis
+    /// status for older peers.
+    fn worker_state_from_proto(info: &WorkerInfoProto) -> WorkerState {
+        let admin = info
+            .admin_state
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .and_then(AdminState::from_str_name);
+        let liveness = info
+            .liveness
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .and_then(Liveness::from_str_name);
+        match (admin, liveness) {
+            (None, None) => Self::worker_state_from_legacy(Self::worker_status_from_proto(
+                info.status,
+            )),
+            (admin, liveness) => {
+                let legacy = Self::worker_state_from_legacy(Self::worker_status_from_proto(
+                    info.status,
+                ));
+                WorkerState::new(
+                    admin.unwrap_or_else(|| legacy.admin()),
+                    liveness.unwrap_or_else(|| legacy.liveness()),
+                )
+            }
+        }
+    }
+
+    /// Inverse of [`WorkerInfo::status`] for peers that only speak the legacy
+    /// single-axis format. `Unknown` reads as a healthy normal node: a peer that
+    /// never filled the field was a live worker before this change.
+    fn worker_state_from_legacy(src: WorkerStatus) -> WorkerState {
+        match src {
+            WorkerStatus::Unknown | WorkerStatus::Live => WorkerState::registered(AdminState::Normal),
+            WorkerStatus::Blacklist => WorkerState::new(AdminState::Normal, Liveness::Stale),
+            WorkerStatus::Decommission => {
+                WorkerState::new(AdminState::Decommissioned, Liveness::Running)
+            }
+            WorkerStatus::Lost => WorkerState::new(AdminState::Normal, Liveness::Lost),
+        }
+    }
+
     pub fn filesystem_info_to_pb(src: FilesystemInfo) -> GetFilesystemInfoResponse {
         let mut pb = GetFilesystemInfoResponse {
             active_master: src.active_master,
@@ -454,6 +497,8 @@ impl ProtoUtils {
     }
 
     pub fn worker_info_to_pb(src: WorkerInfo) -> WorkerInfoProto {
+        let admin_state = src.admin().as_str_name().to_string();
+        let liveness = src.liveness().as_str_name().to_string();
         let mut pb = WorkerInfoProto {
             address: ProtoUtils::worker_address_to_pb(&src.address),
             capacity: src.capacity,
@@ -463,7 +508,7 @@ impl ProtoUtils {
             last_update: src.last_update,
             reserved_bytes: src.reserved_bytes,
             block_num: Some(src.block_num),
-            status: Some(src.status as i32),
+            status: Some(src.status() as i32),
             weight: Some(src.weight),
             worker_session_id: Some(src.worker_session_id),
             transfer_task_submit: Some(src.transfer_capabilities.task_submit),
@@ -478,6 +523,8 @@ impl ProtoUtils {
                 .then_some(src.worker_max_concurrent_tasks as i64),
             software_version: Some(src.software_version),
             startup_time_ms: Some(src.startup_time_ms),
+            admin_state: Some(admin_state),
+            liveness: Some(liveness),
             component_info: src.component_info,
             storage_map: Default::default(),
         };
@@ -567,6 +614,7 @@ impl ProtoUtils {
     pub fn worker_info_from_pb(workers: Vec<WorkerInfoProto>) -> Vec<WorkerInfo> {
         let mut vec = vec![];
         for info in workers {
+            let state = Self::worker_state_from_proto(&info);
             let storage_map = info
                 .storage_map
                 .iter()
@@ -581,7 +629,6 @@ impl ProtoUtils {
                 reserved_bytes: info.reserved_bytes,
                 last_update: info.last_update,
                 block_num: Self::worker_block_num_from_proto(info.block_num, &storage_map),
-                status: Self::worker_status_from_proto(info.status),
                 weight: info.weight.unwrap_or_else(WorkerInfo::default_weight),
                 worker_session_id: info.worker_session_id.unwrap_or_default(),
                 transfer_capabilities: TransferWorkerCapabilities {
@@ -604,7 +651,14 @@ impl ProtoUtils {
                 // Master-only in-flight reservation; not carried on proto.
                 scheduled_bytes: 0,
                 scheduled_since_ms: 0,
+                // The wire format only carries the legacy single-axis status; it
+                // is projected back onto the two axes here. A peer that speaks
+                // only the old format therefore cannot express cordon or drain.
+                admin: AdminState::Normal,
+                liveness: Liveness::Running,
             };
+            let mut worker_info = worker_info;
+            worker_info.apply_state(state);
             vec.push(worker_info);
         }
 

@@ -352,6 +352,23 @@ impl JournalWriter {
         self.send(fs_dir, JournalEntry::TrashPurge(entry))
     }
 
+    /// Journals one operator intent for `host`. Replay restores the record, so
+    /// intents survive restart and leader failover.
+    pub fn log_worker_intent(
+        &self,
+        fs_dir: &FsDir,
+        host: &str,
+        intent: crate::master::fs::state::WorkerIntent,
+    ) -> FsResult<()> {
+        let entry = WorkerIntentEntry {
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
+            host: host.to_string(),
+            intent,
+        };
+        self.send(fs_dir, JournalEntry::WorkerIntent(entry))
+    }
+
     pub fn log_free<P: AsRef<str>>(
         &self,
         fs_dir: &FsDir,

@@ -26,7 +26,7 @@ fn add_blacklist_worker_is_idempotent() {
 
     let first = manager.add_blacklist_worker(worker_id);
     assert!(matches!(
-        first.as_ref().map(|worker| worker.status),
+        first.as_ref().map(|worker| worker.status()),
         Some(WorkerStatus::Blacklist)
     ));
 

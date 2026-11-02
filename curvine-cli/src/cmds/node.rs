@@ -74,14 +74,60 @@ pub enum NodeSubCommand {
         json: bool,
     },
 
-    /// Manage the decommission list
+    /// Stop placing new data on the nodes but keep serving reads.
+    Cordon {
+        /// node list (hostname, ip, or host:port). Repeat or separate with commas.
+        #[arg(required = true)]
+        nodes: Vec<String>,
+    },
+
+    /// Remove a cordon and let the nodes take new data again.
+    Uncordon {
+        /// node list (hostname, ip, or host:port). Repeat or separate with commas.
+        #[arg(required = true)]
+        nodes: Vec<String>,
+    },
+
+    /// Move all data off the nodes, then stop serving them.
+    ///
+    /// Progress is visible in `cv node list` and in the metrics; the bytes stay on
+    /// the nodes' disks until they are recommissioned and reconciled.
     Decommission {
+        /// Legacy flag; decommissioning is the default when neither flag is given.
         #[arg(long, visible_alias = "add-dcm")]
         add: bool,
 
+        /// Undo the operator constraint instead of draining (`--remove-dcm` alias).
         #[arg(long, visible_alias = "remove-dcm")]
         remove: bool,
 
+        /// node list (hostname, ip, or host:port). Repeat or separate with commas.
+        #[arg(required = true)]
+        nodes: Vec<String>,
+    },
+
+    /// Abort an in-progress drain. Already-moved replicas stay where they are, so
+    /// the node lands in `cordoned`, not `normal`.
+    CancelDecommission {
+        /// node list (hostname, ip, or host:port). Repeat or separate with commas.
+        #[arg(required = true)]
+        nodes: Vec<String>,
+    },
+
+    /// Bring a decommissioned node back into the cluster.
+    Recommission {
+        /// node list (hostname, ip, or host:port). Repeat or separate with commas.
+        #[arg(required = true)]
+        nodes: Vec<String>,
+    },
+
+    /// Retire the node now: stop draining, drop the remaining block locations and
+    /// delete those blocks on the node.
+    ///
+    /// This is the operator's decision to give up the data that could not be
+    /// moved: the residual blocks are deleted, and the ones that had no other
+    /// replica are lost. Use `cancel-decommission` instead to keep the data.
+    ForceDecommission {
         /// node list (hostname, ip, or host:port). Repeat or separate with commas.
         #[arg(required = true)]
         nodes: Vec<String>,
@@ -110,7 +156,7 @@ impl NodeCommand {
             .chain(info.blacklist_workers.iter())
             .chain(info.decommission_workers.iter())
             .chain(info.lost_workers.iter())
-            .map(|worker| (format!("{:?}", worker.status), worker))
+            .map(|worker| (worker.state().as_label(), worker))
             .collect();
 
         // Unhealthy nodes first: the list exists to surface problems.
@@ -126,6 +172,8 @@ impl NodeCommand {
                         "worker_id": worker.worker_id(),
                         "address": worker.rpc_addr(),
                         "status": status,
+                        "admin_state": worker.admin().as_str_name(),
+                        "liveness": worker.liveness().as_str_name(),
                         "health": Self::health_label(worker),
                         "accepting_allocations": worker.accepting_allocations(),
                         "schedulable": worker.schedulable(),
@@ -219,9 +267,9 @@ impl NodeCommand {
         let mut failed = Vec::new();
         for node in Self::node_selectors(&selectors) {
             match client.set_worker_status(&node, status).await {
-                Ok((worker, _)) => successful.push(format!(
-                    "{}:{}",
-                    worker.address.hostname, worker.address.rpc_port
+                Ok((worker, state)) => successful.push(format!(
+                    "{}:{} -> {}",
+                    worker.address.hostname, worker.address.rpc_port, state
                 )),
                 Err(err) => failed.push(format!("{} ({})", node, err)),
             }
@@ -328,13 +376,44 @@ impl NodeCommand {
             }
             Some(NodeSubCommand::Decommission { add, remove, nodes }) => {
                 let status = match (add, remove) {
-                    (true, false) => ("decommission", "added to"),
-                    (false, true) => ("remove_decommission", "removed from"),
-                    _ => return err_box!("Specify either --add or --remove"),
+                    // `cv node decommission <nodes>` is the common case; the
+                    // legacy flags stay for scripts.
+                    (true, false) | (false, false) => ("decommission", "decommissioning"),
+                    (false, true) => ("live", "restored"),
+                    (true, true) => {
+                        return err_box!("Specify either --add or --remove, not both")
+                    }
                 };
                 self.set_decommission_status(client, status.0, status.1, nodes.clone())
                     .await
             }
+            Some(NodeSubCommand::Cordon { nodes }) => {
+                self.set_decommission_status(client, "cordon", "cordoned", nodes.clone())
+                    .await
+            }
+            Some(NodeSubCommand::Uncordon { nodes }) => {
+                self.set_decommission_status(client, "uncordon", "uncordoned", nodes.clone())
+                    .await
+            }
+            Some(NodeSubCommand::CancelDecommission { nodes }) => self
+                .set_decommission_status(
+                    client,
+                    "cancel-decommission",
+                    "cancelled the drain of",
+                    nodes.clone(),
+                )
+                .await,
+            Some(NodeSubCommand::Recommission { nodes }) => self
+                .set_decommission_status(client, "recommission", "recommissioned", nodes.clone())
+                .await,
+            Some(NodeSubCommand::ForceDecommission { nodes }) => self
+                .set_decommission_status(
+                    client,
+                    "force-decommission",
+                    "force-completed the drain of",
+                    nodes.clone(),
+                )
+                .await,
         }
     }
 
@@ -381,7 +460,7 @@ impl NodeCommand {
                     .map(|worker| serde_json::json!({
                         "worker_id": worker.worker_id(),
                         "address": worker.rpc_addr(),
-                        "status": format!("{:?}", worker.status),
+                        "status": format!("{:?}", worker.status()),
                         "accepting_allocations": worker.accepting_allocations(),
                         "schedulable": worker.schedulable(),
                         "storage": Self::unhealthy_dirs(worker)

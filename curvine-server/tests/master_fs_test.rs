@@ -23,8 +23,8 @@ use curvine_model::{
     AccessMode, BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress,
     CommitBlock, ContentSummary, CreateFileOpts, CreateFileOptsBuilder, DeleteResult,
     FileAllocOpts, HeartbeatStatus, ListOptions, LocatedBlock, MkdirOpts, MkdirOptsBuilder,
-    MountInfo, Provider, StorageType, TtlAction, TtlType, WorkerAddress, WorkerCommand, WorkerInfo,
-    WorkerStatus, WriteType,
+    AdminState, MountInfo, Provider, StorageType, TtlAction, TtlType, WorkerAddress, WorkerCommand,
+    WorkerInfo, WorkerStatus, WriteType,
 };
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
@@ -47,6 +47,7 @@ use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
 use curvine_runtime::sync::StateCtl;
+use curvine_server::master::fs::state::WorkerIntent;
 use curvine_server::master::fs::{DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
 use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
@@ -4120,34 +4121,57 @@ fn file_block_details_resolves_lost_worker_addresses() -> CommonResult<()> {
     assert!(live_replica.address.is_some());
     assert_eq!(live_replica.state, WorkerStatus::Live);
 
+    // A graceful End heartbeat parks the worker in the lost map but keeps its
+    // locations during the grace period: this is the window where a replica
+    // points at a worker that is no longer in the live map, and the block
+    // details must still resolve its address.
     fs.worker_manager
         .write()
-        .remove_expired_worker(worker_id)
-        .expect("worker should move to lost map");
+        .shutdown_worker(worker_id)
+        .expect("worker should move to the lost map");
 
     let details = fs.get_file_block_details(path)?;
     assert_eq!(details.blocks.len(), 1);
     assert_eq!(details.blocks[0].block_id, block.block.id);
     assert_eq!(details.blocks[0].replicas.len(), 1);
-    let lost = &details.blocks[0].replicas[0];
-    assert_eq!(lost.worker_id, worker_id);
-    assert_eq!(lost.storage_type, reported_storage_type);
-    let lost_address = lost
+    let shutdown = &details.blocks[0].replicas[0];
+    assert_eq!(shutdown.worker_id, worker_id);
+    assert_eq!(shutdown.storage_type, reported_storage_type);
+    let shutdown_address = shutdown
         .address
         .as_ref()
-        .expect("lost worker address should be resolved from lost worker map");
-    assert_eq!(lost_address.worker_id, expected_address.worker_id);
-    assert_eq!(lost_address.hostname, expected_address.hostname);
-    assert_eq!(lost_address.ip_addr, expected_address.ip_addr);
-    assert_eq!(lost_address.rpc_port, expected_address.rpc_port);
-    assert_eq!(lost_address.web_port, expected_address.web_port);
-    assert_eq!(lost.state, WorkerStatus::Lost);
+        .expect("shutdown worker address should be resolved from the lost worker map");
+    assert_eq!(shutdown_address.worker_id, expected_address.worker_id);
+    assert_eq!(shutdown_address.hostname, expected_address.hostname);
+    assert_eq!(shutdown_address.ip_addr, expected_address.ip_addr);
+    assert_eq!(shutdown_address.rpc_port, expected_address.rpc_port);
+    assert_eq!(shutdown_address.web_port, expected_address.web_port);
+    assert_eq!(shutdown.state, WorkerStatus::Lost);
 
-    // Contrast: create_locate_block must use live-only get_worker; lost replicas must not be returned to readers.
+    // Readers are not handed a shutdown replica.
     assert!(
         fs.create_locate_block(path, block.block.clone(), &[location])
             .is_err(),
-        "read path must refuse a block whose only replica is on a lost worker"
+        "read path must refuse a block whose only replica is on a shutdown worker"
+    );
+
+    // Grace expiry (LOST) drops the location by design (#10).
+    let session = fs
+        .worker_manager
+        .read()
+        .get_known_worker(worker_id)
+        .expect("worker should still be known")
+        .worker_session_id
+        .clone();
+    fs.retire_lost_worker(worker_id, &session, "test")
+        .expect("lost transition should apply");
+    let details = fs.get_file_block_details(path)?;
+    assert!(
+        details.blocks[0]
+            .replicas
+            .iter()
+            .all(|replica| replica.worker_id != worker_id),
+        "a lost worker's location must be removed from the replica set"
     );
     Ok(())
 }
@@ -4179,13 +4203,22 @@ fn file_block_details_preserve_registered_non_live_worker_status() -> CommonResu
         .expect("blacklisted worker location should be retained");
     assert_eq!(blacklist.state, WorkerStatus::Blacklist);
     assert!(blacklist.address.is_some());
-    // create_locate_block serves reads and keeps only live workers (#1731),
-    // so a blacklisted replica must not be returned to readers.
-    assert!(fs
-        .create_locate_block(path, block.block.clone(), std::slice::from_ref(&location))
-        .is_err());
+    // STALE degrades but is still allowed to serve reads (design §5.2), unlike
+    // the old single-axis model that dropped every non-Live replica.
+    fs.create_locate_block(path, block.block.clone(), std::slice::from_ref(&location))
+        .expect("a stale replica is still readable");
 
-    fs.worker_manager.write().add_dcm(vec![hostname]);
+    // Decommission now goes through the state machine and needs the replication
+    // pipeline, so this test records the terminal state the way the drain does.
+    fs.worker_manager.write().record_intent(
+        &hostname,
+        WorkerIntent::new(
+            AdminState::Decommissioned,
+            "test",
+            "drained",
+            0,
+        ),
+    );
     let dcm_details = fs.get_file_block_details(path)?;
     let decommission = dcm_details.blocks[0]
         .replicas

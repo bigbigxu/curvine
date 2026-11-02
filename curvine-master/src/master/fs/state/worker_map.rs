@@ -13,21 +13,23 @@
 // limitations under the License.
 
 use curvine_core_error::err_box;
-use curvine_error::FsResult;
+use curvine_error::{FsError, FsResult};
 use curvine_model::{
-    StorageInfo, TransferWorkerCapabilities, WorkerAddress, WorkerInfo, WorkerStatus,
+    apply, AdminState, Facts, Liveness, StorageInfo, TransferWorkerCapabilities, Trigger,
+    WorkerAddress, WorkerInfo, WorkerState,
 };
 use curvine_proto::ComponentInfoProto;
+use curvine_runtime::common::LocalTime;
+use crate::master::fs::state::WorkerIntentTable;
 use indexmap::IndexMap;
 use log::{error, info, warn};
-use std::collections::HashSet;
 
 // Store all worker information.
 pub struct WorkerMap {
     pub(crate) workers: IndexMap<u32, WorkerInfo>,
     pub(crate) lost_workers: IndexMap<u32, WorkerInfo>,
-    // Operator decommission intent keyed by hostname; outlives worker entries and ids.
-    pub(crate) decommissioned_hosts: HashSet<String>,
+    // Operator intent keyed by hostname; outlives worker entries, sessions and ids.
+    pub(crate) intents: WorkerIntentTable,
 }
 
 impl Default for WorkerMap {
@@ -41,12 +43,106 @@ impl WorkerMap {
         Self {
             workers: IndexMap::new(),
             lost_workers: IndexMap::new(),
-            decommissioned_hosts: HashSet::new(),
+            intents: WorkerIntentTable::new(),
         }
     }
 
     pub fn is_decommissioned(&self, hostname: &str) -> bool {
-        self.decommissioned_hosts.contains(hostname)
+        self.intents.is_decommissioned(hostname)
+    }
+
+    /// Admin state the operator asked for `hostname`. `Normal` when there is no
+    /// record, which is what makes `Normal` disappear from the intent table.
+    pub fn admin_of(&self, hostname: &str) -> AdminState {
+        self.intents.admin_of(hostname)
+    }
+
+    /// Applies a trigger to every entry registered for `hostname` and returns the
+    /// new state. Heartbeat paths use this for liveness triggers; operator paths
+    /// go through `MasterFilesystem`, which also journals the intent.
+    pub fn apply_trigger(
+        &mut self,
+        hostname: &str,
+        trigger: Trigger,
+        facts: &Facts,
+    ) -> FsResult<Option<(WorkerState, WorkerState)>> {
+        let mut transition = None;
+        for worker in self.host_workers_mut(hostname) {
+            let from = worker.state();
+            let (to, _effects) = apply(from, trigger, facts)
+                .map_err(|refusal| FsError::common(refusal.to_string()))?;
+            worker.apply_state(to);
+            transition = Some((from, to));
+        }
+        Ok(transition)
+    }
+
+    /// Sets both axes of one worker.
+    pub fn set_state_for(&mut self, worker_id: u32, state: WorkerState) {
+        if let Some(entry) = self.workers.get_mut(&worker_id) {
+            entry.apply_state(state);
+        }
+        if let Some(entry) = self.lost_workers.get_mut(&worker_id) {
+            entry.apply_state(state);
+        }
+    }
+
+    /// Sets the admin axis of one worker, keeping its liveness.
+    pub fn set_admin_for(&mut self, worker_id: u32, admin: AdminState) {
+        if let Some(entry) = self.workers.get_mut(&worker_id) {
+            entry.apply_state(WorkerState::new(admin, entry.liveness()));
+        }
+        if let Some(entry) = self.lost_workers.get_mut(&worker_id) {
+            entry.apply_state(WorkerState::new(admin, entry.liveness()));
+        }
+    }
+
+    /// Sets the liveness axis of one worker, keeping its admin state.
+    pub fn set_liveness_for(&mut self, worker_id: u32, liveness: Liveness) {
+        if let Some(entry) = self.workers.get_mut(&worker_id) {
+            entry.apply_state(WorkerState::new(entry.admin(), liveness));
+        }
+        if let Some(entry) = self.lost_workers.get_mut(&worker_id) {
+            entry.apply_state(WorkerState::new(entry.admin(), liveness));
+        }
+    }
+
+    /// Applies an already-computed state to every entry for `hostname` in both
+    /// the live and the lost map.
+    pub fn set_state_for_host(&mut self, hostname: &str, state: WorkerState) {
+        for worker in self.host_workers_mut(hostname) {
+            worker.apply_state(state);
+        }
+    }
+
+    pub fn host_workers_mut<'a>(
+        &'a mut self,
+        hostname: &'a str,
+    ) -> impl Iterator<Item = &'a mut WorkerInfo> + 'a {
+        self.workers
+            .values_mut()
+            .chain(self.lost_workers.values_mut())
+            .filter(move |worker| worker.address.hostname == hostname)
+    }
+
+    /// Every worker entry on `hostname`, live map first.
+    pub fn host_workers(&self, hostname: &str) -> Vec<&WorkerInfo> {
+        self.workers
+            .values()
+            .chain(self.lost_workers.values())
+            .filter(|worker| worker.address.hostname == hostname)
+            .collect()
+    }
+
+    /// Liveness of the host, taken from its entries. `Running` when the host has
+    /// no entry at all: an operator decision about an unknown host must not be
+    /// recorded as if the node were already dead.
+    pub fn host_liveness(&self, hostname: &str) -> Liveness {
+        self.host_workers(hostname)
+            .into_iter()
+            .map(|worker| worker.liveness())
+            .next()
+            .unwrap_or(Liveness::Running)
     }
 
     pub fn remove(&mut self, addr: &WorkerAddress) {
@@ -137,13 +233,11 @@ impl WorkerMap {
             )
         });
 
-        // Decommission is operator-managed and survives timeouts, eviction and restarts.
-        // Blacklist is heartbeat-timeout based; a new heartbeat clears it.
-        info.status = if self.is_decommissioned(&info.address.hostname) {
-            WorkerStatus::Decommission
-        } else {
-            WorkerStatus::Live
-        };
+        // The two axes come from their own sources: admin from the persisted
+        // intent table, liveness from the fact that a heartbeat just arrived.
+        // Nothing here may overwrite an operator decision (CV-60).
+        let admin = self.admin_of(&info.address.hostname);
+        info.apply_state(WorkerState::registered(admin));
 
         if let Some((previous_available, previous_scheduled, previous_since)) = previous {
             info.scheduled_bytes = previous_scheduled;
@@ -171,6 +265,9 @@ impl WorkerMap {
         };
 
         error!("remove expired worker {}", worker.address);
+        // The liveness axis is changed by the caller's transition, which also
+        // drops locations and asks for repairs. Moving the entry must not change
+        // the state on its own, or the transition would look idempotent.
         self.lost_workers.insert(id, worker.clone());
         Some(worker)
     }
@@ -187,6 +284,16 @@ impl WorkerMap {
         };
 
         info!("remove offline worker {}", worker.address);
+        let mut worker = worker;
+        let (state, _) = apply(
+            worker.state(),
+            Trigger::GracefulShutdown,
+            &Facts::default(),
+        )
+        .ok()?;
+        worker.apply_state(state);
+        // The grace period is anchored at the moment the process said goodbye.
+        worker.last_update = LocalTime::mills();
         self.lost_workers.insert(id, worker.clone());
         Some(worker)
     }
@@ -205,3 +312,4 @@ impl WorkerMap {
             .is_some_and(|worker| worker.worker_session_id == worker_session_id)
     }
 }
+

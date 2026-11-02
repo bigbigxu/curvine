@@ -1244,8 +1244,19 @@ impl JournalLoader {
             JournalEntry::UfsDeferred(e) => self.apply_ufs_deferred(e),
             JournalEntry::TrashPurge(e) => self.trash_purge(e),
 
+            JournalEntry::WorkerIntent(e) => self.worker_intent(e),
+
             _ => Ok(()),
         }
+    }
+
+    fn worker_intent(&self, entry: WorkerIntentEntry) -> CommonResult<()> {
+        self.worker_manager
+            .write()
+            .worker_map
+            .intents
+            .upsert(&entry.host, entry.intent);
+        Ok(())
     }
 
     fn trash_purge(&self, entry: TrashPurgeEntry) -> CommonResult<()> {

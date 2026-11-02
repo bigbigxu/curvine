@@ -93,13 +93,35 @@ pub struct MasterConf {
     #[serde(skip)]
     pub worker_check_interval_unit: DurationUnit,
 
-    pub worker_blacklist_interval: String,
+    /// Threshold for `STALE`. Historically called `worker_blacklist_interval`;
+    /// the old key is still accepted on read so existing configs keep working.
+    #[serde(alias = "worker_blacklist_interval")]
+    pub worker_stale_interval: String,
     #[serde(skip)]
-    pub worker_blacklist_interval_unit: DurationUnit,
+    pub worker_stale_interval_unit: DurationUnit,
 
     pub worker_lost_interval: String,
     #[serde(skip)]
     pub worker_lost_interval_unit: DurationUnit,
+
+    /// How long a `DECOMMISSIONING` worker may keep draining before the
+    /// operator may force completion. `0` disables forced completion.
+    pub worker_drain_timeout: String,
+    #[serde(skip)]
+    pub worker_drain_timeout_unit: DurationUnit,
+
+    /// How often the metadata location set of a draining worker is re-scanned
+    /// as a self-healing check on top of the incremental counter. Each scan is
+    /// a full `CF_LOCATION` prefix walk, so this stays coarse.
+    pub worker_drain_scan_interval: String,
+    #[serde(skip)]
+    pub worker_drain_scan_interval_unit: DurationUnit,
+
+    /// Grace period after a graceful `End` heartbeat before the worker's block
+    /// locations are dropped. Avoids a replication storm on a normal restart.
+    pub worker_shutdown_grace: String,
+    #[serde(skip)]
+    pub worker_shutdown_grace_unit: DurationUnit,
 
     // Audit log configuration.
     pub audit_logging_enabled: bool,
@@ -223,10 +245,16 @@ impl MasterConf {
 
         self.worker_check_interval_unit = DurationUnit::from_str(&self.worker_check_interval)?;
 
-        self.worker_blacklist_interval_unit =
-            DurationUnit::from_str(&self.worker_blacklist_interval)?;
+        self.worker_stale_interval_unit = DurationUnit::from_str(&self.worker_stale_interval)?;
 
         self.worker_lost_interval_unit = DurationUnit::from_str(&self.worker_lost_interval)?;
+
+        self.worker_drain_timeout_unit = DurationUnit::from_str(&self.worker_drain_timeout)?;
+
+        self.worker_drain_scan_interval_unit =
+            DurationUnit::from_str(&self.worker_drain_scan_interval)?;
+
+        self.worker_shutdown_grace_unit = DurationUnit::from_str(&self.worker_shutdown_grace)?;
 
         // Initialize TTL duration units
         self.ttl_checker_interval_unit = DurationUnit::from_str(&self.ttl_checker_interval)?;
@@ -248,8 +276,8 @@ impl MasterConf {
 
         self.dir_space.init()?;
 
-        if self.heartbeat_interval_unit > self.worker_blacklist_interval_unit {
-            return err_box!("Worker_blacklist_interval must be greater than heartbeat_interval");
+        if self.heartbeat_interval_unit > self.worker_stale_interval_unit {
+            return err_box!("Worker_stale_interval must be greater than heartbeat_interval");
         };
 
         if self.heartbeat_interval_unit > self.worker_lost_interval_unit {
@@ -338,11 +366,28 @@ impl MasterConf {
     }
 
     pub fn worker_blacklist_interval_ms(&self) -> u64 {
-        self.worker_blacklist_interval_unit.as_millis()
+        self.worker_stale_interval_unit.as_millis()
     }
 
     pub fn worker_lost_interval_ms(&self) -> u64 {
         self.worker_lost_interval_unit.as_millis()
+    }
+
+    /// Threshold for `STALE`, i.e. when reads degrade and placement stops.
+    pub fn worker_stale_interval_ms(&self) -> u64 {
+        self.worker_stale_interval_unit.as_millis()
+    }
+
+    pub fn worker_drain_timeout_ms(&self) -> u64 {
+        self.worker_drain_timeout_unit.as_millis()
+    }
+
+    pub fn worker_drain_scan_interval_ms(&self) -> u64 {
+        self.worker_drain_scan_interval_unit.as_millis()
+    }
+
+    pub fn worker_shutdown_grace_ms(&self) -> u64 {
+        self.worker_shutdown_grace_unit.as_millis()
     }
 
     pub fn ttl_checker_interval_ms(&self) -> u64 {
@@ -450,11 +495,20 @@ impl Default for MasterConf {
             worker_check_interval: "10s".to_string(),
             worker_check_interval_unit: Default::default(),
 
-            worker_blacklist_interval: "30s".to_string(),
-            worker_blacklist_interval_unit: Default::default(),
+            worker_stale_interval: "30s".to_string(),
+            worker_stale_interval_unit: Default::default(),
 
             worker_lost_interval: "10m".to_string(),
             worker_lost_interval_unit: Default::default(),
+
+            worker_drain_timeout: "24h".to_string(),
+            worker_drain_timeout_unit: Default::default(),
+
+            worker_drain_scan_interval: "30s".to_string(),
+            worker_drain_scan_interval_unit: Default::default(),
+
+            worker_shutdown_grace: "5m".to_string(),
+            worker_shutdown_grace_unit: Default::default(),
 
             audit_logging_enabled: true,
             audit_log: Default::default(),

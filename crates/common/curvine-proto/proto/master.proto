@@ -376,6 +376,11 @@ message SetWorkerStatusRequest {
 message SetWorkerStatusResponse {
     required WorkerInfoProto worker = 1;
     required string status = 2;
+    // State after the transition, so a console can show "why" without a second
+    // call. Legacy masters omit them.
+    optional string admin_state = 3 [default = ""];
+    optional string liveness = 4 [default = ""];
+    optional string previous_state = 5 [default = ""];
 }
 
 message GetFilesystemInfoResponse {

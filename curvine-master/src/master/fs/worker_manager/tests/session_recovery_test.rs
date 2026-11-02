@@ -82,7 +82,9 @@ fn lost_session_requires_new_start_before_running() {
         )
         .unwrap();
     assert!(accepted_start);
-    assert!(!manager.get_worker(1).unwrap().is_live());
+    // A fresh registration is usable immediately: the old model parked new
+    // nodes in BLACKLIST until their next heartbeat (CV-60 #2).
+    assert!(manager.get_worker(1).unwrap().is_live());
 
     manager
         .heartbeat(

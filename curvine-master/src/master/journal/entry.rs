@@ -16,7 +16,7 @@ use crate::master::meta::inode::{InodeDir, InodeFile, InodeView};
 use crate::master::meta::BlockMeta;
 use crate::master::MetadataCodec;
 use curvine_core_error::{err_box, CommonResult};
-use curvine_model::{CommitBlock, FileLock, MountInfo, ProtoUtils, SetAttrOpts};
+use curvine_model::{AdminState, CommitBlock, FileLock, MountInfo, ProtoUtils, SetAttrOpts};
 use curvine_proto::*;
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -109,6 +109,15 @@ pub struct TrashPurgeEntry {
     pub(crate) entry: String,
     pub(crate) mtime: i64,
     pub(crate) paths: Vec<String>,
+}
+
+// operator intent for a worker host, replayed into the intent table
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct WorkerIntentEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) host: String,
+    pub(crate) intent: crate::master::fs::state::WorkerIntent,
 }
 
 // mount
@@ -237,6 +246,9 @@ pub enum JournalEntry {
     CacheInvalidation(CacheInvalidationEntry),
     UfsDeferred(UfsDeferredEntry),
     TrashPurge(TrashPurgeEntry),
+
+    /// The single persisted source of what an operator asked a worker host to do.
+    WorkerIntent(WorkerIntentEntry),
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -336,6 +348,8 @@ impl JournalEntry {
             JournalEntry::Snapshot(e) => e.op_id,
             JournalEntry::UfsDeferred(e) => e.op_id,
             JournalEntry::TrashPurge(e) => e.op_id,
+
+            JournalEntry::WorkerIntent(e) => e.op_id,
         }
     }
 
@@ -361,6 +375,8 @@ impl JournalEntry {
             JournalEntry::Snapshot(e) => e.rpc_id,
             JournalEntry::UfsDeferred(e) => e.rpc_id,
             JournalEntry::TrashPurge(e) => e.rpc_id,
+
+            JournalEntry::WorkerIntent(e) => e.rpc_id,
         }
     }
 
@@ -405,7 +421,7 @@ impl JournalEntry {
         }
     }
 
-    fn into_proto(self) -> CommonResult<JournalEntryProto> {
+    pub(crate) fn into_proto(self) -> CommonResult<JournalEntryProto> {
         use journal_entry_proto::Entry as PbEntry;
 
         let entry = match self {
@@ -571,12 +587,28 @@ impl JournalEntry {
                 mtime: e.mtime,
                 paths: e.paths,
             }),
+
+            JournalEntry::WorkerIntent(e) => PbEntry::WorkerIntent(WorkerIntentEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                host: e.host,
+                admin: e.intent.admin.as_str_name().to_string(),
+                since_ms: e.intent.since_ms,
+                operator: e.intent.operator,
+                reason: e.intent.reason,
+                drain_deadline_ms: e.intent.drain_deadline_ms,
+                orphan_blocks: e.intent.orphan_blocks,
+                orphan_count: Some(e.intent.orphan_count),
+                forced_at_ms: Some(e.intent.forced_at_ms),
+                preflight_blocks: Some(e.intent.preflight_blocks),
+                preflight_single_replica: Some(e.intent.preflight_single_replica),
+            }),
         };
 
         Ok(JournalEntryProto { entry: Some(entry) })
     }
 
-    fn from_proto(proto: JournalEntryProto) -> CommonResult<Self> {
+    pub(crate) fn from_proto(proto: JournalEntryProto) -> CommonResult<Self> {
         use journal_entry_proto::Entry as PbEntry;
 
         let Some(entry) = proto.entry else {
@@ -746,6 +778,31 @@ impl JournalEntry {
                 mtime: e.mtime,
                 paths: e.paths,
             }),
+
+            PbEntry::WorkerIntent(e) => {
+                let admin = match AdminState::from_str_name(&e.admin) {
+                    Some(admin) => admin,
+                    None => return err_box!("unknown worker admin state: {}", e.admin),
+                };
+                JournalEntry::WorkerIntent(WorkerIntentEntry {
+                    op_id: e.op_id,
+                    rpc_id: e.rpc_id,
+                    host: e.host,
+                    intent: crate::master::fs::state::WorkerIntent {
+                        admin,
+                        since_ms: e.since_ms,
+                        operator: e.operator,
+                        reason: e.reason,
+                        drain_deadline_ms: e.drain_deadline_ms,
+                        orphan_blocks: e.orphan_blocks,
+                        orphan_count: e.orphan_count.unwrap_or_default(),
+                        forced_at_ms: e.forced_at_ms.unwrap_or_default(),
+                        preflight_blocks: e.preflight_blocks.unwrap_or_default(),
+                        preflight_single_replica: e.preflight_single_replica
+                            .unwrap_or_default(),
+                    },
+                })
+            }
         })
     }
 }

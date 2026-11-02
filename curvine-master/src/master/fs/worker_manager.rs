@@ -13,19 +13,19 @@
 // limitations under the License.
 
 use crate::master::fs::policy::{ChooseContext, WorkerPolicyAdapter};
-use crate::master::fs::state::{BlockMap, WorkerMap};
+use crate::master::fs::state::{BlockMap, WorkerIntent, WorkerMap};
 use crate::master::fs::DeleteResult;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;
 use curvine_model::{
-    BlockLocation, ExtendedBlock, HeartbeatStatus, LocatedBlock, StorageInfo, StorageType,
-    TransferWorkerCapabilities, WorkerAddress, WorkerCommand, WorkerInfo, WorkerStatus,
+    apply, AdminState, BlockLocation, ExtendedBlock, Facts, HeartbeatStatus, Liveness, LocatedBlock,
+    StorageInfo, StorageType, TransferWorkerCapabilities, Trigger, WorkerAddress, WorkerCommand,
+    WorkerInfo, WorkerState,
 };
 use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::{ByteUnit, LocalTime};
 use log::{info, warn};
-use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -61,7 +61,7 @@ impl WorkerManager {
         self.worker_map
             .workers()
             .values()
-            .filter(|worker| worker.is_live())
+            .filter(|worker| worker.writable())
             .count()
     }
 
@@ -127,10 +127,10 @@ impl WorkerManager {
                     storages,
                     component_info,
                 )?;
-                let worker = self.worker_map.workers.get_mut(&worker_id).unwrap();
-                if worker.status != WorkerStatus::Decommission {
-                    worker.status = WorkerStatus::Blacklist;
-                }
+                // A new registration applies the persisted intent; there is no
+                // reason to park a fresh node in a not-ready state first (the old
+                // code forced Blacklist here and made every new node useless until
+                // its next heartbeat).
                 return Ok((vec![], true));
             }
 
@@ -159,7 +159,19 @@ impl WorkerManager {
                 // above and still refreshes worker liveness through the insert
                 // below; it only suppresses the block commands that a normal
                 // running heartbeat carries.
-                if presence_only {
+                //
+                // A draining worker must not be told to delete blocks: its bytes are
+                // retained on purpose (design §5.1), and a delete command left over
+                // from before the drain would quietly destroy exactly the data the
+                // operator wanted kept. A `DECOMMISSIONED` worker is different: its
+                // only pending deletes come from an explicit forced retirement, so
+                // they have to be delivered or the disk is never reclaimed.
+                let keeps_data = self
+                    .worker_map
+                    .workers
+                    .get(&addr.worker_id)
+                    .is_some_and(|worker| worker.admin() == AdminState::Decommissioning);
+                if presence_only || keeps_data {
                     Vec::new()
                 } else {
                     self.block_map.handle_heartbeat(addr.worker_id)
@@ -295,13 +307,19 @@ impl WorkerManager {
         self.worker_map
             .workers()
             .values()
-            .filter(|worker| worker.is_live())
+            .filter(|worker| worker.writable())
             .map(|worker| worker.allocatable_available().max(0))
             .fold(0, i64::saturating_add)
     }
 
     pub fn remove_expired_worker(&mut self, id: u32) -> Option<WorkerInfo> {
         self.worker_map.remove_expired(id)
+    }
+
+    /// Graceful `End` heartbeat: park the worker in `SHUTDOWN` and keep its
+    /// locations until the grace period expires.
+    pub fn shutdown_worker(&mut self, id: u32) -> Option<WorkerInfo> {
+        self.worker_map.remove_offline(id)
     }
 
     pub fn remove_expired_worker_if_stale(
@@ -320,14 +338,7 @@ impl WorkerManager {
     }
 
     pub fn add_blacklist_worker(&mut self, id: u32) -> Option<WorkerInfo> {
-        match self.worker_map.workers.get_mut(&id) {
-            Some(v) if v.status == WorkerStatus::Live => {
-                v.status = WorkerStatus::Blacklist;
-                Some(v.clone())
-            }
-
-            _ => None,
-        }
+        self.mark_stale(id)
     }
 
     pub fn remove_block(&mut self, worker_id: u32, block_id: i64) {
@@ -360,8 +371,12 @@ impl WorkerManager {
     }
 
     pub fn is_live_worker_session(&self, worker_id: u32, worker_session_id: &str) -> bool {
-        self.get_worker(worker_id)
-            .is_some_and(|worker| worker.is_live() && worker.worker_session_id == worker_session_id)
+        // A cordoned or draining worker still heartbeats: only its liveness axis
+        // can make a session invalid.
+        self.get_worker(worker_id).is_some_and(|worker| {
+            worker.liveness() == Liveness::Running
+                && worker.worker_session_id == worker_session_id
+        })
     }
 
     pub fn create_locate_block(
@@ -374,17 +389,17 @@ impl WorkerManager {
         let mut live_storage_types = Vec::with_capacity(locs.len());
         for loc in locs {
             match self.get_worker(loc.worker_id) {
-                Some(info) if info.is_live() => {
+                Some(info) if info.readable() => {
                     addrs.push(info.address.clone());
                     live_storage_types.push(loc.storage_type);
                 }
                 Some(info) => {
                     warn!(
-                        "File {} block {}, worker {} is not alive (status={:?}), replica excluded",
+                        "File {} block {}, worker {} is not readable (state={}), replica excluded",
                         path.as_ref(),
                         block.id,
                         loc.worker_id,
-                        info.status
+                        info.state()
                     );
                 }
                 None => {
@@ -435,57 +450,68 @@ impl WorkerManager {
         self.worker_map.workers.insert(worker.worker_id(), worker);
     }
 
-    pub fn add_dcm(&mut self, list: Vec<String>) -> Vec<String> {
-        let hosts: BTreeSet<String> = list.into_iter().collect();
-        let mut res = vec![];
-        for host in hosts {
-            for worker in self.host_workers_mut(&host) {
-                worker.status = WorkerStatus::Decommission;
-            }
-            res.extend(self.host_dcm_entries(&host, WorkerStatus::Decommission));
-            self.worker_map.decommissioned_hosts.insert(host);
+    /// Marks a worker as `STALE` (heartbeat late). Idempotent: the state machine
+    /// returns no side effects for a repeated timeout.
+    pub fn mark_stale(&mut self, id: u32) -> Option<WorkerInfo> {
+        let worker = self.worker_map.workers.get_mut(&id)?;
+        if worker.liveness() != Liveness::Running {
+            return None;
         }
-        res
+        let (state, _) = apply(worker.state(), Trigger::StaleTimeout, &Facts::default()).ok()?;
+        worker.apply_state(state);
+        Some(worker.clone())
     }
 
-    pub fn get_dcm(&self) -> Vec<String> {
-        let hosts: BTreeSet<&String> = self.worker_map.decommissioned_hosts.iter().collect();
-        hosts
-            .into_iter()
-            .flat_map(|host| self.host_dcm_entries(host, WorkerStatus::Decommission))
+    /// Marks a worker as `LOST` in place. The caller (heartbeat checker) still
+    /// moves it to the lost map and drops its locations.
+    pub fn mark_lost(&mut self, id: u32) -> Option<WorkerInfo> {
+        let worker = self.worker_map.workers.get_mut(&id)?;
+        let (state, _) = apply(worker.state(), Trigger::LostTimeout, &Facts::default()).ok()?;
+        worker.apply_state(state);
+        Some(worker.clone())
+    }
+
+    /// Workers to consider for the drain timeout: `DECOMMISSIONING` and alive.
+    pub fn decommissioning_workers(&self) -> Vec<WorkerInfo> {
+        self.worker_map
+            .workers
+            .values()
+            .filter(|worker| worker.admin() == AdminState::Decommissioning)
+            .cloned()
             .collect()
     }
 
-    pub fn remove_dcm(&mut self, list: Vec<String>) -> Vec<String> {
-        let hosts: BTreeSet<String> = list.into_iter().collect();
+    /// Hosts that still carry an operator record, for the console and CLI.
+    pub fn intent_hosts(&self) -> Vec<String> {
+        self.worker_map.intents.hosts()
+    }
+
+    /// Hosts with an operator record, in the legacy `id,host:port,state` shape.
+    pub fn get_dcm(&self) -> Vec<String> {
         let mut res = vec![];
-        for host in hosts {
-            if !self.worker_map.decommissioned_hosts.remove(&host) {
-                continue;
-            }
-            for worker in self.host_workers_mut(&host) {
-                if worker.status == WorkerStatus::Decommission {
-                    worker.status = WorkerStatus::Live;
-                }
-            }
-            res.extend(self.host_dcm_entries(&host, WorkerStatus::Live));
+        for host in self.worker_map.intents.hosts() {
+            let admin = self.worker_map.intents.admin_of(&host);
+            res.extend(self.host_dcm_entries(&host, admin));
         }
         res
     }
 
-    fn host_workers_mut<'a>(
-        &'a mut self,
-        host: &'a str,
-    ) -> impl Iterator<Item = &'a mut WorkerInfo> + 'a {
-        let wm = &mut self.worker_map;
-        wm.workers
-            .values_mut()
-            .chain(wm.lost_workers.values_mut())
-            .filter(move |worker| worker.address.hostname == host)
+    /// Records operator intent and projects it onto every entry of the host.
+    ///
+    /// Returns the previous record. Journaling is the caller's job
+    /// (`MasterFilesystem::set_worker_intent`), so that a unit test can record an
+    /// intent without a journal while production still has exactly one writer.
+    pub fn record_intent(&mut self, host: &str, intent: WorkerIntent) -> Option<WorkerIntent> {
+        let previous = self.worker_map.intents.upsert(host, intent);
+        let admin = self.worker_map.admin_of(host);
+        for worker in self.worker_map.host_workers_mut(host) {
+            worker.apply_state(WorkerState::new(admin, worker.liveness()));
+        }
+        previous
     }
 
-    // Offline hosts fall back to lost entries, then to "-,<host>,<status>" in the same shape.
-    fn host_dcm_entries(&self, host: &str, status: WorkerStatus) -> Vec<String> {
+    // Offline hosts fall back to lost entries, then to "-,<host>,<admin>" in the same shape.
+    fn host_dcm_entries(&self, host: &str, admin: AdminState) -> Vec<String> {
         let on_host = |worker: &&WorkerInfo| worker.address.hostname == host;
         let mut res: Vec<String> = self
             .worker_map
@@ -504,7 +530,7 @@ impl WorkerManager {
                 .collect();
         }
         if res.is_empty() {
-            res.push(format!("-,{},{:?}", host, status));
+            res.push(format!("-,{},{}", host, admin.as_str_name()));
         }
         res
     }
@@ -539,6 +565,7 @@ impl Display for WorkerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use curvine_model::WorkerStatus;
 
     fn worker_with_available(worker_id: u32, available: i64) -> WorkerInfo {
         WorkerInfo {
@@ -552,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn running_heartbeat_is_live_and_start_is_not() {
+    fn a_fresh_registration_is_usable_immediately() {
         let mut manager = WorkerManager::new(&ClusterConf::default()).unwrap();
         let cluster_id = manager.cluster_id.clone();
         let addr = WorkerAddress {
@@ -576,7 +603,9 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(manager.live_worker_count(), 0);
+        // The old code forced BLACKLIST here and made a new node useless until
+        // its next heartbeat (CV-60 #2).
+        assert_eq!(manager.live_worker_count(), 1);
 
         manager
             .heartbeat(
@@ -618,16 +647,35 @@ mod tests {
         assert_eq!(manager.available_bytes(), 15);
     }
 
+    fn worker_in_state(
+        worker_id: u32,
+        available: i64,
+        admin: AdminState,
+        liveness: Liveness,
+    ) -> WorkerInfo {
+        let mut worker = worker_with_available(worker_id, available);
+        worker.apply_state(WorkerState::new(admin, liveness));
+        worker
+    }
+
     #[test]
-    fn create_locate_block_excludes_non_live_workers() {
+    fn create_locate_block_only_excludes_unreadable_workers() {
         let mut manager = WorkerManager::new(&ClusterConf::default()).unwrap();
         manager.add_test_worker(worker_with_available(1, 100));
-        let mut blacklisted = worker_with_available(2, 100);
-        blacklisted.status = WorkerStatus::Blacklist;
-        manager.add_test_worker(blacklisted);
-        let mut decommissioned = worker_with_available(3, 100);
-        decommissioned.status = WorkerStatus::Decommission;
-        manager.add_test_worker(decommissioned);
+        manager.add_test_worker(worker_in_state(2, 100, AdminState::Normal, Liveness::Stale));
+        manager.add_test_worker(worker_in_state(
+            3,
+            100,
+            AdminState::Decommissioned,
+            Liveness::Running,
+        ));
+        manager.add_test_worker(worker_in_state(4, 100, AdminState::Normal, Liveness::Lost));
+        manager.add_test_worker(worker_in_state(
+            5,
+            100,
+            AdminState::Decommissioning,
+            Liveness::Running,
+        ));
 
         let block = ExtendedBlock::new(7, 128, StorageType::Disk, curvine_model::FileType::File);
         let locs = vec![
@@ -635,18 +683,24 @@ mod tests {
             BlockLocation::with_id(2),
             BlockLocation::with_id(3),
             BlockLocation::with_id(4),
+            BlockLocation::with_id(5),
         ];
         let located = manager.create_locate_block("/a", block, &locs).unwrap();
-        assert_eq!(located.locs.len(), 1);
-        assert_eq!(located.locs[0].worker_id, 1);
+        let readable: Vec<u32> = located.locs.iter().map(|loc| loc.worker_id).collect();
+        // STALE degrades but still serves reads; DECOMMISSIONING must stay
+        // readable or its own drain could never copy anything out.
+        assert_eq!(readable, vec![1, 2, 5]);
     }
 
     #[test]
-    fn create_locate_block_errors_when_no_live_replica_remains() {
+    fn create_locate_block_errors_when_no_readable_replica_remains() {
         let mut manager = WorkerManager::new(&ClusterConf::default()).unwrap();
-        let mut blacklisted = worker_with_available(2, 100);
-        blacklisted.status = WorkerStatus::Blacklist;
-        manager.add_test_worker(blacklisted);
+        manager.add_test_worker(worker_in_state(
+            2,
+            100,
+            AdminState::Decommissioned,
+            Liveness::Running,
+        ));
 
         let block = ExtendedBlock::new(7, 128, StorageType::Disk, curvine_model::FileType::File);
         let err = manager
@@ -656,11 +710,9 @@ mod tests {
     }
 
     #[test]
-    fn available_bytes_ignores_non_live_workers() {
+    fn available_bytes_ignores_non_writable_workers() {
         let mut manager = WorkerManager::new(&ClusterConf::default()).unwrap();
-        let mut blacklisted = worker_with_available(1, 100);
-        blacklisted.status = WorkerStatus::Blacklist;
-        manager.add_test_worker(blacklisted);
+        manager.add_test_worker(worker_in_state(1, 100, AdminState::Normal, Liveness::Stale));
         manager.add_test_worker(worker_with_available(2, 20));
         assert_eq!(manager.available_bytes(), 20);
     }
@@ -910,18 +962,52 @@ mod tests {
         send_heartbeat(manager, HeartbeatStatus::Running, addr);
     }
 
+    fn state_of(manager: &WorkerManager, id: u32) -> WorkerState {
+        manager.get_known_worker(id).unwrap().state()
+    }
+
+    #[allow(dead_code)]
     fn status_of(manager: &WorkerManager, id: u32) -> WorkerStatus {
-        manager.get_known_worker(id).unwrap().status
+        manager.get_known_worker(id).unwrap().status()
+    }
+
+    fn set_admin(manager: &mut WorkerManager, host: &str, admin: AdminState) {
+        manager.record_intent(host, WorkerIntent::new(admin, "test", "test", 0));
     }
 
     #[test]
-    fn decommission_survives_blacklist_timeout() {
+    fn heartbeat_never_overwrites_operator_intent() {
+        let mut manager = robin_manager();
+        let addr = host_addr(1, "a");
+        send_heartbeat(&mut manager, HeartbeatStatus::Start, addr.clone());
+        set_admin(&mut manager, "a", AdminState::Cordoned);
+
+        // Every heartbeat path must leave the intent untouched.
+        send_heartbeat(&mut manager, HeartbeatStatus::Running, addr.clone());
+        assert_eq!(state_of(&manager, 1).admin(), AdminState::Cordoned);
+        assert_eq!(state_of(&manager, 1).liveness(), Liveness::Running);
+        assert!(!manager.get_worker(1).unwrap().writable());
+
+        set_admin(&mut manager, "a", AdminState::Decommissioning);
+        send_heartbeat(&mut manager, HeartbeatStatus::Running, addr);
+        assert_eq!(state_of(&manager, 1).admin(), AdminState::Decommissioning);
+    }
+
+    #[test]
+    fn decommission_survives_stale_timeout() {
         let mut manager = robin_manager();
         send_heartbeat(&mut manager, HeartbeatStatus::Running, host_addr(1, "a"));
-        assert_eq!(manager.add_dcm(vec!["a".to_string()]).len(), 1);
+        set_admin(&mut manager, "a", AdminState::Decommissioning);
 
-        assert!(manager.add_blacklist_worker(1).is_none());
-        assert_eq!(status_of(&manager, 1), WorkerStatus::Decommission);
+        assert!(manager.mark_stale(1).is_some());
+        assert_eq!(
+            state_of(&manager, 1),
+            WorkerState::new(AdminState::Decommissioning, Liveness::Stale)
+        );
+        // STALE + DECOMMISSIONING: no new data, but still readable and a drain source.
+        let worker = manager.get_worker(1).unwrap();
+        assert!(!worker.writable());
+        assert!(worker.readable());
     }
 
     #[test]
@@ -929,14 +1015,19 @@ mod tests {
         let mut manager = robin_manager();
         let addr = host_addr(1, "a");
         send_heartbeat(&mut manager, HeartbeatStatus::Running, addr.clone());
-        manager.add_dcm(vec!["a".to_string()]);
+        set_admin(&mut manager, "a", AdminState::Decommissioning);
 
-        manager.add_blacklist_worker(1);
+        manager.mark_stale(1);
         manager.remove_expired_worker(1).unwrap();
-        assert_eq!(status_of(&manager, 1), WorkerStatus::Decommission);
+        // Moving the entry out of the live map does not change liveness; the
+        // heartbeat checker's transition does.
+        assert_eq!(
+            state_of(&manager, 1),
+            WorkerState::new(AdminState::Decommissioning, Liveness::Stale)
+        );
 
         restart(&mut manager, addr);
-        assert_eq!(status_of(&manager, 1), WorkerStatus::Decommission);
+        assert_eq!(state_of(&manager, 1).admin(), AdminState::Decommissioning);
         assert_eq!(manager.get_dcm().len(), 1);
         assert!(manager
             .choose_worker(ChooseContext::with_num(1, 128 << 20, vec![]))
@@ -947,27 +1038,24 @@ mod tests {
     fn decommission_survives_restart_with_new_worker_id() {
         let mut manager = robin_manager();
         send_heartbeat(&mut manager, HeartbeatStatus::Running, host_addr(1, "a"));
-        manager.add_dcm(vec!["a".to_string()]);
+        set_admin(&mut manager, "a", AdminState::Decommissioning);
         manager.remove_expired_worker(1).unwrap();
 
         restart(&mut manager, host_addr(2, "a"));
-        assert_eq!(status_of(&manager, 2), WorkerStatus::Decommission);
+        assert_eq!(state_of(&manager, 2).admin(), AdminState::Decommissioning);
     }
 
     #[test]
     fn decommission_applies_to_worker_registered_later() {
         let mut manager = robin_manager();
-        assert_eq!(
-            manager.add_dcm(vec!["a".to_string()]),
-            vec!["-,a,Decommission"]
-        );
-        assert_eq!(manager.get_dcm(), vec!["-,a,Decommission"]);
+        set_admin(&mut manager, "a", AdminState::Decommissioning);
+        assert_eq!(manager.get_dcm(), vec!["-,a,decommissioning"]);
 
         send_heartbeat(&mut manager, HeartbeatStatus::Running, host_addr(1, "a"));
         send_heartbeat(&mut manager, HeartbeatStatus::Running, host_addr(2, "b"));
-        assert_eq!(status_of(&manager, 1), WorkerStatus::Decommission);
-        assert_eq!(status_of(&manager, 2), WorkerStatus::Live);
-        assert_eq!(manager.get_dcm(), vec!["1,a:8997,Decommission"]);
+        assert_eq!(state_of(&manager, 1).admin(), AdminState::Decommissioning);
+        assert_eq!(state_of(&manager, 2).admin(), AdminState::Normal);
+        assert_eq!(manager.get_dcm(), vec!["1,a:8997,decommissioning"]);
     }
 
     #[test]
@@ -977,61 +1065,85 @@ mod tests {
         send_heartbeat(&mut manager, HeartbeatStatus::Running, host_addr(2, "b"));
         manager.remove_expired_worker(1).unwrap();
 
-        let added = manager.add_dcm(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        set_admin(&mut manager, "a", AdminState::Decommissioning);
+        set_admin(&mut manager, "b", AdminState::Decommissioning);
+        set_admin(&mut manager, "c", AdminState::Decommissioning);
         assert_eq!(
-            added,
+            manager.get_dcm(),
             vec![
-                "1,a:8997,Decommission",
-                "2,b:8997,Decommission",
-                "-,c,Decommission"
+                "1,a:8997,decommissioning",
+                "2,b:8997,decommissioning",
+                "-,c,decommissioning"
             ]
         );
-        assert_eq!(manager.get_dcm(), added);
 
         // The CLI matches requested hosts on the hostname in field 1.
-        for (entry, host) in added.iter().zip(["a", "b", "c"]) {
+        for (entry, host) in manager.get_dcm().iter().zip(["a", "b", "c"]) {
             let addr = entry.split(',').nth(1).unwrap();
             assert_eq!(addr.split(':').next(), Some(host));
         }
 
-        let removed = manager.remove_dcm(vec!["a".to_string(), "c".to_string(), "d".to_string()]);
-        assert_eq!(removed, vec!["1,a:8997,Live", "-,c,Live"]);
-        assert_eq!(manager.get_dcm(), vec!["2,b:8997,Decommission"]);
+        set_admin(&mut manager, "a", AdminState::Normal);
+        assert_eq!(
+            manager.get_dcm(),
+            vec!["2,b:8997,decommissioning", "-,c,decommissioning"]
+        );
     }
 
     #[test]
-    fn remove_dcm_while_lost_restores_live_on_register() {
+    fn cancel_decommission_lands_on_cordoned_not_normal() {
         let mut manager = robin_manager();
         let addr = host_addr(1, "a");
         send_heartbeat(&mut manager, HeartbeatStatus::Running, addr.clone());
-        manager.add_dcm(vec!["a".to_string()]);
+        set_admin(&mut manager, "a", AdminState::Decommissioning);
+        manager.mark_lost(1);
         manager.remove_expired_worker(1).unwrap();
 
+        // Cancelling a drain keeps the node out of placement: already-moved
+        // replicas must not move back.
+        set_admin(&mut manager, "a", AdminState::Cordoned);
         assert_eq!(
-            manager.remove_dcm(vec!["a".to_string()]),
-            vec!["1,a:8997,Live"]
+            state_of(&manager, 1),
+            WorkerState::new(AdminState::Cordoned, Liveness::Lost)
         );
-        assert_eq!(status_of(&manager, 1), WorkerStatus::Live);
 
         restart(&mut manager, addr);
-        assert_eq!(status_of(&manager, 1), WorkerStatus::Live);
-        assert!(manager.get_dcm().is_empty());
-        manager
+        assert_eq!(state_of(&manager, 1).admin(), AdminState::Cordoned);
+        // The record survives, but it is a cordon now, not a drain.
+        assert_eq!(manager.get_dcm(), vec!["1,a:8997,cordoned"]);
+        assert!(manager
             .choose_worker(ChooseContext::with_num(1, 128 << 20, vec![]))
-            .unwrap();
+            .is_err());
     }
 
     #[test]
-    fn blacklisted_worker_recovers_live_on_heartbeat() {
+    fn stale_worker_recovers_running_on_heartbeat() {
         let mut manager = robin_manager();
         let addr = host_addr(1, "a");
         send_heartbeat(&mut manager, HeartbeatStatus::Running, addr.clone());
 
-        assert!(manager.add_blacklist_worker(1).is_some());
-        assert!(manager.remove_dcm(vec!["a".to_string()]).is_empty());
-        assert_eq!(status_of(&manager, 1), WorkerStatus::Blacklist);
+        assert!(manager.mark_stale(1).is_some());
+        assert_eq!(state_of(&manager, 1).liveness(), Liveness::Stale);
+        // Idempotent: a second timeout tick reports nothing new.
+        assert!(manager.mark_stale(1).is_none());
 
         send_heartbeat(&mut manager, HeartbeatStatus::Running, addr);
-        assert_eq!(status_of(&manager, 1), WorkerStatus::Live);
+        assert_eq!(state_of(&manager, 1).liveness(), Liveness::Running);
+        assert!(manager.get_worker(1).unwrap().writable());
+    }
+
+    #[test]
+    fn graceful_shutdown_keeps_the_worker_known() {
+        let mut manager = robin_manager();
+        send_heartbeat(&mut manager, HeartbeatStatus::Running, host_addr(1, "a"));
+
+        assert!(manager.shutdown_worker(1).is_some());
+        assert!(manager.get_worker(1).is_none());
+        assert_eq!(
+            state_of(&manager, 1),
+            WorkerState::new(AdminState::Normal, Liveness::Shutdown)
+        );
+        // Locations are still in metadata, but the node is not readable.
+        assert!(!manager.get_known_worker(1).unwrap().readable());
     }
 }

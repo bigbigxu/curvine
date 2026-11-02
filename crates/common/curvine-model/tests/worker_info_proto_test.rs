@@ -1,5 +1,6 @@
 use curvine_model::{
-    ProtoUtils, StorageInfo, StorageType, WorkerAddress, WorkerInfo, WorkerStatus,
+    AdminState, Liveness, ProtoUtils, StorageInfo, StorageType, WorkerAddress, WorkerInfo,
+    WorkerState, WorkerStatus,
 };
 use curvine_proto::ComponentInfoProto;
 
@@ -16,7 +17,7 @@ fn sample_worker() -> WorkerInfo {
     );
     worker.last_update = 1_700_000_000_123;
     worker.block_num = 42;
-    worker.status = WorkerStatus::Blacklist;
+    worker.apply_state(WorkerState::new(AdminState::Normal, Liveness::Stale));
     worker.capacity = 1_000;
     worker.available = 600;
     worker.fs_used = 300;
@@ -67,7 +68,7 @@ fn worker_info_proto_round_trip_preserves_heartbeat_and_blocks() {
 
     assert_eq!(restored.last_update, worker.last_update);
     assert_eq!(restored.block_num, worker.block_num);
-    assert_eq!(restored.status, worker.status);
+    assert_eq!(restored.status(), worker.status());
     assert_eq!(restored.capacity, worker.capacity);
     assert_eq!(restored.available, worker.available);
     assert_eq!(restored.storage_map.len(), worker.storage_map.len());
@@ -99,6 +100,9 @@ fn worker_info_from_pb_treats_missing_optional_fields_as_legacy_defaults() {
     let mut pb = ProtoUtils::worker_info_to_pb(sample_worker());
     pb.block_num = None;
     pb.status = None;
+    // A legacy peer knows neither axis and only sends (or omits) `status`.
+    pb.admin_state = None;
+    pb.liveness = None;
     pb.weight = None;
     pb.transfer_inflight_budget_bytes = None;
     pb.worker_max_concurrent_tasks = None;
@@ -107,7 +111,7 @@ fn worker_info_from_pb_treats_missing_optional_fields_as_legacy_defaults() {
         .pop()
         .expect("worker");
 
-    assert_eq!(restored.status, WorkerStatus::Live);
+    assert_eq!(restored.status(), WorkerStatus::Live);
     assert_eq!(restored.block_num, 42);
     assert_eq!(restored.weight, WorkerInfo::default_weight());
     assert_eq!(restored.transfer_inflight_budget_bytes, 0);
@@ -120,7 +124,7 @@ fn worker_info_proto_preserves_weight() {
         weight: 42,
         software_version: "0.1.0-test".to_string(),
         startup_time_ms: 123_456,
-        ..Default::default()
+        ..WorkerInfo::default()
     };
 
     let proto = ProtoUtils::worker_info_to_pb(worker);
@@ -141,7 +145,7 @@ fn worker_info_proto_preserves_component_info() {
         weight: 42,
         software_version: "0.1.0-test".to_string(),
         component_info: Some(component_info.clone()),
-        ..Default::default()
+        ..WorkerInfo::default()
     };
 
     let proto = ProtoUtils::worker_info_to_pb(worker);
@@ -157,7 +161,7 @@ fn worker_info_proto_defaults_missing_component_info() {
     // None instead of inventing an empty payload.
     let worker = WorkerInfo {
         software_version: "0.1.0-test".to_string(),
-        ..Default::default()
+        ..WorkerInfo::default()
     };
 
     let proto = ProtoUtils::worker_info_to_pb(worker);
@@ -178,4 +182,49 @@ fn worker_info_proto_defaults_missing_weight() {
     assert_eq!(restored[0].weight, WorkerInfo::default_weight());
     assert!(restored[0].software_version.is_empty());
     assert_eq!(restored[0].startup_time_ms, 0);
+}
+
+#[test]
+fn worker_info_proto_prefers_the_state_axes_over_the_legacy_status() {
+    let mut worker = sample_worker();
+    worker.apply_state(WorkerState::new(
+        AdminState::Decommissioning,
+        Liveness::Running,
+    ));
+    let mut pb = ProtoUtils::worker_info_to_pb(worker);
+    // A peer that writes the legacy field inconsistently must not win.
+    pb.status = Some(WorkerStatus::Blacklist as i32);
+
+    let restored = ProtoUtils::worker_info_from_pb(vec![pb])
+        .pop()
+        .expect("worker");
+
+    assert_eq!(restored.admin(), AdminState::Decommissioning);
+    assert_eq!(restored.liveness(), Liveness::Running);
+}
+
+#[test]
+fn worker_info_proto_legacy_status_map() {
+    // Old masters only fill `status`; the reader projects it onto both axes.
+    for (legacy, admin, liveness) in [
+        (WorkerStatus::Live, AdminState::Normal, Liveness::Running),
+        (WorkerStatus::Blacklist, AdminState::Normal, Liveness::Stale),
+        (
+            WorkerStatus::Decommission,
+            AdminState::Decommissioned,
+            Liveness::Running,
+        ),
+        (WorkerStatus::Lost, AdminState::Normal, Liveness::Lost),
+    ] {
+        let mut pb = ProtoUtils::worker_info_to_pb(sample_worker());
+        pb.status = Some(legacy as i32);
+        pb.admin_state = None;
+        pb.liveness = None;
+
+        let restored = ProtoUtils::worker_info_from_pb(vec![pb])
+            .pop()
+            .expect("worker");
+        assert_eq!(restored.admin(), admin, "legacy {legacy:?}");
+        assert_eq!(restored.liveness(), liveness, "legacy {legacy:?}");
+    }
 }

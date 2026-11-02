@@ -294,3 +294,41 @@ fn bincode_record_is_rejected() {
     let legacy = [1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     assert!(JournalBatch::decode(&legacy).is_err());
 }
+
+#[test]
+fn worker_intent_entry_round_trips_through_proto() {
+    use crate::master::fs::state::WorkerIntent;
+    use curvine_model::AdminState;
+
+    let entry = JournalEntry::WorkerIntent(WorkerIntentEntry {
+        op_id: 8,
+        rpc_id: 0,
+        host: "host-a".to_string(),
+        intent: WorkerIntent {
+            orphan_blocks: vec![7, 9],
+            orphan_count: 2,
+            forced_at_ms: 1_700_000_000_000,
+            preflight_blocks: 5,
+            preflight_single_replica: 1,
+            admin: AdminState::Decommissioning,
+            since_ms: 1_700_000_000_000,
+            operator: "alice".to_string(),
+            reason: "hardware return".to_string(),
+            drain_deadline_ms: 1_700_000_600_000,
+        },
+    });
+
+    let proto = entry.clone().into_proto().unwrap();
+    let decoded = JournalEntry::from_proto(proto).unwrap();
+
+    match decoded {
+        JournalEntry::WorkerIntent(decoded) => {
+            assert_eq!(decoded.op_id, 8);
+            assert_eq!(decoded.host, "host-a");
+            assert_eq!(decoded.intent.admin, AdminState::Decommissioning);
+            assert_eq!(decoded.intent.operator, "alice");
+            assert_eq!(decoded.intent.drain_deadline_ms, 1_700_000_600_000);
+        }
+        other => panic!("expected worker intent, got {other:?}"),
+    }
+}

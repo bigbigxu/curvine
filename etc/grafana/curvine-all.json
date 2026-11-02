@@ -6243,6 +6243,480 @@
           ],
           "title": "自检探测 P99 耗时",
           "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：已下线（DECOMMISSIONED）节点磁盘上仍然保留的字节数，容量不计入可分配。\n趋势：上升表示下线节点的数据尚未清理；下降到 0 表示这些节点已被重新接入或擦除。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              },
+              "unit": "bytes"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 6,
+            "x": 12,
+            "y": 67
+          },
+          "id": 115,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "value_and_name"
+          },
+          "pluginVersion": "10.0.9",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "exemplar": false,
+              "expr": "max(worker_retained_bytes{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\"})",
+              "format": "time_series",
+              "instant": true,
+              "interval": "",
+              "legendFormat": "up",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "exemplar": false,
+              "expr": "sum(up{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"} == bool 0)",
+              "format": "time_series",
+              "instant": true,
+              "interval": "",
+              "legendFormat": "down",
+              "refId": "B"
+            }
+          ],
+          "title": "下线节点保留字节",
+          "type": "stat"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：正在搬空（DECOMMISSIONING）的节点上仍挂在元数据里的块位置数，是搬迁进度。\n趋势：持续下降表示搬迁在推进；长期不变表示搬迁卡住，请查看卡住原因。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 6,
+            "x": 18,
+            "y": 67
+          },
+          "id": 116,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "value_and_name"
+          },
+          "pluginVersion": "10.0.9",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "exemplar": false,
+              "expr": "max(worker_drain_blocks_remaining{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\"})",
+              "format": "time_series",
+              "instant": true,
+              "interval": "",
+              "legendFormat": "up",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "exemplar": false,
+              "expr": "sum(up{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"} == bool 0)",
+              "format": "time_series",
+              "instant": true,
+              "interval": "",
+              "legendFormat": "down",
+              "refId": "B"
+            }
+          ],
+          "title": "Drain 剩余块数",
+          "type": "stat"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：无法推进搬迁的节点数量，按原因分组（stale=节点失联、no_target_worker=没有可接收的节点）。\n趋势：出现非零值表示该原因导致的搬迁停滞；回到 0 表示恢复推进。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 0,
+            "y": 74
+          },
+          "id": 117,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "exemplar": false,
+              "expr": "sum by (reason) (worker_drain_stalled{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\"})",
+              "format": "time_series",
+              "interval": "",
+              "legendFormat": "{{reason}}",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "exemplar": false,
+              "expr": "num_blocks{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}",
+              "format": "time_series",
+              "interval": "",
+              "legendFormat": "blocks {{instance}}",
+              "refId": "B"
+            }
+          ],
+          "title": "Drain 卡住原因",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：正在搬空的节点上只有一份副本的块位置数，强制完成会让这些块不可读。\n趋势：上升表示搬迁风险变大；强制完成前应在该值不为 0 时确认影响面。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 8,
+            "y": 74
+          },
+          "id": 118,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "exemplar": false,
+              "expr": "max(worker_drain_single_replica_blocks{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\"})",
+              "format": "time_series",
+              "interval": "",
+              "legendFormat": "last copy",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "exemplar": false,
+              "expr": "num_blocks{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}",
+              "format": "time_series",
+              "interval": "",
+              "legendFormat": "blocks {{instance}}",
+              "refId": "B"
+            }
+          ],
+          "title": "Drain 最后一份副本块数",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：Worker 状态转移的速率，标签 from/to 是两个维度（admin/liveness）的状态组合。\n趋势：出现尖峰表示批量运维动作或大规模心跳异常；长期非零需要核对运维意图。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 1,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 16,
+            "y": 74
+          },
+          "id": 119,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "exemplar": false,
+              "expr": "sum by (from, to) (rate(worker_state_transition_count{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\"}[$interval]))",
+              "format": "time_series",
+              "interval": "",
+              "legendFormat": "{{from}} → {{to}}",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "exemplar": false,
+              "expr": "num_blocks{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}",
+              "format": "time_series",
+              "interval": "",
+              "legendFormat": "blocks {{instance}}",
+              "refId": "B"
+            }
+          ],
+          "title": "Worker 状态变迁速率",
+          "type": "timeseries"
         }
       ],
       "targets": [

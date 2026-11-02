@@ -127,6 +127,24 @@ pub struct MasterMetrics {
 
     pub(crate) worker_num: GaugeVec,
 
+    /// Worker state transitions, labelled with the `admin+liveness` pair on both
+    /// sides. Answers "who moved this node and from where".
+    pub(crate) worker_state_transition_count: CounterVec,
+    /// Blocks whose replica count fell when locations were dropped (force
+    /// completion or a lost worker).
+    pub(crate) worker_orphan_blocks: Counter,
+    /// Blocks still to be copied off a draining worker.
+    pub(crate) worker_drain_blocks_remaining: GaugeVec,
+    /// Workers whose drain cannot make progress, by reason
+    /// (`stale` / `no_target_worker`).
+    pub(crate) worker_drain_stalled: GaugeVec,
+    /// Block locations that are the last copy of their block, summed over
+    /// draining workers: forcing those drains would lose data.
+    pub(crate) worker_drain_single_replica_blocks: Gauge,
+    /// Bytes still held by `DECOMMISSIONED` nodes: retained, not counted as
+    /// available capacity.
+    pub(crate) worker_retained_bytes: Gauge,
+
     pub(crate) journal_queue_len: Gauge,
     pub(crate) journal_flush_count: Counter,
     pub(crate) journal_flush_time: Counter,
@@ -269,6 +287,33 @@ impl MasterMetrics {
                 &["worker_addr"],
             )?,
             worker_num: m::new_gauge_vec("worker_num", "The number of lived workers", &["tag"])?,
+            worker_state_transition_count: m::new_counter_vec(
+                "worker_state_transition_count",
+                "Worker state transitions by from/to state",
+                &["from", "to"],
+            )?,
+            worker_orphan_blocks: m::new_counter(
+                "worker_orphan_blocks",
+                "Block locations dropped by force completion or worker loss",
+            )?,
+            worker_drain_blocks_remaining: m::new_gauge_vec(
+                "worker_drain_blocks_remaining",
+                "Block locations still to be copied off a draining worker",
+                &["worker"],
+            )?,
+            worker_drain_stalled: m::new_gauge_vec(
+                "worker_drain_stalled",
+                "Draining workers that cannot make progress, by reason",
+                &["reason"],
+            )?,
+            worker_drain_single_replica_blocks: m::new_gauge(
+                "worker_drain_single_replica_blocks",
+                "Block locations on draining workers that are the last copy of their block",
+            )?,
+            worker_retained_bytes: m::new_gauge(
+                "worker_retained_bytes",
+                "Bytes retained on decommissioned workers",
+            )?,
 
             journal_queue_len: m::new_gauge("journal_queue_len", "Journal queue length")?,
             journal_flush_count: m::new_counter(
@@ -562,15 +607,34 @@ impl MasterMetrics {
         self.worker_num
             .with_label_values(&["live"])
             .set(filesystem_info.live_workers.len() as i64);
+        // `blacklist` and `stale` partition the alive-but-not-writable workers,
+        // so live + blacklist + stale + decommission + lost is the fleet size.
+        let stale_workers = filesystem_info
+            .blacklist_workers
+            .iter()
+            .filter(|worker| worker.liveness() == curvine_model::Liveness::Stale)
+            .count() as i64;
         self.worker_num
             .with_label_values(&["blacklist"])
-            .set(filesystem_info.blacklist_workers.len() as i64);
+            .set(filesystem_info.blacklist_workers.len() as i64 - stale_workers);
+        self.worker_num
+            .with_label_values(&["stale"])
+            .set(stale_workers);
         self.worker_num
             .with_label_values(&["decommission"])
             .set(filesystem_info.decommission_workers.len() as i64);
         self.worker_num
             .with_label_values(&["lost"])
             .set(filesystem_info.lost_workers.len() as i64);
+        // Bytes kept on drained nodes: retained on disk, never advertised as
+        // allocatable capacity.
+        self.worker_retained_bytes.set(
+            filesystem_info
+                .decommission_workers
+                .iter()
+                .map(|worker| worker.fs_used.max(0))
+                .sum(),
+        );
 
         Metrics::text_output()
     }

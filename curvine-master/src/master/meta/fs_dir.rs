@@ -1791,6 +1791,45 @@ impl FsDir {
         Ok(true)
     }
 
+    /// Moves one replica of `block_id` from `from_worker` to `add`.
+    ///
+    /// Used by the decommission drain. The new location is written before the old
+    /// one is dropped in the same batch, so a block is never left with fewer
+    /// copies than before the move. Returns `false` when the block is gone or the
+    /// draining location is already absent (idempotent retry).
+    pub(crate) fn move_block_location(
+        &mut self,
+        block_id: i64,
+        add: BlockLocation,
+        from_worker: u32,
+    ) -> FsResult<bool> {
+        let inode_id = InodeId::get_id(block_id);
+        let Some(File(file)) = self.store.get_inode(inode_id, None)? else {
+            return Ok(false);
+        };
+        if !file.blocks.iter().any(|block| block.id == block_id) {
+            return Ok(false);
+        }
+        let locations = self.store.get_block_locations(block_id)?;
+        if !locations
+            .iter()
+            .any(|current| current.worker_id == from_worker)
+        {
+            return Ok(false);
+        }
+
+        let mut batch = self.store.new_batch();
+        if !locations
+            .iter()
+            .any(|current| current.worker_id == add.worker_id)
+        {
+            batch.add_location(block_id, &add)?;
+        }
+        batch.delete_location(block_id, from_worker)?;
+        batch.commit()?;
+        Ok(true)
+    }
+
     pub fn reopen_file(
         &mut self,
         inp: &InodePath,

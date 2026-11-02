@@ -196,12 +196,23 @@ impl MasterReplicationManager {
         })
     }
 
-    fn source_endpoint(&self, locations: &[BlockLocation]) -> CommonResult<WorkerEndpoint> {
+    fn source_endpoint(
+        &self,
+        locations: &[BlockLocation],
+        drain_source: Option<WorkerId>,
+    ) -> CommonResult<WorkerEndpoint> {
         let worker_manager = self.worker_manager.read();
-        for location in locations {
+        // A drain copy must read from the draining worker: that is the copy we
+        // are moving. CORDONED and DECOMMISSIONING workers are valid sources for
+        // ordinary repairs as well; only STALE/LOST/DECOMMISSIONED are not.
+        let candidates: Vec<WorkerId> = match drain_source {
+            Some(worker_id) => vec![worker_id],
+            None => locations.iter().map(|location| location.worker_id).collect(),
+        };
+        for worker_id in candidates {
             if let Some(worker) = worker_manager
-                .get_worker(location.worker_id)
-                .filter(|worker| worker.is_live())
+                .get_worker(worker_id)
+                .filter(|worker| worker.replicable_source())
             {
                 return Ok(WorkerEndpoint {
                     address: worker.address.clone(),
@@ -209,7 +220,11 @@ impl MasterReplicationManager {
                 });
             }
         }
-        err_box!("No live source worker found for locations: {:?}", locations)
+        err_box!(
+            "No usable replication source found for locations: {:?} (drain source: {:?})",
+            locations,
+            drain_source
+        )
     }
 
     fn assign(&self, exclusive_worker_ids: Vec<WorkerId>) -> CommonResult<WorkerEndpoint> {
@@ -466,7 +481,10 @@ impl MasterReplicationManager {
             info!("Skip obsolete replication request for block {}", block_id);
             return Ok(());
         };
-        if block_state.locations.len() >= block_state.replicas as usize {
+        let drain_source = self.fs.drain_source_of_block(block_id);
+        // A drain copy is not a repair: the replica count already includes the
+        // draining worker, so the "already replicated" shortcut must not fire.
+        if drain_source.is_none() && block_state.locations.len() >= block_state.replicas as usize {
             if self.tracker.cancel_queued(block_id) {
                 self.metrics.replication_staging_number.dec();
             }
@@ -476,15 +494,31 @@ impl MasterReplicationManager {
         if block_state.locations.is_empty() {
             return err_box!("missing source location for block {}", block_id);
         }
-
-        let source = self.source_endpoint(&block_state.locations)?;
-        let target = self.assign(
-            block_state
+        if let Some(worker_id) = drain_source {
+            if !block_state
                 .locations
                 .iter()
-                .map(|location| location.worker_id)
-                .collect(),
-        )?;
+                .any(|location| location.worker_id == worker_id)
+            {
+                // Already moved by a previous attempt (or deleted): nothing to do.
+                if self.tracker.cancel_queued(block_id) {
+                    self.metrics.replication_staging_number.dec();
+                }
+                self.fs.on_drain_block_moved(worker_id, block_id);
+                return Ok(());
+            }
+        }
+
+        let source = self.source_endpoint(&block_state.locations, drain_source)?;
+        let mut exclusive: Vec<WorkerId> = block_state
+            .locations
+            .iter()
+            .map(|location| location.worker_id)
+            .collect();
+        // Never target another draining worker: it would have to move the copy
+        // out again, and two drains could chase each other.
+        exclusive.extend(self.fs.drain_sources());
+        let target = self.assign(exclusive)?;
         info!(
             "block_id: {}. locations: {:?}, target: {}",
             block_id, block_state.locations, target.address
@@ -699,6 +733,20 @@ impl MasterReplicationManager {
         Ok(())
     }
 
+    /// Queues one block of a draining worker.
+    ///
+    /// A drain copy is not a repair: the replica count is already satisfied by
+    /// the draining worker itself, so the normal "already replicated" shortcut
+    /// must not apply. The source is pinned to the draining worker and the
+    /// location only moves once the copy is committed.
+    pub fn queue_drain_block(&self, block_id: BlockId) -> CommonResult<()> {
+        if !self.replication_enabled {
+            return Ok(());
+        }
+        self.queue_block(block_id);
+        Ok(())
+    }
+
     pub fn report_under_replicated_blocks(
         &self,
         _worker_id: WorkerId,
@@ -782,9 +830,25 @@ impl MasterReplicationManager {
                 snapshot.attempt.target_worker.worker_id,
                 req.storage_type.into(),
             );
-            metadata_result = self
-                .commit_replication_location(block_id, location)
-                .map(|added| {
+            let drain_source = self
+                .fs
+                .drain_source_of_block(block_id)
+                .filter(|worker_id| *worker_id == snapshot.attempt.source_worker_id);
+            metadata_result = match drain_source {
+                Some(source_worker) => self
+                    .fs
+                    .commit_drain_move(block_id, location, source_worker)
+                    .map(|moved| {
+                        if moved {
+                            info!(
+                                "Successfully drained {} off worker {}",
+                                block_id, source_worker
+                            );
+                        } else {
+                            info!("Drain move for block {} is no longer needed", block_id);
+                        }
+                    }),
+                None => self.commit_replication_location(block_id, location).map(|added| {
                     if added {
                         info!("Successfully replicated {}", block_id);
                     } else {
@@ -793,7 +857,8 @@ impl MasterReplicationManager {
                             block_id
                         );
                     }
-                });
+                }),
+            };
         } else {
             error!(
                 "Errors on block replication for block_id: {} to worker: {}. error: {:?}",

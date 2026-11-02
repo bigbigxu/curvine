@@ -3427,19 +3427,19 @@ async fn worker_detail_v1(
     let master_info = current_master_info(&instance).await?;
     for item in master_info.live_workers {
         if worker_matches(&item, &worker) {
-            let state = format!("{:?}", item.status);
+            let state = format!("{:?}", item.status());
             return Ok(api_success(worker_payload(item, &state)));
         }
     }
     for item in master_info.blacklist_workers {
         if worker_matches(&item, &worker) {
-            let state = format!("{:?}", item.status);
+            let state = format!("{:?}", item.status());
             return Ok(api_success(worker_payload(item, &state)));
         }
     }
     for item in master_info.decommission_workers {
         if worker_matches(&item, &worker) {
-            let state = format!("{:?}", item.status);
+            let state = format!("{:?}", item.status());
             return Ok(api_success(worker_payload(item, &state)));
         }
     }
@@ -3452,12 +3452,18 @@ async fn worker_detail_v1(
     err_box!("worker not found: {}", worker)
 }
 
+/// Console action -> master action string.
+///
+/// `blacklist` now means "cordon": the node stops taking new data but still
+/// serves reads, which is what the old BLACKLIST status was trying to express.
 fn worker_action_target_status(action: &str) -> FsResult<&'static str> {
     match action.trim().to_lowercase().as_str() {
-        "blacklist" | "block" => Ok("Blacklist"),
-        "allow" | "unblacklist" | "remove_blacklist" => Ok("Live"),
-        "decommission" | "retire" => Ok("Decommission"),
-        "recommission" | "remove_decommission" => Ok("Live"),
+        "blacklist" | "block" | "cordon" => Ok("cordon"),
+        "allow" | "unblacklist" | "remove_blacklist" | "uncordon" => Ok("uncordon"),
+        "decommission" | "retire" => Ok("decommission"),
+        "cancel_decommission" | "cancel-decommission" => Ok("cancel-decommission"),
+        "force_decommission" | "force-decommission" => Ok("force-decommission"),
+        "recommission" | "remove_decommission" => Ok("recommission"),
         action => err_box!("unsupported worker action: {}", action),
     }
 }
@@ -3482,7 +3488,7 @@ async fn worker_decommission_v1(
     let (worker, status) = instance
         .unified_fs
         .fs_client()
-        .set_worker_status(payload.worker.trim(), "Decommission")
+        .set_worker_status(payload.worker.trim(), "decommission")
         .await?;
     Ok(api_success(worker_payload(worker, &status)))
 }
@@ -3494,7 +3500,7 @@ async fn worker_remove_decommission_v1(
     let (worker, status) = instance
         .unified_fs
         .fs_client()
-        .set_worker_status(payload.worker.trim(), "Live")
+        .set_worker_status(payload.worker.trim(), "live")
         .await?;
     Ok(api_success(worker_payload(worker, &status)))
 }
@@ -4793,7 +4799,7 @@ async fn add_dcm(
     Extension(instance): Extension<Arc<AdminRouterHandler>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> FsResult<Json<Vec<String>>> {
-    Ok(apply_worker_decommission(&instance, &params, "Decommission").await)
+    Ok(apply_worker_decommission(&instance, &params, "decommission").await)
 }
 
 async fn get_dcm(

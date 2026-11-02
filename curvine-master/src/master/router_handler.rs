@@ -24,7 +24,7 @@ use curvine_config::ClusterConf;
 use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_fault::FaultHttpControl;
-use curvine_model::{FileBlocks, FileStatus, WorkerInfo};
+use curvine_model::{FileBlocks, FileStatus, Trigger, WorkerInfo};
 use curvine_runtime::common::LocalTime;
 use curvine_web::router::RouterHandler;
 
@@ -226,19 +226,35 @@ async fn add_dcm(
     Query(params): Query<HashMap<String, String>>,
 ) -> FsResult<Json<Vec<String>>> {
     let fs = &instance.fs;
-    let mut wm = fs.worker_manager.write();
-    match params.get("workers") {
-        None => err_box!("not params workers"),
-        Some(v) => {
-            let list = v
-                .split(",")
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty())
-                .collect();
-            let res = wm.add_dcm(list);
-            Ok(Json(res))
-        }
+    let Some(v) = params.get("workers") else {
+        return err_box!("not params workers");
+    };
+    Ok(Json(apply_decommission(
+        fs,
+        v,
+        Trigger::Decommission,
+        "web /add-dcm",
+    )?))
+}
+
+/// Legacy REST entry point. It goes through the same state machine and the same
+/// journaled intent as the RPC and CLI paths instead of writing the worker map.
+fn apply_decommission(
+    fs: &crate::master::fs::MasterFilesystem,
+    workers: &str,
+    trigger: Trigger,
+    reason: &str,
+) -> FsResult<Vec<String>> {
+    let mut updated = Vec::new();
+    for worker in workers
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        fs.apply_operator_action(worker, trigger, "rest", reason)?;
+        updated.push(worker.to_string());
     }
+    Ok(updated)
 }
 
 async fn get_dcm(
@@ -254,19 +270,15 @@ async fn remove_dcm(
     Query(params): Query<HashMap<String, String>>,
 ) -> FsResult<Json<Vec<String>>> {
     let fs = &instance.fs;
-    let mut wm = fs.worker_manager.write();
-    match params.get("workers") {
-        None => err_box!("not params workers"),
-        Some(v) => {
-            let list = v
-                .split(",")
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty())
-                .collect();
-            let res = wm.remove_dcm(list);
-            Ok(Json(res))
-        }
-    }
+    let Some(v) = params.get("workers") else {
+        return err_box!("not params workers");
+    };
+    Ok(Json(apply_decommission(
+        fs,
+        v,
+        Trigger::Recommission,
+        "web /remove-dcm",
+    )?))
 }
 
 async fn workers1(

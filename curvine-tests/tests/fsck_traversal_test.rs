@@ -175,7 +175,7 @@ fn fsck_reports_lost_replica_in_two_worker_cluster() -> CommonResult<()> {
             // master requires both worker intervals to be at least the heartbeat
             // interval.
             conf.master.heartbeat_interval = "5s".to_string();
-            conf.master.worker_blacklist_interval = "20s".to_string();
+            conf.master.worker_stale_interval = "20s".to_string();
             conf.master.worker_lost_interval = "30s".to_string();
         })
         .build()?;

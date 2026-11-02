@@ -312,7 +312,9 @@ impl ClusterMetadataCache {
             .workers
             .into_iter()
             .filter(|worker| {
-                worker.is_live()
+                // Transfer writes real data: only workers that take new data may
+                // receive it (CORDONED / DECOMMISSIONING are excluded).
+                worker.writable()
                     && !worker.worker_session_id.is_empty()
                     && worker.transfer_capabilities.supports_transfer()
             })
@@ -361,10 +363,10 @@ impl ClusterMetadataCache {
 }
 
 fn worker_counts(workers: &[WorkerInfo]) -> (usize, usize) {
-    let live = workers.iter().filter(|worker| worker.is_live()).count();
+    let live = workers.iter().filter(|worker| worker.writable()).count();
     let capable = workers
         .iter()
-        .filter(|worker| worker.is_live() && worker.transfer_capabilities.supports_transfer())
+        .filter(|worker| worker.writable() && worker.transfer_capabilities.supports_transfer())
         .count();
     (live, capable)
 }

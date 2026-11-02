@@ -96,6 +96,11 @@ pub use self::last_block_status::LastBlockStatus;
 mod worker_status;
 pub use self::worker_status::WorkerStatus;
 
+mod worker_admin;
+pub use self::worker_admin::{
+    apply, AdminState, Effect, Facts, Liveness, Refusal, Trigger, WorkerState,
+};
+
 mod mount;
 pub use self::mount::*;
 

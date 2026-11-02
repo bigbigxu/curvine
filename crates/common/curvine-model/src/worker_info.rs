@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::state::{StorageInfo, WorkerAddress, WorkerStatus};
+use crate::state::{AdminState, Liveness, StorageInfo, WorkerAddress, WorkerState, WorkerStatus};
 use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::LocalTime;
 use serde::{Deserialize, Serialize};
@@ -72,7 +72,16 @@ pub struct WorkerInfo {
     pub last_update: u64,
     pub block_num: i64,
     pub storage_map: HashMap<String, StorageInfo>,
-    pub status: WorkerStatus,
+    /// Operator intent, projected from the persisted intent table.
+    ///
+    /// Do not assign: [`WorkerInfo::apply_state`] is the only writer, and it
+    /// keeps this consistent with `liveness`. There is deliberately no single
+    /// `status` field any more: one writable field shared by heartbeats,
+    /// timeouts and operator actions is exactly the CV-60 bug.
+    pub admin: AdminState,
+    /// Heartbeat-derived fact (`RUNNING` / `STALE` / `LOST` / `SHUTDOWN`).
+    /// Do not assign outside [`WorkerInfo::apply_state`].
+    pub liveness: Liveness,
     pub worker_session_id: String,
     pub transfer_capabilities: TransferWorkerCapabilities,
     /// Runtime Transfer admission budget from the latest heartbeat. Zero
@@ -111,7 +120,8 @@ impl WorkerInfo {
             block_num: 0,
             last_update: LocalTime::mills(),
             storage_map: Default::default(),
-            status: WorkerStatus::Live,
+            admin: AdminState::Normal,
+            liveness: Liveness::Running,
             worker_session_id: String::new(),
             transfer_capabilities: TransferWorkerCapabilities::default(),
             transfer_inflight_budget_bytes: 0,
@@ -171,8 +181,74 @@ impl WorkerInfo {
         )
     }
 
+    /// Node state as the pair of orthogonal axes: operator intent and liveness.
+    pub fn state(&self) -> WorkerState {
+        WorkerState::new(self.admin, self.liveness)
+    }
+
+    /// Operator intent (persisted). Heartbeats never change it.
+    pub fn admin(&self) -> AdminState {
+        self.admin
+    }
+
+    /// Heartbeat-derived fact (not persisted).
+    pub fn liveness(&self) -> Liveness {
+        self.liveness
+    }
+
+    /// The only writer of the state axes.
+    ///
+    /// Callers must obtain the new state from `curvine_model::apply`, never by
+    /// editing one axis in place: that is what let a heartbeat overwrite an
+    /// operator decision (CV-60).
+    pub fn apply_state(&mut self, state: WorkerState) {
+        self.admin = state.admin();
+        self.liveness = state.liveness();
+    }
+
+    /// Legacy single-axis projection, kept for the wire format, fsck and the
+    /// console. Never read it to decide placement: use [`Self::writable`],
+    /// [`Self::readable`], [`Self::replicable_source`] or
+    /// [`Self::accepts_block_report_add`].
+    pub fn status(&self) -> WorkerStatus {
+        // The operator's terminal decision outranks liveness: a node that was
+        // decommissioned stays "decommissioned" in a legacy view even while it
+        // is stale or gone, which is what an operator needs to see.
+        if self.admin == AdminState::Decommissioned {
+            return WorkerStatus::Decommission;
+        }
+        match self.liveness {
+            Liveness::Lost | Liveness::Shutdown => WorkerStatus::Lost,
+            Liveness::Stale => WorkerStatus::Blacklist,
+            Liveness::Running => WorkerStatus::Live,
+        }
+    }
+
+    /// Legacy predicate: this worker is in the one state the old model had for
+    /// "fully available". Keep it only where the single-axis answer is what is
+    /// actually wanted (a re-registered worker has a session, etc.).
     pub fn is_live(&self) -> bool {
-        self.status == WorkerStatus::Live
+        self.state().writable()
+    }
+
+    /// Can the master place new data here?
+    pub fn writable(&self) -> bool {
+        self.state().writable()
+    }
+
+    /// Can a client be handed this worker for a read?
+    pub fn readable(&self) -> bool {
+        self.state().readable()
+    }
+
+    /// Can this worker be the source of a replica copy?
+    pub fn replicable_source(&self) -> bool {
+        self.state().replicable_source()
+    }
+
+    /// May a block report from this worker add locations again?
+    pub fn accepts_block_report_add(&self) -> bool {
+        self.state().accepts_block_report_add()
     }
 
     pub fn allocatable_available(&self) -> i64 {
@@ -186,18 +262,18 @@ impl WorkerInfo {
     /// explicitly reported field.
     pub fn accepting_allocations(&self) -> bool {
         if self.storage_map.is_empty() {
-            return self.is_live();
+            return self.writable();
         }
         self.storage_map.values().any(|storage| storage.is_usable())
     }
 
-    /// Master policy on top of the worker fact: blacklist/decommission/weight.
+    /// Master policy on top of the worker fact: intent/liveness/weight.
     pub fn schedulable(&self) -> bool {
-        self.is_live() && self.weight > 0 && self.accepting_allocations()
+        self.writable() && self.weight > 0 && self.accepting_allocations()
     }
 
     pub fn can_allocate(&self, block_size: i64) -> bool {
-        if !self.is_live() || !self.accepting_allocations() {
+        if !self.writable() || !self.accepting_allocations() {
             return false;
         }
         // 0 is a valid size: no capacity constraint, pick any live worker.
@@ -255,13 +331,16 @@ impl WorkerInfo {
         self.address.connect_addr()
     }
 
+    /// Legacy `id,host:port,state` line used by the CLI and the console. The
+    /// state field is the new admin/liveness label (`normal`, `stale`,
+    /// `decommissioning`, ...), which is what an operator needs to see.
     pub fn simple_string(&self) -> String {
         format!(
-            "{},{}:{},{:?}",
+            "{},{}:{},{}",
             self.worker_id(),
             self.address.hostname,
             self.address.rpc_port,
-            self.status
+            self.state().as_label()
         )
     }
 }
@@ -288,7 +367,8 @@ impl Default for WorkerInfo {
             last_update: 0,
             block_num: 0,
             storage_map: Default::default(),
-            status: WorkerStatus::Live,
+            admin: AdminState::Normal,
+            liveness: Liveness::Running,
             worker_session_id: String::new(),
             transfer_capabilities: TransferWorkerCapabilities::default(),
             transfer_inflight_budget_bytes: 0,
@@ -346,13 +426,41 @@ mod tests {
     }
 
     #[test]
-    fn can_allocate_rejects_non_live_worker() {
-        let worker = WorkerInfo {
-            status: WorkerStatus::Blacklist,
-            ..Default::default()
-        };
+    fn can_allocate_rejects_a_stale_worker() {
+        let mut worker = WorkerInfo::default();
+        worker.apply_state(WorkerState::new(AdminState::Normal, Liveness::Stale));
         assert!(!worker.can_allocate(0));
         assert!(!worker.can_allocate(128));
+    }
+
+    #[test]
+    fn can_allocate_rejects_a_cordoned_worker() {
+        let mut worker = WorkerInfo::default();
+        worker.apply_state(WorkerState::new(AdminState::Cordoned, Liveness::Running));
+        assert!(!worker.writable());
+        assert!(worker.readable());
+        assert!(!worker.can_allocate(0));
+    }
+
+    #[test]
+    fn legacy_status_projects_the_two_axes() {
+        let mut worker = WorkerInfo::default();
+        assert_eq!(worker.status(), WorkerStatus::Live);
+
+        worker.apply_state(WorkerState::new(AdminState::Decommissioning, Liveness::Running));
+        assert_eq!(worker.status(), WorkerStatus::Live);
+
+        worker.apply_state(WorkerState::new(AdminState::Decommissioned, Liveness::Running));
+        assert_eq!(worker.status(), WorkerStatus::Decommission);
+
+        worker.apply_state(WorkerState::new(AdminState::Normal, Liveness::Stale));
+        assert_eq!(worker.status(), WorkerStatus::Blacklist);
+
+        worker.apply_state(WorkerState::new(AdminState::Normal, Liveness::Lost));
+        assert_eq!(worker.status(), WorkerStatus::Lost);
+
+        worker.apply_state(WorkerState::new(AdminState::Normal, Liveness::Shutdown));
+        assert_eq!(worker.status(), WorkerStatus::Lost);
     }
 
     #[test]

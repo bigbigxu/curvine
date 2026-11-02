@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::{DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus};
+use crate::master::fs::{resolve_action, DeleteMode, FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::job::JobHandler;
 use crate::master::meta::trash::TrashCursor;
 use crate::master::meta::TrashListing;
@@ -42,7 +42,6 @@ use curvine_model::{
     ContentSummarySnapshot, ContentSummarySource, CreateFileOpts, DeleteBlockCmd, DeleteResult,
     FileBlockDetails, FileBlocks, FileStatus, FilesystemInfo, FreeResult, HeartbeatStatus,
     ListOptions, OpenFlags, RenameFlags, RestoreTrashResult, WorkerCommand, WorkerInfo,
-    WorkerStatus,
 };
 use curvine_net::net::ConnState;
 use curvine_proto::*;
@@ -885,42 +884,62 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
-    fn worker_matches(worker: &WorkerInfo, selector: &str) -> bool {
-        let selector = selector.trim();
-        if selector.contains(':') {
-            return worker.address.connect_addr() == selector;
-        }
-        worker.worker_id().to_string() == selector
-            || worker.address.worker_id.to_string() == selector
-            || worker.address.hostname == selector
-            || worker.address.ip_addr == selector
-    }
-
+    /// Operator entry point for every worker state action.
+    ///
+    /// The status string is mapped onto a trigger (kept backward compatible with
+    /// the old `live` / `blacklist` / `decommission` names), the trigger is
+    /// applied by the state machine, the intent is journaled, and the transition
+    /// is audited and logged with before/after.
     pub fn set_worker_status(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: SetWorkerStatusRequest = ctx.parse_header()?;
-        let target_status = match req.status.trim().to_lowercase().as_str() {
-            "live" | "allow" | "recommission" | "remove_blacklist" | "remove_decommission" => {
-                WorkerStatus::Live
-            }
-            "blacklist" | "block" => WorkerStatus::Blacklist,
-            "decommission" | "retire" => WorkerStatus::Decommission,
-            status => return err_box!("unsupported worker status: {}", status),
-        };
+        let current = self.fs.current_admin(&req.worker)?;
+        let trigger = resolve_action(&req.status, current)?;
+        ctx.set_audit(Some(req.worker.clone()), None);
 
-        let mut wm = self.fs.worker_manager.write();
-        for (_, worker) in wm.worker_map.workers.iter_mut() {
-            if Self::worker_matches(worker, &req.worker) {
-                worker.status = target_status;
-                let status = format!("{:?}", worker.status);
-                let rep_header = SetWorkerStatusResponse {
-                    worker: ProtoUtils::worker_info_to_pb(worker.clone()),
-                    status,
-                };
-                return ctx.response(rep_header);
+        let outcome =
+            self.fs
+                .apply_operator_action(&req.worker, trigger, "rpc", &req.status)?;
+        if !outcome.under_replicated.is_empty() {
+            if let Some(handler) = &self.replication_handler {
+                if let Err(e) = handler.report_under_replicated_blocks(
+                    outcome.worker_ids.first().copied().unwrap_or(0),
+                    outcome.under_replicated.clone(),
+                ) {
+                    log::warn!("failed to report under-replicated blocks after a state change: {e}");
+                }
             }
         }
 
-        err_box!("worker not found or not manageable: {}", req.worker)
+        let worker = self
+            .fs
+            .worker_manager
+            .read()
+            .worker_map
+            .host_workers(&outcome.host)
+            .first()
+            .map(|worker| (*worker).clone())
+            .unwrap_or_else(|| {
+                let mut info = WorkerInfo::new(
+                    curvine_model::WorkerAddress {
+                        hostname: outcome.host.clone(),
+                        ..Default::default()
+                    },
+                    1,
+                );
+                if let Some(state) = outcome.to {
+                    info.apply_state(state);
+                }
+                info
+            });
+
+        let rep_header = SetWorkerStatusResponse {
+            worker: ProtoUtils::worker_info_to_pb(worker),
+            status: outcome.to_label(),
+            admin_state: Some(outcome.to.map(|state| state.admin().as_str_name()).unwrap_or_default().to_string()),
+            liveness: Some(outcome.to.map(|state| state.liveness().as_str_name()).unwrap_or_default().to_string()),
+            previous_state: Some(outcome.from_label()),
+        };
+        ctx.response(rep_header)
     }
 
     /// Build the GetFilesystemInfo response, attaching the master's own version
@@ -972,9 +991,6 @@ impl MasterHandler {
 
     pub fn worker_heartbeat(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: WorkerHeartbeatRequest = ctx.parse_header()?;
-        let status = HeartbeatStatus::from(header.status);
-        let worker_id = ProtoUtils::worker_address_from_pb(&header.address).worker_id;
-        let worker_session_id = header.worker_session_id.clone().unwrap_or_default();
         // Evaluate the compatibility policy only when the result can actually
         // be acted upon (enforce mode, configured bounds/blocklist, or the
         // worker reported component_info); otherwise a legacy worker would hit
@@ -993,10 +1009,11 @@ impl MasterHandler {
                 self.metrics,
             )?;
         }
+        // A graceful `End` heartbeat only starts the shutdown grace period: the
+        // locations stay in metadata until it expires, so a restart does not
+        // trigger a replication storm. `cleanup_lost_worker_locations` used to run
+        // here, which dropped them immediately and did exactly that.
         let cmds = Self::process_worker_heartbeat(self.fs.clone(), header)?;
-        if matches!(status, HeartbeatStatus::End) {
-            self.cleanup_lost_worker_locations(worker_id, &worker_session_id)?;
-        }
         let rep_header = WorkerHeartbeatResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
             role: Some(if self.fs.master_monitor.is_active() {
@@ -1008,37 +1025,6 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
-    fn cleanup_lost_worker_locations(
-        &self,
-        worker_id: u32,
-        worker_session_id: &str,
-    ) -> FsResult<()> {
-        let Some(cleanup) = self
-            .fs
-            .delete_lost_worker_locations(worker_id, worker_session_id)?
-        else {
-            return Ok(());
-        };
-        if let Some(replication_handler) = &self.replication_handler {
-            replication_handler
-                .report_under_replicated_blocks(worker_id, cleanup.replication_block_ids)?;
-        }
-        Ok(())
-    }
-
-    /// Evaluate a compatibility verdict against the configured mode.
-    ///
-    /// - `diagnose` (default): log a warning for non-compatible peers and
-    ///   allow the request, so old components are never rejected without
-    ///   explicit configuration.
-    /// - `enforce`: reject with an explicit error describing the actual peer
-    ///   version, the expected bound and the upgrade suggestion.
-    ///
-    /// Diagnose-mode warnings are deduped per peer: a persistently
-    /// incompatible or legacy peer (heartbeats run every few seconds, statfs
-    /// every call) warns on the first occurrence and again only when its
-    /// verdict changes, so repeated identical warnings do not flood
-    /// operational logs.
     fn check_peer_compatibility(
         peer: &str,
         dedup_key: &str,
@@ -1134,6 +1120,11 @@ impl MasterHandler {
         let weight = header.weight.unwrap_or_else(WorkerInfo::default_weight);
         let worker_id = address.worker_id;
         fs.with_worker_location_lock(worker_id, || {
+            let before = fs
+                .worker_manager
+                .read()
+                .get_known_worker(worker_id)
+                .map(|worker| worker.state());
             let (cmds, accepted_start) = {
                 let mut wm = fs.worker_manager.write();
                 wm.heartbeat(
@@ -1163,6 +1154,20 @@ impl MasterHandler {
             };
             if accepted_start {
                 fs.reset_full_block_report(worker_id);
+            }
+            // Registration and heartbeat recovery change the liveness axis inside
+            // the worker map, so record the transition here: without it a node that
+            // comes back from STALE/LOST would leave no trace in the transition
+            // count or the log.
+            if let Some(before) = before {
+                let after = fs
+                    .worker_manager
+                    .read()
+                    .get_known_worker(worker_id)
+                    .map(|worker| worker.state());
+                if let Some(after) = after {
+                    fs.record_heartbeat_state_change(worker_id, before, after, status);
+                }
             }
             Ok(cmds)
         })
