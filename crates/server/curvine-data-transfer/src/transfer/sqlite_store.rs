@@ -878,6 +878,17 @@ impl TransferStore for SqliteTransferStore {
         Ok(affected > 0)
     }
 
+    fn set_owner_addr(&self, job_id: &str, run_id: u64, owner_addr: &str) -> FsResult<()> {
+        self.conn
+            .lock()
+            .execute(
+                "update transfer_jobs set owner_addr = ?1 where job_id = ?2 and run_id = ?3",
+                params![owner_addr, job_id, run_id as i64],
+            )
+            .map(|_| ())
+            .map_err(sqlite_err)
+    }
+
     fn update_transfer_state(&self, update: TransferStateUpdate) -> FsResult<bool> {
         let states = state_list(&update.from_states);
         let sql = format!(
@@ -1741,7 +1752,9 @@ fn create_base_tables(conn: &Connection) -> FsResult<()> {
             tenant text not null,
             created_at integer not null,
             updated_at integer not null,
-            takeover_count integer not null default 0
+            takeover_count integer not null default 0,
+            placement_addr text not null default '',
+            owner_addr text not null default ''
         );
         create table if not exists transfer_cleanup_lease (
             id integer primary key check (id = 1),
@@ -1934,9 +1947,10 @@ fn insert_job(conn: &Connection, job: &TransferJobRecord) -> FsResult<()> {
             planning_attempts,
             cv_metadata_epoch, state, owner, lease_epoch, lease_expire_at, cancel_requested, summary_json,
             terminal_summary_json, terminal_counts_json,
-            client_request_id, submitter, tenant, created_at, updated_at
+            client_request_id, submitter, tenant, created_at, updated_at,
+            placement_addr, owner_addr
         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                  ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                  ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
         params![
             job.job_id,
             job.job_key,
@@ -1970,7 +1984,9 @@ fn insert_job(conn: &Connection, job: &TransferJobRecord) -> FsResult<()> {
             job.submitter,
             job.tenant,
             job.created_at,
-            job.updated_at
+            job.updated_at,
+            job.placement_addr,
+            job.owner_addr
         ],
     )
     .map_err(sqlite_err)?;
@@ -2294,6 +2310,16 @@ fn sqlite_job_row(row: &Row<'_>) -> rusqlite::Result<TransferJobRecord> {
         // SQLite keeps the whole record as columns; takeovers ride in the JSON
         // payload below, so reload them from it.
         takeover_count: takeover_from_row(row),
+        // Placement and owner addresses live only in the record columns below;
+        // SQLite keeps them as their own columns for the relay path.
+        placement_addr: row
+            .get::<_, Option<String>>(27)
+            .unwrap_or_default()
+            .unwrap_or_default(),
+        owner_addr: row
+            .get::<_, Option<String>>(28)
+            .unwrap_or_default()
+            .unwrap_or_default(),
         cv_metadata_epoch: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
         state: TransferState::from(row.get::<_, i32>(13)?),
         owner: row.get(14)?,

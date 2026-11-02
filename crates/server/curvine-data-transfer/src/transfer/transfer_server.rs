@@ -109,8 +109,6 @@ pub struct TransferServer {
     scheduler: TransferScheduler<TransferStoreBackend>,
     ready: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
-    /// Present in discovery=sql mode; dropped (or shut down) = deregistered.
-    registration: Option<curvine_service_discovery::RegistrationGuard>,
 }
 
 impl TransferServer {
@@ -222,7 +220,6 @@ impl TransferServer {
 
         let ready = Arc::new(AtomicBool::new(false));
         let runtime_config = Arc::new(build_transfer_runtime_registry(runtime_state, &conf));
-        let registration = register_discovery(&conf, rt.clone());
         let transfer_service = TransferService::with_cache_and_report_queue(
             store,
             cache.clone(),
@@ -255,7 +252,6 @@ impl TransferServer {
             scheduler,
             ready,
             stop,
-            registration,
         })
     }
 
@@ -284,175 +280,38 @@ impl TransferServer {
         result
     }
 
-    pub fn block_on_start(mut self) -> CommonResult<()> {
+    pub fn block_on_start(self) -> CommonResult<()> {
         let rt = self.rpc_server.clone_rt();
-        let registration = self.registration.take();
         rt.block_on(async move {
             let mut status = self.start().await?;
             if let Err(err) = status.wait_stop().await {
                 log::warn!("curvine-transfer wait stop failed: {}", err);
-            }
-            // Best-effort graceful deregistration; a missed one is covered by
-            // lease expiry, so this never fails shutdown.
-            if let Some(guard) = registration {
-                let _ = guard.shutdown().await;
             }
             Ok(())
         })
     }
 }
 
-/// Builds the status/watch relay when discovery is on. Without discovery a
-/// request is always answered by the instance that received it.
+/// Placement ring over the configured endpoint list.
+///
+/// `transfer.endpoints` is the authoritative instance list: no registry, no
+/// heartbeat, no refresh. Every instance must be configured with the same list;
+/// instance changes are config changes.
 fn build_forwarder(
     conf: &ClusterConf,
     rt: Arc<curvine_runtime::runtime::Runtime>,
 ) -> Option<Arc<Forwarder>> {
-    use curvine_config::TransferDiscovery;
-    if conf.transfer.discovery != TransferDiscovery::Sql {
+    if conf.transfer.endpoints.is_empty() {
         return None;
     }
-    let url = conf.transfer.mysql_store_url();
-    if url.is_empty() {
-        return None;
-    }
-    let discovery = curvine_service_discovery::SqlDiscovery::open(url).ok()?;
     let self_addr = format!("{}:{}", conf.transfer.hostname, conf.transfer.rpc_port);
     let factory = Arc::new(curvine_rpc::client::ClientFactory::with_rt(
         conf.client_rpc_conf(),
         rt,
     ));
     Some(Arc::new(Forwarder::new(
-        Arc::new(discovery),
+        conf.transfer.endpoints.clone(),
         self_addr,
         factory,
     )))
-}
-
-/// Discovery-safe instance id for a host:port pair.
-fn discovery_instance_id(host: &str, port: u16) -> String {
-    let mut id: String = host
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    id.push('-');
-    id.push_str(&port.to_string());
-    id
-}
-
-/// Registration guard, if this instance registered itself.
-type Registration = Option<curvine_service_discovery::RegistrationGuard>;
-
-/// Registers this instance in the SQL discovery registry when
-/// `transfer.discovery = sql`. Returns none for the static mode.
-fn register_discovery(
-    conf: &ClusterConf,
-    rt: Arc<curvine_runtime::runtime::Runtime>,
-) -> Registration {
-    use curvine_config::TransferDiscovery;
-    if conf.transfer.discovery != TransferDiscovery::Sql {
-        return None;
-    }
-    let url = conf.transfer.mysql_store_url();
-    if url.is_empty() {
-        info!("transfer.discovery=sql requires transfer.store_url=mysql://; skipping registration");
-        return None;
-    }
-    let discovery = curvine_service_discovery::SqlDiscovery::open(url).ok()?;
-    if let Err(err) = discovery.init_schema() {
-        info!(
-            "transfer discovery schema init failed, skipping registration: {}",
-            err
-        );
-        return None;
-    }
-    let kind = curvine_service_discovery::ServiceKind::try_new("transfer").ok()?;
-    let endpoint = curvine_service_discovery::ServiceEndpoint {
-        kind: kind.clone(),
-        // Discovery ids allow only [A-Za-z0-9_-], so a host:port identity must
-        // be sanitized: `10.0.0.1:9010` -> `10-0-0-1-9010`. The registry keeps
-        // host and port as their own columns, so nothing else depends on the
-        // id's shape.
-        id: discovery_instance_id(&conf.transfer.hostname, conf.transfer.rpc_port),
-        host: conf.transfer.hostname.clone(),
-        rpc_port: conf.transfer.rpc_port,
-        web_port: Some(conf.transfer.web_port),
-        component_info: curvine_proto::ComponentInfoProto {
-            component: Some("transfer".to_string()),
-            release_version: Some(curvine_sys::version::GIT_VERSION.to_string()),
-            git_commit: None,
-            git_tag: None,
-            git_branch: None,
-            protocol_version: None,
-            min_protocol_version: None,
-            capabilities: Vec::new(),
-        },
-        start_time_ms: curvine_runtime::common::LocalTime::mills(),
-        status: curvine_service_discovery::ServiceStatus::Serving,
-        metadata: None,
-    };
-    // Register on the server's own runtime: the provider spawns its heartbeat
-    // task there, and a temporary runtime would be dropped here, silently
-    // stopping the heartbeat so the lease expires seconds after registration.
-    use curvine_service_discovery::ServiceRegistry;
-    let registered = rt.block_on(async {
-        discovery
-            .register(
-                endpoint,
-                curvine_service_discovery::RegistrationOptions::default(),
-            )
-            .await
-    });
-    match registered {
-        Ok(guard) => {
-            info!(
-                "registered transfer instance in sql discovery: {}:{}",
-                conf.transfer.hostname, conf.transfer.rpc_port
-            );
-            Some(guard)
-        }
-        Err(err) => {
-            info!(
-                "transfer discovery registration failed, continuing unregistered: {}",
-                err
-            );
-            None
-        }
-    }
-}
-
-#[cfg(test)]
-mod discovery_id_tests {
-    use super::discovery_instance_id;
-
-    /// Discovery ids are `[A-Za-z0-9_-]` only, so an IP or a DNS name with dots
-    /// must be sanitized. A raw `host:port` used to fail registration outright.
-    #[test]
-    fn instance_id_is_discovery_safe() {
-        assert_eq!(
-            discovery_instance_id("10.119.43.210", 9012),
-            "10-119-43-210-9012"
-        );
-        assert_eq!(
-            discovery_instance_id("curvine-transfer-0.svc.cluster.local", 9010),
-            "curvine-transfer-0-svc-cluster-local-9010"
-        );
-        assert_eq!(discovery_instance_id("localhost", 9012), "localhost-9012");
-        for id in [
-            discovery_instance_id("10.119.43.210", 9012),
-            discovery_instance_id("cv_local", 1),
-        ] {
-            assert!(
-                id.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
-                "id {id} must satisfy the discovery id charset"
-            );
-        }
-    }
 }

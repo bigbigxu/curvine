@@ -626,7 +626,18 @@ where
         // so the owner picks it up on its next tick.
         if job.state == TransferState::Planning {
             if let Some(forwarder) = &self.forwarder {
-                if !forwarder.owns(&job.client_request_id) {
+                // Placement was recorded at submit; compare against it rather
+                // than a locally recomputed hash, so two instances with
+                // different views still agree on who should run this job.
+                let target = if job.placement_addr.is_empty() {
+                    forwarder.owner_of(&job.client_request_id)
+                } else {
+                    Some(job.placement_addr.clone())
+                };
+                if target
+                    .as_deref()
+                    .is_some_and(|addr| addr != forwarder.self_addr())
+                {
                     record_metric(|metrics| metrics.inc_requeue("placed_elsewhere"));
                     self.store.requeue_transfer(TransferRequeueUpdate {
                         job_id: job.job_id.clone(),
@@ -641,6 +652,18 @@ where
                     })?;
                     return Ok(true);
                 }
+            }
+        }
+
+        // Record the acting owner so status/watch can relay by address.
+        let mut job = job;
+        let self_addr = self
+            .forwarder
+            .as_ref()
+            .map(|forwarder| forwarder.self_addr().to_string());
+        if let Some(addr) = self_addr {
+            if job.owner_addr != addr {
+                job.owner_addr = addr;
             }
         }
 

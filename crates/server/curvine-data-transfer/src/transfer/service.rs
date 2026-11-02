@@ -194,7 +194,18 @@ where
     }
 
     pub fn submit_transfer(&self, req: SubmitTransferRequest) -> FsResult<TransferJobRecord> {
-        let job = self.submit_transfer_inner(req, true)?;
+        self.submit_transfer_placed(req, None)
+    }
+
+    /// `placement_addr` is the instance the configured ring assigned this job
+    /// to. It is stored so later decisions (lease hand-back, status relay) read
+    /// a recorded address instead of recomputing a hash that may disagree.
+    pub fn submit_transfer_placed(
+        &self,
+        req: SubmitTransferRequest,
+        placement_addr: Option<String>,
+    ) -> FsResult<TransferJobRecord> {
+        let job = self.submit_transfer_inner(req, true, placement_addr)?;
         self.record_submit_accepted(&job);
         Ok(job)
     }
@@ -203,6 +214,7 @@ where
         &self,
         req: SubmitTransferRequest,
         allow_auto_repair: bool,
+        placement_addr: Option<String>,
     ) -> FsResult<TransferJobRecord> {
         validate_protocol_version(req.protocol_version)?;
         let kind = transfer_kind(req.kind)?;
@@ -278,6 +290,8 @@ where
             mount_snapshot_attempts: 0,
             planning_attempts: 0,
             takeover_count: 0,
+            placement_addr: placement_addr.unwrap_or_default(),
+            owner_addr: String::new(),
             terminal_summary: None,
             terminal_counts: None,
             cv_metadata_epoch: None,
@@ -565,7 +579,20 @@ where
                 forwarded: None,
             },
             false,
+            None,
         )
+    }
+
+    /// Address of the instance that currently holds this job's lease, or None
+    /// when the job is unknown or has not been acquired yet. Readers use this to
+    /// relay instead of recomputing a placement hash.
+    pub fn owner_addr(&self, job_id: &str) -> Option<String> {
+        self.store
+            .get_transfer(job_id)
+            .ok()
+            .flatten()
+            .map(|job| job.owner_addr)
+            .filter(|addr| !addr.is_empty())
     }
 
     pub fn get_transfer_status(

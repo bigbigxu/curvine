@@ -344,6 +344,15 @@ pub struct TransferJobRecord {
     /// every ordinary acquisition).
     #[serde(default)]
     pub takeover_count: u32,
+    /// Where placement put this job: `hash(client_request_id)` over the
+    /// configured endpoints, decided once at submit. Kept separate from
+    /// `owner_addr` so an operator can see "should run on A, actually ran on B".
+    #[serde(default)]
+    pub placement_addr: String,
+    /// The instance that currently holds the lease, written at acquire. Status
+    /// and watch relay here instead of recomputing a hash.
+    #[serde(default)]
+    pub owner_addr: String,
     /// Terminal task snapshot (progress + structured counts) persisted
     /// synchronously before the job lands terminal, so TTL task purge never
     /// renders detail as 0/empty. JSON-only additive; None means not snapshotted.

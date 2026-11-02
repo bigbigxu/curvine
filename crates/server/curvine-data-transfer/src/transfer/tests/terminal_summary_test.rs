@@ -50,6 +50,8 @@ fn failed_job(
         updated_at: 0,
         planning_attempts: 0,
         takeover_count: 0,
+        placement_addr: String::new(),
+        owner_addr: String::new(),
         terminal_summary,
         terminal_counts,
     }
@@ -160,4 +162,27 @@ fn incremental_noop_reports_skipped_files_instead_of_zero() {
     assert_eq!(counts.completed_size, skipped_size);
     // The job row (read by the list view) must agree with the detail view.
     assert_eq!(stored.summary.loaded_size, skipped_size);
+}
+
+/// Placement and the acting owner are recorded separately: placement says where
+/// the job was meant to run, owner says where it actually ran. Status relay
+/// reads the owner address instead of recomputing a placement hash, so a config
+/// disagreement between instances cannot misroute a read.
+#[test]
+fn placement_and_owner_addresses_are_independent() {
+    use super::store::TransferStore;
+
+    let store = super::MemoryTransferStore::new();
+    let mut job = failed_job(TransferProgress::default(), None, None);
+    job.state = TransferState::Running;
+    job.placement_addr = "10.0.0.1:9010".to_string();
+    job.owner_addr = "10.0.0.3:9010".to_string();
+    store.create_or_get_by_request_id(job.clone()).unwrap();
+
+    let stored = store.get_transfer(&job.job_id).unwrap().unwrap();
+    assert_eq!(stored.placement_addr, "10.0.0.1:9010");
+    assert_eq!(
+        stored.owner_addr, "10.0.0.3:9010",
+        "a takeover must not rewrite where the job was placed"
+    );
 }

@@ -11,6 +11,9 @@ pub use self::store::*;
 mod task_cache;
 pub use self::task_cache::{merge_summaries, JobRunKey, TaskCache};
 
+mod hash_ring;
+pub use self::hash_ring::{ConsistentHashRing, RingEntry};
+
 mod forwarder;
 pub use self::forwarder::{is_forwarded, Forwarder};
 

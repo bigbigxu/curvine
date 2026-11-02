@@ -52,18 +52,41 @@ where
         self
     }
 
-    /// Relays a status/watch request to the owning instance, if there is one.
-    /// Returns None whenever the request should be served here: no forwarder,
-    /// already forwarded (one hop only), no resolvable owner, or the relay
-    /// failed. A failure to relay must never fail the caller's request.
-    async fn relay<T, R>(&self, job_id: &str, code: RpcCode, req: T) -> Option<R>
+    /// Relays a submit to the placement owner of `key`, if that is another
+    /// instance. Returns None when this instance should serve it.
+    async fn relay<T, R>(&self, key: &str, code: RpcCode, req: T) -> Option<R>
     where
         T: prost::Message + Default,
         R: prost::Message + Default,
     {
         let forwarder = self.forwarder.as_ref()?;
-        let addr = forwarder.relay_target(job_id)?;
-        match forwarder.relay::<T, R>(&addr, code, req).await {
+        let addr = forwarder.relay_target(key)?;
+        self.relay_to(&addr, code, req).await
+    }
+
+    /// Relays a status/watch request to the instance that currently holds the
+    /// job's lease. The address was recorded at acquire time, so this stays
+    /// correct even when two instances disagree about placement.
+    async fn relay_to_owner<T, R>(&self, job_id: &str, code: RpcCode, req: T) -> Option<R>
+    where
+        T: prost::Message + Default,
+        R: prost::Message + Default,
+    {
+        let forwarder = self.forwarder.as_ref()?;
+        let addr = self.service.owner_addr(job_id)?;
+        if addr == forwarder.self_addr() {
+            return None;
+        }
+        self.relay_to(&addr, code, req).await
+    }
+
+    async fn relay_to<T, R>(&self, addr: &str, code: RpcCode, req: T) -> Option<R>
+    where
+        T: prost::Message + Default,
+        R: prost::Message + Default,
+    {
+        let forwarder = self.forwarder.as_ref()?;
+        match forwarder.relay::<T, R>(addr, code, req).await {
             Ok(response) => Some(response),
             Err(err) => {
                 log::debug!(
@@ -255,9 +278,15 @@ where
                         return Ok(Builder::success(&msg).proto_header(response).build());
                     }
                 }
+                // Record where placement put this job. Later decisions read
+                // this instead of recomputing a hash.
+                let placement = self
+                    .forwarder
+                    .as_ref()
+                    .and_then(|forwarder| forwarder.owner_of(&req.client_request_id));
                 // No owner, or the relay failed: accept the job here so a
                 // submit never fails just because placement could not run.
-                let job = self.service.submit_transfer(req)?;
+                let job = self.service.submit_transfer_placed(req, placement)?;
                 let response = SubmitTransferResponse {
                     job_id: job.job_id,
                     run_id: job.run_id,
@@ -269,7 +298,7 @@ where
                 let mut req: GetTransferStatusRequest = msg.parse_header()?;
                 if !crate::transfer::is_forwarded(req.forwarded) {
                     let relay = self
-                        .relay::<_, GetTransferStatusResponse>(
+                        .relay_to_owner::<_, GetTransferStatusResponse>(
                             &req.job_id,
                             RpcCode::GetTransferStatus,
                             GetTransferStatusRequest {
@@ -292,7 +321,7 @@ where
                 let mut req: WatchTransferRequest = msg.parse_header()?;
                 if !crate::transfer::is_forwarded(req.forwarded) {
                     let relay = self
-                        .relay::<_, WatchTransferResponse>(
+                        .relay_to_owner::<_, WatchTransferResponse>(
                             &req.job_id,
                             RpcCode::WatchTransfer,
                             WatchTransferRequest {

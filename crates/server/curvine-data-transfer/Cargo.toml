@@ -10,7 +10,7 @@ fault-injection = ["curvine-fault/http-server"]
 transfer = ["dep:uuid"]
 transfer-web = ["transfer", "dep:axum", "dep:curvine-web"]
 transfer-store-sqlite = ["transfer", "dep:rusqlite"]
-transfer-store-mysql = ["transfer", "dep:mysql", "curvine-service-discovery/sql"]
+transfer-store-mysql = ["transfer", "dep:mysql"]
 transfer-store-postgres = [
     "transfer",
     "dep:postgres",
@@ -45,7 +45,6 @@ oss-hdfs = ["curvine-unified-fs/oss-hdfs"]
 curvine-core-error = { workspace = true }
 curvine-net = { workspace = true }
 curvine-proto = { workspace = true }
-curvine-service-discovery = { workspace = true }
 curvine-fs-api = { workspace = true }
 curvine-error = { workspace = true }
 curvine-config = { workspace = true }

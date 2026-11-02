@@ -3,122 +3,80 @@
 // Licensed under the Apache License, Version 2.0.
 // License text: http://www.apache.org/licenses/LICENSE-2.0
 
-//! Relays a status/watch request to the transfer instance that owns the job.
+//! Placement: which transfer instance owns a job, decided from the configured
+//! endpoint list.
 //!
-//! Only the hash owner holds the job's file-level task state, so a request that
-//! lands on any other instance would otherwise report an empty task list. The
-//! relay is one hop: the forwarded request is always answered locally, which
-//! also keeps two instances with disagreeing rings from ping-ponging.
+//! The endpoint list is static configuration (`transfer.endpoints`), so the ring
+//! is built once at startup: no registry, no heartbeat, no refresh. Instance
+//! changes are config changes, and every instance must be configured with the
+//! same list.
 //!
-//! Everything here is best effort. If discovery is off, the topology cannot be
-//! resolved, or the owner does not answer, the caller serves the request from
-//! its own (store-backed) view instead of failing it.
+//! Placement is computed once, at submit, and stored on the job record. Every
+//! later decision reads that stored address, so a temporary disagreement
+//! between two instances' configs cannot make them hand the same job back and
+//! forth.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use curvine_error::{FsError, FsResult};
 use curvine_rpc::client::ClientFactory;
 use curvine_rpc::RpcUtils;
-use curvine_service_discovery::{ConsistentHashRing, LiveEndpoints, ServiceKind};
-use log::warn;
 use parking_lot::RwLock;
 use prost::Message as PMessage;
 
-const RING_TTL: Duration = Duration::from_secs(3);
-const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
+use crate::transfer::ConsistentHashRing;
+
+const RELAY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Forwarder {
-    discovery: Arc<dyn LiveEndpoints>,
-    /// This instance's own rpc `host:port`, matching the ring's address form.
+    /// This instance's own rpc `host:port`, in the same form as the ring.
     self_addr: String,
+    ring: Arc<RwLock<Option<Arc<ConsistentHashRing>>>>,
+    endpoints: Vec<String>,
     factory: Arc<ClientFactory>,
-    ring: RwLock<Option<(Instant, Arc<ConsistentHashRing>)>>,
 }
 
 impl Forwarder {
     pub fn new(
-        discovery: Arc<dyn LiveEndpoints>,
+        endpoints: Vec<String>,
         self_addr: impl Into<String>,
         factory: Arc<ClientFactory>,
     ) -> Self {
         Self {
-            discovery,
             self_addr: self_addr.into(),
+            ring: Arc::new(RwLock::new(None)),
+            endpoints,
             factory,
-            ring: RwLock::new(None),
         }
     }
 
-    /// Owner address of a job, or None when it cannot be resolved (discovery
-    /// unavailable), in which case the caller must answer locally.
-    fn owner_of(&self, job_id: &str) -> Option<String> {
-        let ring = self.ring_snapshot()?;
-        let owner = ring.owner(job_id)?.addr.clone();
-        Some(owner)
+    pub fn self_addr(&self) -> &str {
+        &self.self_addr
     }
 
-    /// True when this instance is the placement owner of `key`, or when the
-    /// topology cannot be resolved (then anyone may run it: availability wins
-    /// over placement).
-    pub fn owns(&self, key: &str) -> bool {
-        let Some(ring) = self.ring_snapshot() else {
-            return true;
-        };
-        ring.owner(key)
-            .map(|entry| entry.addr == self.self_addr)
-            .unwrap_or(true)
+    /// Placement owner of a routing key, from the configured endpoints.
+    pub fn owner_of(&self, key: &str) -> Option<String> {
+        self.ring().owner(key).map(|entry| entry.addr.clone())
     }
 
-    /// Owner address to relay to, or None when this instance should answer.
-    pub fn relay_target(&self, job_id: &str) -> Option<String> {
-        let owner = self.owner_of(job_id)?;
+    /// Address this instance should relay `key` to, or None when it owns it.
+    pub fn relay_target(&self, key: &str) -> Option<String> {
+        let owner = self.owner_of(key)?;
         (owner != self.self_addr).then_some(owner)
     }
 
-    fn ring_snapshot(&self) -> Option<Arc<ConsistentHashRing>> {
-        if let Some((fetched, ring)) = self.ring.read().as_ref() {
-            if fetched.elapsed() < RING_TTL {
-                return Some(ring.clone());
-            }
-        }
-        match self.fetch_ring() {
-            Ok(ring) => {
-                let ring = Arc::new(ring);
-                *self.ring.write() = Some((Instant::now(), ring.clone()));
-                Some(ring)
-            }
-            Err(err) => {
-                warn!("transfer forwarder could not refresh the topology: {}", err);
-                // Fall back to whatever we had; a slightly old ring still
-                // relays to the right instance far more often than not.
-                self.ring.read().as_ref().map(|(_, ring)| ring.clone())
-            }
+    /// True when this instance is the placement owner of `key`. An empty ring
+    /// (no configured endpoints) means nobody can claim ownership, so everyone
+    /// serves locally instead of stalling.
+    pub fn owns(&self, key: &str) -> bool {
+        match self.owner_of(key) {
+            Some(owner) => owner == self.self_addr,
+            None => true,
         }
     }
 
-    fn fetch_ring(&self) -> FsResult<ConsistentHashRing> {
-        let kind = ServiceKind::try_new("transfer")
-            .map_err(|err| FsError::common(format!("invalid service kind: {err}")))?;
-        // Synchronous registry read: this runs inside an async request handler,
-        // where building a nested runtime to await the resolver would panic (or
-        // hang the caller forever).
-        let endpoints = self
-            .discovery
-            .live_endpoints(&kind)
-            .map_err(|err| FsError::common(format!("transfer topology list failed: {err}")))?;
-        Ok(ConsistentHashRing::build(endpoints.into_iter().map(
-            |endpoint| {
-                (
-                    endpoint.id,
-                    format!("{}:{}", endpoint.host, endpoint.rpc_port),
-                    endpoint.start_time_ms,
-                )
-            },
-        )))
-    }
-
-    /// Relays one request to `addr` and returns the owner's own response.
+    /// Relays one request to `addr` and returns that instance's own response.
     pub async fn relay<T, R>(
         &self,
         addr: &str,
@@ -129,13 +87,30 @@ impl Forwarder {
         T: PMessage + Default,
         R: PMessage + Default,
     {
+        if addr == self.self_addr {
+            return Err(FsError::common("refusing to relay a request to itself"));
+        }
         let inet = curvine_net::net::InetAddr::from_str(addr)?;
         let client = self
             .factory
             .get(&inet)
             .await
             .map_err(|err| FsError::common(format!("connect transfer owner {addr}: {err}")))?;
-        RpcUtils::proto_rpc(&client, FORWARD_TIMEOUT, code, req).await
+        RpcUtils::proto_rpc(&client, RELAY_TIMEOUT, code, req).await
+    }
+
+    /// The ring is immutable: built once from the configured endpoints.
+    fn ring(&self) -> Arc<ConsistentHashRing> {
+        if let Some(ring) = self.ring.read().as_ref() {
+            return ring.clone();
+        }
+        let ring = Arc::new(ConsistentHashRing::build(
+            self.endpoints
+                .iter()
+                .map(|addr| (addr.clone(), addr.clone(), 0u64)),
+        ));
+        *self.ring.write() = Some(ring.clone());
+        ring
     }
 }
 
@@ -149,52 +124,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn forwarded_flag_defaults_to_serving_locally() {
-        assert!(!is_forwarded(None));
-        assert!(!is_forwarded(Some(false)));
-        assert!(is_forwarded(Some(true)));
-    }
-
-    /// A ring that resolves a job to this instance must not relay: relaying to
-    /// yourself would recurse until the one-hop guard stops it.
-    fn ring_for(addrs: &[(&str, &str)]) -> ConsistentHashRing {
-        ConsistentHashRing::build(
-            addrs
-                .iter()
-                .map(|(id, addr)| ((*id).to_string(), (*addr).to_string(), 1u64)),
-        )
-    }
-
-    fn target(ring: &ConsistentHashRing, self_addr: &str, job_id: &str) -> Option<String> {
-        // Mirrors Forwarder::relay_target without touching discovery.
-        let owner = ring.owner(job_id)?.addr.clone();
-        (owner != self_addr).then_some(owner)
-    }
-
-    #[test]
-    fn relaying_skips_the_owning_instance() {
-        let ring = ring_for(&[
-            ("a:9000", "a:9000"),
-            ("b:9000", "b:9000"),
-            ("c:9000", "c:9000"),
-        ]);
-        for i in 0..50 {
-            let job_id = format!("job-{i}");
-            let owner = ring.owner(&job_id).unwrap().addr.clone();
-            // From the owner: serve locally.
-            assert_eq!(target(&ring, &owner, &job_id), None);
-            // From any other member: relay to the owner.
-            let other = ["a:9000", "b:9000", "c:9000"]
+    fn placement_is_stable_and_spread_over_the_configured_list() {
+        // Ring building is pure; assert directly without a client factory.
+        let ring = ConsistentHashRing::build(
+            ["10.0.0.1:9010", "10.0.0.2:9010", "10.0.0.3:9010"]
                 .into_iter()
-                .find(|addr| *addr != owner)
-                .unwrap();
-            assert_eq!(target(&ring, other, &job_id), Some(owner));
+                .map(|addr| (addr.to_string(), addr.to_string(), 0u64)),
+        );
+        let mut owners = std::collections::HashSet::new();
+        for index in 0..60 {
+            let key = format!("request-{index}");
+            let first = ring.owner(&key).unwrap().addr.clone();
+            // Deterministic: the same key always maps to the same instance.
+            assert_eq!(first, ring.owner(&key).unwrap().addr);
+            owners.insert(first);
         }
+        assert!(
+            owners.len() > 1,
+            "placement must spread over the configured instances"
+        );
     }
 
     #[test]
-    fn empty_ring_never_relays() {
+    fn empty_endpoint_list_claims_nothing() {
         let ring = ConsistentHashRing::default();
-        assert_eq!(target(&ring, "a:9000", "job-1"), None);
+        assert!(ring.owner("request-1").is_none());
     }
 }

@@ -730,6 +730,15 @@ impl TransferStore for MemoryTransferStore {
         Ok(true)
     }
 
+    fn set_owner_addr(&self, job_id: &str, run_id: u64, owner_addr: &str) -> FsResult<()> {
+        if let Some(job) = self.inner.lock().jobs.get_mut(job_id) {
+            if job.run_id == run_id {
+                job.owner_addr = owner_addr.to_string();
+            }
+        }
+        Ok(())
+    }
+
     fn update_transfer_state(&self, update: TransferStateUpdate) -> FsResult<bool> {
         let mut inner = self.inner.lock();
         let Some(job) = inner.jobs.get_mut(&update.job_id) else {
@@ -1344,6 +1353,8 @@ mod tests {
             mount_snapshot_attempts: 0,
             planning_attempts: 0,
             takeover_count: 0,
+            placement_addr: String::new(),
+            owner_addr: String::new(),
             terminal_summary: None,
             terminal_counts: None,
             cv_metadata_epoch: None,

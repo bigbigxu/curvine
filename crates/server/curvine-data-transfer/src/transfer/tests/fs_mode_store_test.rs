@@ -33,6 +33,8 @@ fn job(job_id: &str, submitter: &str, target: &str) -> TransferJobRecord {
         mount_snapshot_attempts: 0,
         planning_attempts: 0,
         takeover_count: 0,
+        placement_addr: String::new(),
+        owner_addr: String::new(),
         terminal_summary: None,
         terminal_counts: None,
         cv_metadata_epoch: None,

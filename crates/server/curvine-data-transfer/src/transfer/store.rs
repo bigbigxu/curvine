@@ -208,6 +208,15 @@ pub trait TransferStore: Send + Sync + 'static {
 
     fn update_transfer_state(&self, update: TransferStateUpdate) -> FsResult<bool>;
 
+    /// Records which instance currently serves this job, so status/watch can
+    /// relay by address instead of recomputing a placement hash. Called once per
+    /// ownership change, not per renewal. Backends that store the whole record
+    /// as JSON do not need to do anything special.
+    fn set_owner_addr(&self, job_id: &str, run_id: u64, owner_addr: &str) -> FsResult<()> {
+        let _ = (job_id, run_id, owner_addr);
+        Ok(())
+    }
+
     fn requeue_transfer(&self, update: TransferRequeueUpdate) -> FsResult<bool>;
 
     fn set_transfer_cv_metadata_epoch(

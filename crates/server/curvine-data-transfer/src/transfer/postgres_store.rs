@@ -1794,6 +1794,18 @@ impl TransferStore for PostgresTransferStore {
         })
     }
 
+    fn set_owner_addr(&self, job_id: &str, run_id: u64, owner_addr: &str) -> FsResult<()> {
+        self.transaction(|tx| {
+            let mut job = match select_job_by_id_for_update(tx, job_id)? {
+                Some(job) if job.run_id == run_id => job,
+                _ => return Ok(()),
+            };
+            job.owner_addr = owner_addr.to_string();
+            update_job(tx, &job)?;
+            Ok(())
+        })
+    }
+
     fn update_transfer_state(&self, update: TransferStateUpdate) -> FsResult<bool> {
         self.transaction(|tx| {
             let mut job = match select_job_by_id_for_update(tx, &update.job_id)? {
