@@ -66,12 +66,12 @@ impl SubtreeAggregator {
         Ok(())
     }
 
-    pub fn add_file(&mut self, parent_id: i64, len: i64) -> CommonResult<()> {
+    pub fn add_file(&mut self, parent_id: i64, len: i64, replicas: u8) -> CommonResult<()> {
         let entry = self
             .direct
             .entry(parent_id)
             .or_insert_with(DirAgg::empty_dir);
-        entry.add_file(len)?;
+        entry.add_file(len, replicas)?;
         Ok(())
     }
 
@@ -227,14 +227,14 @@ mod tests {
         max_dirs: u64,
         max_depth: u32,
         dirs: &[(i64, i64)],
-        files: &[(i64, i64)],
+        files: &[(i64, i64, u8)],
     ) -> CommonResult<AggregationOutput> {
         let mut agg = SubtreeAggregator::new(root, max_dirs, max_depth);
         for &(d, p) in dirs {
             agg.add_dir(d, p)?;
         }
-        for &(p, len) in files {
-            agg.add_file(p, len)?;
+        for &(p, len, replicas) in files {
+            agg.add_file(p, len, replicas)?;
         }
         agg.build()
     }
@@ -254,9 +254,9 @@ mod tests {
         for i in 0..50 {
             dirs.push((10_000 + i, ROOT_INODE_ID));
         }
-        let mut files = vec![(ROOT_INODE_ID, 10_i64)];
+        let mut files = vec![(ROOT_INODE_ID, 10_i64, 1_u8)];
         for i in 0..50 {
-            files.push((10_000 + i, 100));
+            files.push((10_000 + i, 100, 1));
         }
         let out = build_from_edges(ROOT_INODE_ID, 1_000_000, 1024, &dirs, &files).unwrap();
         assert_eq!(out.root.file_count, 51);
@@ -268,7 +268,7 @@ mod tests {
         for depth in 0..500 {
             let id = 20_000 + depth;
             chain_dirs.push((id, parent));
-            chain_files.push((id, 1));
+            chain_files.push((id, 1, 1));
             parent = id;
         }
         let deep =
@@ -280,10 +280,11 @@ mod tests {
     #[test]
     fn hard_link_double_count() {
         let dirs = [(2001, ROOT_INODE_ID), (2002, ROOT_INODE_ID)];
-        let files = [(2001, 50), (2002, 50)];
+        let files = [(2001, 50, 2), (2002, 50, 1)];
         let out = build_from_edges(ROOT_INODE_ID, 1_000_000, 1024, &dirs, &files).unwrap();
         assert_eq!(out.root.file_count, 2);
         assert_eq!(out.root.logical_bytes, 100);
+        assert_eq!(out.root.replicated_bytes, 150);
     }
 
     #[test]
@@ -291,7 +292,7 @@ mod tests {
         let mut agg = SubtreeAggregator::new(ROOT_INODE_ID, 1_000_000, 1024);
         agg.add_dir(5, 5).unwrap();
         agg.add_dir(6, 99).unwrap();
-        agg.add_file(99, 10).unwrap();
+        agg.add_file(99, 10, 1).unwrap();
         agg.add_dir(7, 8).unwrap();
         agg.add_dir(8, 7).unwrap();
         let out = agg.build().unwrap();
@@ -317,7 +318,13 @@ mod tests {
     #[test]
     fn matches_recursive_baseline() {
         let dirs = [(2, ROOT_INODE_ID), (3, 2), (4, 2), (5, ROOT_INODE_ID)];
-        let files = [(2, 7), (3, 11), (4, 13), (5, 17), (ROOT_INODE_ID, 3)];
+        let files = [
+            (2, 7, 1),
+            (3, 11, 2),
+            (4, 13, 1),
+            (5, 17, 3),
+            (ROOT_INODE_ID, 3, 1),
+        ];
         let out = build_from_edges(ROOT_INODE_ID, 1_000_000, 1024, &dirs, &files).unwrap();
 
         let mut children = HashMap::new();
@@ -330,11 +337,11 @@ mod tests {
             direct.entry(d).or_insert_with(DirAgg::empty_dir);
             let _ = p;
         }
-        for &(p, len) in &files {
+        for &(p, len, replicas) in &files {
             direct
                 .entry(p)
                 .or_insert_with(DirAgg::empty_dir)
-                .add_file(len)
+                .add_file(len, replicas)
                 .unwrap();
         }
         let (root_base, entries_base) = baseline_recursive(ROOT_INODE_ID, &children, &direct);
@@ -350,9 +357,25 @@ mod tests {
         agg.logical_bytes = u64::MAX;
         let err = agg.merge(&DirAgg {
             logical_bytes: 1,
+            replicated_bytes: 0,
             file_count: 0,
             directory_count: 0,
         });
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn replicated_bytes_sum_per_file_replicas() {
+        let out = build_from_edges(
+            ROOT_INODE_ID,
+            1_000_000,
+            1024,
+            &[],
+            &[(ROOT_INODE_ID, 100, 3), (ROOT_INODE_ID, 50, 1)],
+        )
+        .unwrap();
+
+        assert_eq!(out.root.logical_bytes, 150);
+        assert_eq!(out.root.replicated_bytes, 350);
     }
 }

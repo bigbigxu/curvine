@@ -19,6 +19,7 @@ pub(super) fn current_process_acl(client: &UnifiedFileSystem) -> (String, String
 
 fn merge_live_summary(into: &mut ContentSummary, other: &ContentSummary) {
     into.logical_bytes = into.logical_bytes.saturating_add(other.logical_bytes);
+    into.replicated_bytes = into.replicated_bytes.saturating_add(other.replicated_bytes);
     into.file_count = into.file_count.saturating_add(other.file_count);
     into.directory_count = into.directory_count.saturating_add(other.directory_count);
 }
@@ -31,10 +32,14 @@ pub async fn calculate_content_summary_live(
     let status = client.get_status(path).await?;
 
     if !status.is_dir {
-        return Ok(ContentSummary::live_file(status.len.max(0) as u64));
+        // For a file, report this file's own length and its replica factor.
+        return Ok(ContentSummary::live_file(
+            status.len.max(0) as u64,
+            status.replicas,
+        ));
     }
 
-    let mut summary = ContentSummary::live_recursive(0, 0, 1);
+    let mut summary = ContentSummary::live_recursive(0, 0, 0, 1);
     let children = client.list_status(path).await?;
 
     for child in children {
@@ -44,9 +49,14 @@ pub async fn calculate_content_summary_live(
                 Box::pin(calculate_content_summary_live(client, &child_path)).await?;
             merge_live_summary(&mut summary, &child_summary);
         } else {
-            summary.logical_bytes = summary
-                .logical_bytes
-                .saturating_add(child.len.max(0) as u64);
+            // Each file contributes its own replica factor: multiplying the
+            // directory total by one replica count is wrong as soon as the
+            // files below it have different factors.
+            let len = child.len.max(0) as u64;
+            summary.logical_bytes = summary.logical_bytes.saturating_add(len);
+            summary.replicated_bytes = summary
+                .replicated_bytes
+                .saturating_add(ContentSummary::replicated_size(len, child.replicas));
             summary.file_count = summary.file_count.saturating_add(1);
         }
     }
@@ -416,11 +426,11 @@ mod tests {
             false,
             || async {
                 SNAPSHOT_CALLS.fetch_add(1, Ordering::SeqCst);
-                Ok(Some(ContentSummary::live_file(42)))
+                Ok(Some(ContentSummary::live_file(42, 1)))
             },
             || async {
                 LIVE_CALLS.fetch_add(1, Ordering::SeqCst);
-                Ok(ContentSummary::live_recursive(1, 1, 1))
+                Ok(ContentSummary::live_recursive(1, 1, 1, 1))
             },
         )
         .await
@@ -442,11 +452,11 @@ mod tests {
             true,
             || async {
                 SNAPSHOT_CALLS.fetch_add(1, Ordering::SeqCst);
-                Ok(Some(ContentSummary::live_file(99)))
+                Ok(Some(ContentSummary::live_file(99, 1)))
             },
             || async {
                 LIVE_CALLS.fetch_add(1, Ordering::SeqCst);
-                Ok(ContentSummary::live_recursive(7, 2, 1))
+                Ok(ContentSummary::live_recursive(7, 7, 2, 1))
             },
         )
         .await
@@ -462,7 +472,7 @@ mod tests {
         let summary = resolve_content_summary(
             false,
             || async { Err(FsError::snapshot_not_ready("/a")) },
-            || async { Ok(ContentSummary::live_recursive(10, 1, 1)) },
+            || async { Ok(ContentSummary::live_recursive(10, 10, 1, 1)) },
         )
         .await
         .unwrap();
@@ -474,6 +484,7 @@ mod tests {
     fn content_summary_verbose_source_and_generation() {
         let summary = ContentSummary::from_snapshot(
             100,
+            300,
             2,
             1,
             ContentSummarySource::Global,

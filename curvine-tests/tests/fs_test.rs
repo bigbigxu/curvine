@@ -1401,10 +1401,13 @@ fn enable_dir_space_for_integration(conf: &mut ClusterConf) {
 async fn live_content_summary(fs: &CurvineFileSystem, path: &Path) -> FsResult<ContentSummary> {
     let status = fs.get_status(path).await?;
     if !status.is_dir {
-        return Ok(ContentSummary::live_file(status.len.max(0) as u64));
+        return Ok(ContentSummary::live_file(
+            status.len.max(0) as u64,
+            status.replicas,
+        ));
     }
 
-    let mut summary = ContentSummary::live_recursive(0, 0, 1);
+    let mut summary = ContentSummary::live_recursive(0, 0, 0, 1);
     for child in fs.list_status(path).await? {
         if child.is_dir {
             let child_path = Path::from_str(&child.path)?;
@@ -1412,14 +1415,19 @@ async fn live_content_summary(fs: &CurvineFileSystem, path: &Path) -> FsResult<C
             summary.logical_bytes = summary
                 .logical_bytes
                 .saturating_add(child_summary.logical_bytes);
+            summary.replicated_bytes = summary
+                .replicated_bytes
+                .saturating_add(child_summary.replicated_bytes);
             summary.file_count = summary.file_count.saturating_add(child_summary.file_count);
             summary.directory_count = summary
                 .directory_count
                 .saturating_add(child_summary.directory_count);
         } else {
-            summary.logical_bytes = summary
-                .logical_bytes
-                .saturating_add(child.len.max(0) as u64);
+            let len = child.len.max(0) as u64;
+            summary.logical_bytes = summary.logical_bytes.saturating_add(len);
+            summary.replicated_bytes = summary
+                .replicated_bytes
+                .saturating_add(ContentSummary::replicated_size(len, child.replicas));
             summary.file_count = summary.file_count.saturating_add(1);
         }
     }

@@ -1,6 +1,7 @@
 use clap::Subcommand;
 use curvine_core_error::CommonResult;
-use curvine_fs_api::{CurvineURI, FileSystem};
+use curvine_fs_api::CurvineURI;
+use curvine_model::ContentSummary;
 use curvine_unified_fs::UnifiedFileSystem;
 
 #[derive(Subcommand, Debug)]
@@ -53,11 +54,6 @@ impl DuCommand {
                 .await
                 {
                     Ok(summary) => {
-                        let status = client.get_status(&path).await;
-                        let replicas = status.map(|s| s.replicas).unwrap_or(1) as i64;
-                        let logical = summary.logical_bytes as i64;
-                        let disk_space = logical * replicas;
-
                         if *verbose {
                             let source =
                                 crate::cmds::fs::common::format_content_summary_source(&summary);
@@ -79,28 +75,85 @@ impl DuCommand {
                             );
                         }
 
-                        if *human_readable {
-                            println!(
-                                "{:>15}  {:>15}  {:>15}  {}",
-                                crate::cmds::fs::common::format_size(summary.logical_bytes),
-                                crate::cmds::fs::common::format_size(summary.logical_bytes),
-                                crate::cmds::fs::common::format_size(disk_space as u64),
-                                path.full_path()
-                            );
-                        } else {
-                            println!(
-                                "{:>15}  {:>15}  {:>15}  {}",
-                                logical,
-                                logical,
-                                disk_space,
-                                path.full_path()
-                            );
-                        }
+                        println!(
+                            "{}",
+                            format_du_row(&summary, path.full_path(), *human_readable)
+                        );
                         Ok(())
                     }
                     Err(e) => Err(format!("Cannot access '{}': {}", path.full_path(), e).into()),
                 }
             }
         }
+    }
+}
+
+/// Formats one `du` output row: size, single replica size, size of all replicas, path.
+fn format_du_row(summary: &ContentSummary, path: &str, human_readable: bool) -> String {
+    // Format similar to HDFS du output with single replica data added
+    if human_readable {
+        format!(
+            "{:>15}  {:>15}  {:>15}  {}",
+            crate::cmds::fs::common::format_size(summary.logical_bytes),
+            crate::cmds::fs::common::format_size(summary.logical_bytes),
+            crate::cmds::fs::common::format_size(summary.replicated_bytes),
+            path
+        )
+    } else {
+        format!(
+            "{:>15}  {:>15}  {:>15}  {}",
+            summary.logical_bytes, summary.logical_bytes, summary.replicated_bytes, path
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_du_row;
+    use curvine_model::{ContentSummary, ContentSummarySnapshot, ContentSummarySource};
+
+    fn live_recursive_dir(files: &[(u64, i32)]) -> ContentSummary {
+        let mut summary = ContentSummary::live_recursive(0, 0, 0, 1);
+        for &(len, replicas) in files {
+            summary.logical_bytes += len;
+            summary.replicated_bytes += ContentSummary::replicated_size(len, replicas);
+            summary.file_count += 1;
+        }
+        summary
+    }
+
+    #[test]
+    fn dir_row_reports_replicated_size_of_files() {
+        let row = format_du_row(&live_recursive_dir(&[(1024, 1), (512, 3)]), "/du", false);
+        let expected = format!("{:>15}  {:>15}  {:>15}  /du", 1536, 1536, 2560);
+        assert_eq!(row, expected);
+    }
+
+    #[test]
+    fn dir_row_human_readable_reports_replicated_size_of_files() {
+        let row = format_du_row(&live_recursive_dir(&[(1024, 1), (512, 3)]), "/du", true);
+        let expected = format!("{:>15}  {:>15}  {:>15}  /du", "1.5 KB", "1.5 KB", "2.5 KB");
+        assert_eq!(row, expected);
+    }
+
+    #[test]
+    fn snapshot_row_reports_master_replicated_bytes() {
+        let summary = ContentSummary::from_snapshot(
+            1024,
+            3072,
+            4,
+            2,
+            ContentSummarySource::Global,
+            ContentSummarySnapshot {
+                generation: 3,
+                ..Default::default()
+            },
+        );
+
+        let row = format_du_row(&summary, "/snap", false);
+        assert_eq!(
+            row,
+            format!("{:>15}  {:>15}  {:>15}  /snap", 1024, 1024, 3072)
+        );
     }
 }

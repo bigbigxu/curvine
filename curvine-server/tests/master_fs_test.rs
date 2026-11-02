@@ -20,11 +20,11 @@ use curvine_fs_api::{CurvineURI, Path};
 use curvine_model::MountOptions;
 use curvine_model::ProtoUtils;
 use curvine_model::{
-    AccessMode, BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress,
-    CommitBlock, ContentSummary, CreateFileOpts, CreateFileOptsBuilder, DeleteResult,
-    FileAllocOpts, HeartbeatStatus, ListOptions, LocatedBlock, MkdirOpts, MkdirOptsBuilder,
-    AdminState, MountInfo, Provider, StorageType, TtlAction, TtlType, WorkerAddress, WorkerCommand,
-    WorkerInfo, WorkerStatus, WriteType,
+    AccessMode, AdminState, BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus,
+    ClientAddress, CommitBlock, ContentSummary, CreateFileOpts, CreateFileOptsBuilder,
+    DeleteResult, FileAllocOpts, HeartbeatStatus, ListOptions, LocatedBlock, MkdirOpts,
+    MkdirOptsBuilder, MountInfo, Provider, StorageType, TtlAction, TtlType, WorkerAddress,
+    WorkerCommand, WorkerInfo, WorkerStatus, WriteType,
 };
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
@@ -340,24 +340,32 @@ fn live_content_summary_recursive(
 ) -> CommonResult<ContentSummary> {
     let status = fs.file_status(path)?;
     if !status.is_dir {
-        return Ok(ContentSummary::live_file(status.len.max(0) as u64));
+        return Ok(ContentSummary::live_file(
+            status.len.max(0) as u64,
+            status.replicas,
+        ));
     }
 
-    let mut summary = ContentSummary::live_recursive(0, 0, 1);
+    let mut summary = ContentSummary::live_recursive(0, 0, 0, 1);
     for child in fs.list_status(path)? {
         if child.is_dir {
             let child_summary = live_content_summary_recursive(fs, &child.path)?;
             summary.logical_bytes = summary
                 .logical_bytes
                 .saturating_add(child_summary.logical_bytes);
+            summary.replicated_bytes = summary
+                .replicated_bytes
+                .saturating_add(child_summary.replicated_bytes);
             summary.file_count = summary.file_count.saturating_add(child_summary.file_count);
             summary.directory_count = summary
                 .directory_count
                 .saturating_add(child_summary.directory_count);
         } else {
-            summary.logical_bytes = summary
-                .logical_bytes
-                .saturating_add(child.len.max(0) as u64);
+            let len = child.len.max(0) as u64;
+            summary.logical_bytes = summary.logical_bytes.saturating_add(len);
+            summary.replicated_bytes = summary
+                .replicated_bytes
+                .saturating_add(ContentSummary::replicated_size(len, child.replicas));
             summary.file_count = summary.file_count.saturating_add(1);
         }
     }
@@ -4384,12 +4392,7 @@ fn file_block_details_preserve_registered_non_live_worker_status() -> CommonResu
     // pipeline, so this test records the terminal state the way the drain does.
     fs.worker_manager.write().record_intent(
         &hostname,
-        WorkerIntent::new(
-            AdminState::Decommissioned,
-            "test",
-            "drained",
-            0,
-        ),
+        WorkerIntent::new(AdminState::Decommissioned, "test", "drained", 0),
     );
     let dcm_details = fs.get_file_block_details(path)?;
     let decommission = dcm_details.blocks[0]

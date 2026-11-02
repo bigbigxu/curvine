@@ -674,6 +674,8 @@ message ContentSummaryProto {
     optional string source = 7;
     optional bool degraded = 8;
     optional uint64 anomaly_count = 9;
+    // Bytes consumed by every replica of the files under the path.
+    optional uint64 replicated_bytes = 10;
 }
 
 message GetContentSummaryResponse {

@@ -18,6 +18,8 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DirAgg {
     pub logical_bytes: u64,
+    /// Bytes consumed by every replica of the files below this directory.
+    pub replicated_bytes: u64,
     pub file_count: u64,
     pub directory_count: u64,
 }
@@ -26,16 +28,24 @@ impl DirAgg {
     pub fn empty_dir() -> Self {
         Self {
             logical_bytes: 0,
+            replicated_bytes: 0,
             file_count: 0,
             directory_count: 1,
         }
     }
 
-    pub fn add_file(&mut self, len: i64) -> CommonResult<()> {
+    /// Add one file edge: its logical length and its replicated size.
+    pub fn add_file(&mut self, len: i64, replicas: u8) -> CommonResult<()> {
         let len = len.max(0) as u64;
         self.logical_bytes = match self.logical_bytes.checked_add(len) {
             Some(v) => v,
             None => return err_box!("dir-space logical_bytes overflow"),
+        };
+        let replicated = len.checked_mul(replicas as u64);
+        self.replicated_bytes = match replicated.and_then(|v| self.replicated_bytes.checked_add(v))
+        {
+            Some(v) => v,
+            None => return err_box!("dir-space replicated_bytes overflow"),
         };
         self.file_count = match self.file_count.checked_add(1) {
             Some(v) => v,
@@ -48,6 +58,10 @@ impl DirAgg {
         self.logical_bytes = match self.logical_bytes.checked_add(other.logical_bytes) {
             Some(v) => v,
             None => return err_box!("dir-space logical_bytes overflow"),
+        };
+        self.replicated_bytes = match self.replicated_bytes.checked_add(other.replicated_bytes) {
+            Some(v) => v,
+            None => return err_box!("dir-space replicated_bytes overflow"),
         };
         self.file_count = match self.file_count.checked_add(other.file_count) {
             Some(v) => v,

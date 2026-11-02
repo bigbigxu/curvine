@@ -72,6 +72,10 @@ pub struct ContentSummarySnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ContentSummary {
     pub logical_bytes: u64,
+    /// Bytes consumed by every replica of the files under the path: each file
+    /// contributes `len * replicas` instead of the directory's own replica
+    /// factor, which is what `curvine fs du` reports as `ALL_REPLICAS`.
+    pub replicated_bytes: u64,
     pub file_count: u64,
     pub directory_count: u64,
     pub source: Option<ContentSummarySource>,
@@ -80,10 +84,16 @@ pub struct ContentSummary {
 }
 
 impl ContentSummary {
+    /// Bytes one file consumes with all its replicas.
+    pub fn replicated_size(len: u64, replicas: i32) -> u64 {
+        len.saturating_mul(replicas.max(0) as u64)
+    }
+
     /// Result for a file path: live inode data, no snapshot metadata.
-    pub fn live_file(logical_bytes: u64) -> Self {
+    pub fn live_file(logical_bytes: u64, replicas: i32) -> Self {
         ContentSummary {
             logical_bytes,
+            replicated_bytes: Self::replicated_size(logical_bytes, replicas),
             file_count: 1,
             directory_count: 0,
             source: Some(ContentSummarySource::LiveFile),
@@ -92,9 +102,15 @@ impl ContentSummary {
     }
 
     /// Result of the CLI live recursive traversal.
-    pub fn live_recursive(logical_bytes: u64, file_count: u64, directory_count: u64) -> Self {
+    pub fn live_recursive(
+        logical_bytes: u64,
+        replicated_bytes: u64,
+        file_count: u64,
+        directory_count: u64,
+    ) -> Self {
         ContentSummary {
             logical_bytes,
+            replicated_bytes,
             file_count,
             directory_count,
             source: Some(ContentSummarySource::LiveRecursive),
@@ -103,8 +119,10 @@ impl ContentSummary {
     }
 
     /// Result served from a published dir-space snapshot generation.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_snapshot(
         logical_bytes: u64,
+        replicated_bytes: u64,
         file_count: u64,
         directory_count: u64,
         source: ContentSummarySource,
@@ -112,6 +130,7 @@ impl ContentSummary {
     ) -> Self {
         ContentSummary {
             logical_bytes,
+            replicated_bytes,
             file_count,
             directory_count,
             source: Some(source),
@@ -132,25 +151,36 @@ mod tests {
 
     #[test]
     fn content_summary_live_file_has_no_snapshot() {
-        let summary = ContentSummary::live_file(1024);
+        let summary = ContentSummary::live_file(1024, 3);
 
         assert_eq!(summary.source, Some(ContentSummarySource::LiveFile));
         assert!(summary.snapshot.is_none());
         assert_eq!(summary.logical_bytes, 1024);
+        assert_eq!(summary.replicated_bytes, 3072);
         assert_eq!(summary.file_count, 1);
         assert_eq!(summary.directory_count, 0);
         assert!(!summary.is_degraded());
     }
 
     #[test]
+    fn content_summary_live_file_without_replicas_is_logical_only() {
+        // A file whose replica factor is unset consumes its logical size.
+        let summary = ContentSummary::live_file(512, 0);
+
+        assert_eq!(summary.logical_bytes, 512);
+        assert_eq!(summary.replicated_bytes, 0);
+    }
+
+    #[test]
     fn content_summary_live_recursive_has_no_snapshot() {
         // The CLI live fallback is constructed locally and never crosses the
         // wire, so it does not require a proto round-trip.
-        let summary = ContentSummary::live_recursive(4096, 4, 2);
+        let summary = ContentSummary::live_recursive(4096, 8192, 4, 2);
 
         assert_eq!(summary.source, Some(ContentSummarySource::LiveRecursive));
         assert!(summary.snapshot.is_none());
         assert_eq!(summary.logical_bytes, 4096);
+        assert_eq!(summary.replicated_bytes, 8192);
         assert_eq!(summary.file_count, 4);
         assert_eq!(summary.directory_count, 2);
     }
@@ -164,8 +194,14 @@ mod tests {
             anomaly_count: 3,
             degraded: true,
         };
-        let summary =
-            ContentSummary::from_snapshot(8192, 8, 4, ContentSummarySource::TrackedPoint, snapshot);
+        let summary = ContentSummary::from_snapshot(
+            8192,
+            24576,
+            8,
+            4,
+            ContentSummarySource::TrackedPoint,
+            snapshot,
+        );
 
         let pb = ProtoUtils::content_summary_to_pb(summary.clone());
         // Snapshot-carrying results must set generation/timestamp fields.
@@ -191,7 +227,7 @@ mod tests {
             degraded: false,
         };
         let summary =
-            ContentSummary::from_snapshot(1, 1, 1, ContentSummarySource::Global, snapshot);
+            ContentSummary::from_snapshot(1, 1, 1, 1, ContentSummarySource::Global, snapshot);
 
         let pb = ProtoUtils::content_summary_to_pb(summary.clone());
         assert_eq!(pb.source.as_deref(), Some("GLOBAL"));

@@ -74,7 +74,7 @@ impl MessageHandler for MockHandler {
             RpcCode::GetContentSummary => {
                 let _request: GetContentSummaryRequest = msg.parse_header()?;
                 self.0.write().rpc_calls += 1;
-                let summary = ContentSummary::live_file(128);
+                let summary = ContentSummary::live_file(128, 3);
                 let response = GetContentSummaryResponse {
                     summary: Some(ProtoUtils::content_summary_to_pb(summary)),
                 };
@@ -145,6 +145,7 @@ fn content_summary_uses_rpc_when_capability_present() {
             .await
             .unwrap();
         assert_eq!(summary.logical_bytes, 128);
+        assert_eq!(summary.replicated_bytes, 384);
         assert_eq!(summary.source, Some(ContentSummarySource::LiveFile));
         assert_eq!(state.read().rpc_calls, 1);
     });

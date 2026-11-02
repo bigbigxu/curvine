@@ -240,6 +240,7 @@ mod tests {
     fn dir_agg(bytes: u64, files: u64, dirs: u64) -> DirAgg {
         DirAgg {
             logical_bytes: bytes,
+            replicated_bytes: bytes,
             file_count: files,
             directory_count: dirs,
         }

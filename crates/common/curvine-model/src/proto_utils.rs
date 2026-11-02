@@ -408,13 +408,12 @@ impl ProtoUtils {
             .filter(|value| !value.is_empty())
             .and_then(Liveness::from_str_name);
         match (admin, liveness) {
-            (None, None) => Self::worker_state_from_legacy(Self::worker_status_from_proto(
-                info.status,
-            )),
+            (None, None) => {
+                Self::worker_state_from_legacy(Self::worker_status_from_proto(info.status))
+            }
             (admin, liveness) => {
-                let legacy = Self::worker_state_from_legacy(Self::worker_status_from_proto(
-                    info.status,
-                ));
+                let legacy =
+                    Self::worker_state_from_legacy(Self::worker_status_from_proto(info.status));
                 WorkerState::new(
                     admin.unwrap_or_else(|| legacy.admin()),
                     liveness.unwrap_or_else(|| legacy.liveness()),
@@ -428,7 +427,9 @@ impl ProtoUtils {
     /// never filled the field was a live worker before this change.
     fn worker_state_from_legacy(src: WorkerStatus) -> WorkerState {
         match src {
-            WorkerStatus::Unknown | WorkerStatus::Live => WorkerState::registered(AdminState::Normal),
+            WorkerStatus::Unknown | WorkerStatus::Live => {
+                WorkerState::registered(AdminState::Normal)
+            }
             WorkerStatus::Blacklist => WorkerState::new(AdminState::Normal, Liveness::Stale),
             WorkerStatus::Decommission => {
                 WorkerState::new(AdminState::Decommissioned, Liveness::Running)
@@ -1091,6 +1092,7 @@ impl ProtoUtils {
     pub fn content_summary_to_pb(src: ContentSummary) -> ContentSummaryProto {
         let mut pb = ContentSummaryProto {
             logical_bytes: Some(src.logical_bytes),
+            replicated_bytes: Some(src.replicated_bytes),
             file_count: Some(src.file_count),
             directory_count: Some(src.directory_count),
             source: src.source.as_ref().map(|s| s.as_str().to_string()),
@@ -1128,6 +1130,7 @@ impl ProtoUtils {
 
         ContentSummary {
             logical_bytes: src.logical_bytes.unwrap_or_default(),
+            replicated_bytes: src.replicated_bytes.unwrap_or_default(),
             file_count: src.file_count.unwrap_or_default(),
             directory_count: src.directory_count.unwrap_or_default(),
             source,

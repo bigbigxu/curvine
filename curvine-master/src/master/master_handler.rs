@@ -173,6 +173,7 @@ impl MasterHandler {
         let meta = &result.snapshot.meta;
         Ok(ContentSummary::from_snapshot(
             agg.logical_bytes,
+            agg.replicated_bytes,
             agg.file_count,
             agg.directory_count,
             source,
@@ -198,7 +199,7 @@ impl MasterHandler {
         let status = self.fs.file_status_by_id(path.path(), None)?;
 
         if !status.is_dir {
-            let summary = ContentSummary::live_file(status.len.max(0) as u64);
+            let summary = ContentSummary::live_file(status.len.max(0) as u64, status.replicas);
             return ctx.response(GetContentSummaryResponse {
                 summary: Some(ProtoUtils::content_summary_to_pb(summary)),
             });
@@ -930,16 +931,18 @@ impl MasterHandler {
         let trigger = resolve_action(&req.status, current)?;
         ctx.set_audit(Some(req.worker.clone()), None);
 
-        let outcome =
-            self.fs
-                .apply_operator_action(&req.worker, trigger, "rpc", &req.status)?;
+        let outcome = self
+            .fs
+            .apply_operator_action(&req.worker, trigger, "rpc", &req.status)?;
         if !outcome.under_replicated.is_empty() {
             if let Some(handler) = &self.replication_handler {
                 if let Err(e) = handler.report_under_replicated_blocks(
                     outcome.worker_ids.first().copied().unwrap_or(0),
                     outcome.under_replicated.clone(),
                 ) {
-                    log::warn!("failed to report under-replicated blocks after a state change: {e}");
+                    log::warn!(
+                        "failed to report under-replicated blocks after a state change: {e}"
+                    );
                 }
             }
         }
@@ -969,8 +972,20 @@ impl MasterHandler {
         let rep_header = SetWorkerStatusResponse {
             worker: ProtoUtils::worker_info_to_pb(worker),
             status: outcome.to_label(),
-            admin_state: Some(outcome.to.map(|state| state.admin().as_str_name()).unwrap_or_default().to_string()),
-            liveness: Some(outcome.to.map(|state| state.liveness().as_str_name()).unwrap_or_default().to_string()),
+            admin_state: Some(
+                outcome
+                    .to
+                    .map(|state| state.admin().as_str_name())
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+            liveness: Some(
+                outcome
+                    .to
+                    .map(|state| state.liveness().as_str_name())
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
             previous_state: Some(outcome.from_label()),
         };
         ctx.response(rep_header)

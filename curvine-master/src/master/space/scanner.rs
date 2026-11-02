@@ -64,6 +64,9 @@ const MAX_EDGE_VALUE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) struct InodeFact {
     pub is_dir: bool,
     pub logical_len: i64,
+    /// Replica factor of a file inode; directories and other inode kinds
+    /// contribute no replicated bytes.
+    pub replicas: u8,
 }
 
 /// Resource limits for one scan round.
@@ -291,7 +294,8 @@ impl<'a> PointScanState<'a> {
                         if fact.logical_len < 0 {
                             self.stats.record_anomaly(1);
                         }
-                        self.aggregator.add_file(parent_id, fact.logical_len)?;
+                        self.aggregator
+                            .add_file(parent_id, fact.logical_len, fact.replicas)?;
                     }
                 }
             }
@@ -521,7 +525,7 @@ impl<'a> ScanState<'a> {
             // Hard links surface as multiple edges to the same inode; the
             // aggregator counts each edge (namespace semantics).
             self.aggregator
-                .add_file(parent_id, child_fact.logical_len)?;
+                .add_file(parent_id, child_fact.logical_len, child_fact.replicas)?;
         }
         Ok(())
     }
@@ -605,11 +609,21 @@ fn inode_fact_from_view_ref(view: &InodeView) -> InodeFact {
         InodeView::Dir(_) => InodeFact {
             is_dir: true,
             logical_len: 0,
+            replicas: 0,
         },
         _ => InodeFact {
             is_dir: false,
             logical_len: inode_logical_len(view),
+            replicas: inode_replicas(view),
         },
+    }
+}
+
+/// Replica factor of a non-directory inode (0 when the kind carries none).
+fn inode_replicas(view: &InodeView) -> u8 {
+    match view {
+        InodeView::File(f) => f.replicas,
+        _ => 0,
     }
 }
 
