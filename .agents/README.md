@@ -42,7 +42,7 @@ rm -rf .claude/skills && ln -sfn ../.agents/skills .claude/skills
 | `cv-comind-internal` | Internal repo — CoMind issues + Huoyan MR on main-next |
 | `cv-tasks-breakdown` | Plan → small tasks + sub-issues |
 | `cv-create-issue` | File GitHub issue |
-| `cv-error-inject` | Fault injection — 3 master / 3 transfer / 5 worker, transfer resilience matrix |
+| `cv-error-inject` | Fault injection — 3 master / 3 transfer / 5 worker; two scopes: transfer resilience matrix, worker/master state machine + block locations |
 | `cv-handle-issue` | Fix issue (plan first, then code) |
 | `cv-create-pr` | Create / update PR |
 | `cv-submit-pr-review` | Review PR code: intent, tests-first, contracts, lifecycle, performance |

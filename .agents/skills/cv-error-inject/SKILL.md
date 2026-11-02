@@ -1,6 +1,6 @@
 ---
 name: cv-error-inject
-description: Build a multi-instance Curvine deployment (3 master / 3 transfer / 5 worker) on one host and run fault-injection rounds against it. Use when verifying transfer resilience, killing transfer instances or workers mid-job, checking failover/takeover behaviour, or reproducing a fault-tolerance claim before review.
+description: Build a multi-instance Curvine deployment (3 master / 3 transfer / 5 worker) on one host and run fault-injection rounds against it. Two independent scopes: transfer job resilience, and worker/master state machine + block location accounting. Use when verifying transfer resilience, killing transfer instances or workers mid-job, checking failover/takeover behaviour, exercising cordon/decommission/drain/SHUTDOWN/LOST transitions, or reproducing a fault-tolerance claim before review.
 ---
 
 # cv-error-inject
@@ -15,19 +15,41 @@ resilience. The default topology for every run is:
 | --------- | ----- | ------------- |
 | master | 3 | 8995 + i / web 9110 + i |
 | transfer | 3 | 9012 / 9022 / 9032 (web +1) |
-| worker | 5 | 8997 on loopback aliases 127.0.0.2-6 |
+| worker | 5 | 8997 on loopback aliases 127.0.0.2-6 (state machine scope uses 127.0.0.10-14) |
 
-Scope of this revision: **transfer only**. Master-only and worker-only fault
-scenarios are intentionally not documented yet.
+## Two scopes — pick one, keep them apart
+
+| Scope | What it proves | Reference |
+| ----- | -------------- | --------- |
+| **Transfer** | a job survives an instance or worker dying and still copies every byte | [references/fault-matrix.md](references/fault-matrix.md) |
+| **Worker/master state machine** | operator intent survives heartbeats/failover, drain moves blocks without losing them, STALE/LOST/SHUTDOWN do not storm, bytes are retained | [references/worker-state-fault-matrix.md](references/worker-state-fault-matrix.md) + [references/worker-state-topology.md](references/worker-state-topology.md) |
+
+Do not mix the two in one round and do not reuse one scope's dataset for the
+other. The transfer scope needs MySQL and `transfer.discovery = "sql"`; the state
+machine scope needs `block_replication_enabled = true` (decommission is refused
+without it) and no MySQL. Sections 1-7 below are the **transfer** scope; the state
+machine scope has its own topology and startup order in the two references above.
 
 ## When to Use
 
 - A change touches transfer ownership, leases, dispatch, retries or reporting
+  → transfer scope
+- A change touches worker states, intent, drain, block reports or master
+  failover → state machine scope
 - You need to prove a transfer job survives an instance or worker dying
+- You need to prove a cordon/decommission survives ≥2 heartbeats and a leader
+  failover, or that a graceful restart does not trigger a replication storm
 - You are reviewing a fault-tolerance claim and want evidence, not reasoning
 - You need to reproduce a "job completed but nothing was copied" class of bug
 
-## Test objectives
+## Track A: transfer
+
+Steps 1-7 below build and drive the transfer topology. If the change under review
+is about worker states instead, skip them and follow
+[references/worker-state-topology.md](references/worker-state-topology.md) +
+[references/worker-state-fault-matrix.md](references/worker-state-fault-matrix.md).
+
+### Test objectives
 
 Each run must prove all of these; a green job status alone is not enough.
 
@@ -156,11 +178,15 @@ hundred MB and delete it afterwards, or a few rounds will fill the disk.
 
 ## Related
 
+- [worker-state-fault-matrix.md](references/worker-state-fault-matrix.md) — S1-S15 scenario matrix, assertions, known location-drift limitation (CV-70)
+- [worker-state-topology.md](references/worker-state-topology.md) — topology, config, leader detection, safe kill patterns for the state machine scope
 - [cv-csi-test](../cv-csi-test/SKILL.md) — CSI integration testing
 - [cv-test-report](../cv-test-report/SKILL.md) — publish results
 - [cv-create-pr](../cv-create-pr/SKILL.md) — attach evidence to a PR
 
 ## Checklist
+
+### Transfer scope
 
 - [ ] 3 master / 3 transfer / 5 worker started, readiness gauges green
 - [ ] Fresh dataset per round (no pre-cached files)
@@ -170,3 +196,16 @@ hundred MB and delete it afterwards, or a few rounds will fill the disk.
 - [ ] `transfer_tasks` empty for file-level jobs
 - [ ] Data verified by `fs blocks` + `cmp`, not by the job summary
 - [ ] Environment torn down, disk checked
+
+### Worker/master state machine scope
+
+- [ ] 3 master / 5 worker started, `cv node list` all `normal`, `fs df` non-zero
+- [ ] `block_replication_enabled = true`, per-instance log file names configured
+- [ ] `leader_web()` resolves through `fs df`, never through grepped log lines
+- [ ] Fault matches a row in [worker-state-fault-matrix.md](references/worker-state-fault-matrix.md)
+- [ ] State checked after ≥2 heartbeats **and** after a leader failover
+- [ ] Read-back + `cmp` for every touched file; replication delta counted per round
+- [ ] Bytes `du`/block-file count unchanged while `DECOMMISSIONING`/`DECOMMISSIONED`
+- [ ] Location drift (CV-70) ruled out before blaming the state machine: restart
+      all workers once and re-check
+- [ ] Harness torn down with `teardown.sh` (never `pkill -f "curvine-server"`)

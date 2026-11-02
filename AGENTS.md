@@ -69,7 +69,7 @@ Usage notes:
 
 <skill>
 <name>cv-error-inject</name>
-<description>Build a multi-instance Curvine deployment (3 master / 3 transfer / 5 worker) on one host and run fault-injection rounds against it. Use when verifying transfer resilience, killing transfer instances or workers mid-job, checking failover/takeover behaviour, or reproducing a fault-tolerance claim before review.</description>
+<description>Build a multi-instance Curvine deployment (3 master / 3 transfer / 5 worker) on one host and run fault-injection rounds against it. Two independent scopes: transfer job resilience, and worker/master state machine + block location accounting. Use when verifying transfer resilience, killing transfer instances or workers mid-job, checking failover/takeover behaviour, exercising cordon/decommission/drain/SHUTDOWN/LOST transitions, or reproducing a fault-tolerance claim before review.</description>
 <location>project</location>
 </skill>
 
