@@ -312,6 +312,7 @@ describe('Console shell', () => {
     // The filter set follows the two state axes: four admin states plus the
     // non-running liveness values.
     expect(await screen.findByTestId('workers-filter-normal')).toBeInTheDocument()
+    expect(screen.getByTestId('workers-filter-readonly')).toBeInTheDocument()
     expect(screen.getByTestId('workers-filter-decommissioning')).toBeInTheDocument()
     expect(screen.getByTestId('workers-filter-stale')).toBeInTheDocument()
     expect(await screen.findByTestId('workers-search')).toBeInTheDocument()
@@ -323,6 +324,112 @@ describe('Console shell', () => {
     // Admin intent and liveness are shown as one badge; a running node shows the
     // admin state alone.
     expect(await screen.findByTestId('worker-state-worker-01:8995')).toHaveTextContent('Normal')
+  })
+
+  it('reports an untouched node with no heartbeat as lost, not as "normal · lost"', async () => {
+    const lost = {
+      worker_id: 2,
+      hostname: 'worker-02',
+      status: 'Live',
+      worker_state: { admin: 'normal', liveness: 'lost', writable: false, readable: false },
+      capacity: 1024,
+      available: 0,
+      block_num: 0,
+      address: { rpc_port: 8996, ip_addr: '10.0.0.2', web_port: 9002 },
+      storage_map: {}
+    }
+    const client = {
+      ...workerClient(),
+      fetchWorkersData: vi.fn(async () => ({
+        workers: [lost],
+        buckets: {
+          admin: { normal: 1, cordoned: 0, decommissioning: 0, decommissioned: 0 },
+          liveness: { running: 0, stale: 0, lost: 1, shutdown: 0 }
+        },
+        total: 1
+      }))
+    } as unknown as Partial<ApiClient>
+
+    renderApp('/workers', createStubClient(client))
+
+    const badge = await screen.findByTestId('worker-state-worker-02:8996')
+    expect(badge).toHaveTextContent('Lost')
+    expect(badge).not.toHaveTextContent('Normal')
+    // The `normal` filter means "healthy and untouched", so it must not list it.
+    await userEvent.click(screen.getByTestId('workers-filter-normal'))
+    await waitFor(() => expect(screen.queryByTestId('worker-row-worker-02:8996')).toBeNull())
+    await userEvent.click(screen.getByTestId('workers-filter-lost'))
+    expect(await screen.findByTestId('worker-row-worker-02:8996')).toBeInTheDocument()
+  })
+
+  it('shows a cordoned node as read-only, with its own actions', async () => {
+    const cordoned = {
+      worker_id: 3,
+      hostname: 'worker-03',
+      status: 'Live',
+      worker_state: { admin: 'cordoned', liveness: 'running', writable: false, readable: true },
+      capacity: 1024,
+      available: 512,
+      block_num: 3,
+      address: { rpc_port: 8997, ip_addr: '10.0.0.3', web_port: 9003 },
+      storage_map: {}
+    }
+    const client = {
+      ...workerClient(),
+      fetchWorkersData: vi.fn(async () => ({
+        workers: [cordoned],
+        buckets: {
+          admin: { normal: 0, cordoned: 1, decommissioning: 0, decommissioned: 0 },
+          liveness: { running: 1, stale: 0, lost: 0, shutdown: 0 }
+        },
+        total: 1
+      }))
+    } as unknown as Partial<ApiClient>
+
+    renderApp('/workers', createStubClient(client))
+
+    // One badge, one fact: a healthy cordoned node is simply read-only.
+    const badge = await screen.findByTestId('worker-state-worker-03:8997')
+    expect(badge).toHaveTextContent('Read-only')
+    expect(badge).not.toHaveTextContent('Running')
+    expect(screen.getByTestId('workers-filter-readonly')).toHaveTextContent('Read-only')
+  })
+
+  it('lets the heartbeat fact replace the intent: read-only + stale reads as stale', async () => {
+    const draining = {
+      worker_id: 4,
+      hostname: 'worker-04',
+      worker_state: { admin: 'cordoned', liveness: 'stale', writable: false, readable: true },
+      capacity: 1024,
+      available: 256,
+      block_num: 1,
+      address: { rpc_port: 8998, ip_addr: '10.0.0.4', web_port: 9004 },
+      storage_map: {}
+    }
+    const client = {
+      ...workerClient(),
+      fetchWorkersData: vi.fn(async () => ({
+        workers: [draining],
+        buckets: {
+          admin: { normal: 0, cordoned: 1, decommissioning: 0, decommissioned: 0 },
+          liveness: { running: 0, stale: 1, lost: 0, shutdown: 0 }
+        },
+        total: 1
+      }))
+    } as unknown as Partial<ApiClient>
+
+    renderApp('/workers', createStubClient(client))
+
+    // Exactly one state: the operator's intent is still read-only, but the node
+    // stopped heartbeating, so that is what the badge says.
+    const badge = await screen.findByTestId('worker-state-worker-04:8998')
+    expect(badge).toHaveTextContent('Stale')
+    expect(badge).not.toHaveTextContent('Read-only')
+    // It is listed under `stale`, and not under `readonly`.
+    await userEvent.click(screen.getByTestId('workers-filter-readonly'))
+    await waitFor(() => expect(screen.queryByTestId('worker-row-worker-04:8998')).toBeNull())
+    await userEvent.click(screen.getByTestId('workers-filter-stale'))
+    expect(await screen.findByTestId('worker-row-worker-04:8998')).toBeInTheDocument()
   })
 
   it('gives the reported worker version its own column', async () => {

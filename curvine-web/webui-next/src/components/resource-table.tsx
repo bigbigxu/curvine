@@ -183,6 +183,8 @@ export function workerStatusTone(status: string | null | undefined): StatusTone 
     case 'normal':
       return 'positive'
     case 'cordoned':
+    // The single state for `cordoned + running` (see `WorkerSummary`).
+    case 'readonly':
       return 'warning'
     case 'decommissioning':
       return 'info'

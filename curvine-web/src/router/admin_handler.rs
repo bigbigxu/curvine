@@ -344,6 +344,9 @@ fn worker_matches(worker: &WorkerInfo, selector: &str) -> bool {
 /// state. `status` stays as the legacy single-axis projection for old scripts.
 fn worker_state_view(worker: &WorkerInfo) -> Value {
     json!({
+        // The single state an operator reads. Heartbeat failures win over the
+        // operator intent, so a lost node is `lost`, never `cordoned+lost`.
+        "state": worker.summary().as_str_name(),
         "admin": worker.admin().as_str_name(),
         "liveness": worker.liveness().as_str_name(),
         "writable": worker.writable(),
@@ -369,6 +372,9 @@ fn worker_json(worker: WorkerInfo) -> Value {
         );
         object.insert("schedulable".to_string(), json!(schedulable));
         object.insert("worker_state".to_string(), worker_state);
+        // The single derived state (`normal` / `readonly` / `stale` / ...), so a
+        // console does not have to re-implement the two-axis precedence rule.
+        object.insert("state".to_string(), json!(worker.summary().as_str_name()));
         // Restored for compatibility: the model no longer has a single `status`
         // field, but dashboards and scripts still read it.
         object.insert("status".to_string(), json!(legacy_status));
@@ -3489,25 +3495,25 @@ async fn worker_detail_v1(
     let master_info = current_master_info(&instance).await?;
     for item in master_info.live_workers {
         if worker_matches(&item, &worker) {
-            let state = item.state().as_label();
-            return Ok(api_success(worker_payload(item, &state)));
+            let state = item.state().summary().as_str_name();
+            return Ok(api_success(worker_payload(item, state)));
         }
     }
     for item in master_info.blacklist_workers {
         if worker_matches(&item, &worker) {
-            let state = item.state().as_label();
-            return Ok(api_success(worker_payload(item, &state)));
+            let state = item.state().summary().as_str_name();
+            return Ok(api_success(worker_payload(item, state)));
         }
     }
     for item in master_info.decommission_workers {
         if worker_matches(&item, &worker) {
-            let state = item.state().as_label();
-            return Ok(api_success(worker_payload(item, &state)));
+            let state = item.state().summary().as_str_name();
+            return Ok(api_success(worker_payload(item, state)));
         }
     }
     for item in master_info.lost_workers {
         if worker_matches(&item, &worker) {
-            return Ok(api_success(worker_payload(item, "Lost")));
+            return Ok(api_success(worker_payload(item, "lost")));
         }
     }
 
@@ -5472,6 +5478,42 @@ mod version_payload_tests {
     use curvine_proto::ComponentInfoProto;
 
     #[test]
+    /// The console reads one state, not two axes: the JSON carries both the
+    /// derived `state` and the axes it was derived from.
+    #[test]
+    fn worker_json_exposes_one_state_plus_its_axes() {
+        let mut worker = WorkerInfo::new(
+            WorkerAddress {
+                worker_id: 7,
+                hostname: "w7".to_string(),
+                ip_addr: "10.0.0.7".to_string(),
+                rpc_port: 8997,
+                ..Default::default()
+            },
+            1,
+        );
+        worker.apply_state(curvine_model::WorkerState::new(
+            curvine_model::AdminState::Cordoned,
+            curvine_model::Liveness::Running,
+        ));
+
+        let value = worker_json(worker.clone());
+        assert_eq!(value["state"], json!("readonly"));
+        assert_eq!(value["worker_state"]["state"], json!("readonly"));
+        assert_eq!(value["worker_state"]["admin"], json!("cordoned"));
+        assert_eq!(value["worker_state"]["liveness"], json!("running"));
+        assert_eq!(value["schedulable"], json!(false));
+
+        // A heartbeat failure replaces the intent in the derived state.
+        worker.apply_state(curvine_model::WorkerState::new(
+            curvine_model::AdminState::Cordoned,
+            curvine_model::Liveness::Lost,
+        ));
+        let value = worker_json(worker);
+        assert_eq!(value["state"], json!("lost"));
+        assert_eq!(value["worker_state"]["admin"], json!("cordoned"));
+    }
+
     fn worker_version_fields_use_software_version_and_commit() {
         let mut worker = WorkerInfo::new(
             WorkerAddress {

@@ -10,6 +10,9 @@ export default {
       activeWorkers: '活跃 Worker',
       usedPercent: '已用 {percent}%',
       requiresAttention: '需要关注',
+      readOnlyMeta: '不接新数据，仍可读',
+      decommissioningMeta: '正在把数据搬走',
+      decommissionedMeta: '位置已摘除',
       unhealthy: '不健康节点',
       unhealthyMeta: '无法接受写入'
     },
@@ -31,7 +34,7 @@ export default {
     filters: {
       all: '全部',
       normal: '正常',
-      cordoned: '只出不进',
+      readonly: '只读',
       decommissioning: '搬空中',
       decommissioned: '已下线',
       stale: '心跳迟到',
@@ -40,9 +43,16 @@ export default {
     },
     states: {
       normal: '正常',
-      cordoned: '只出不进',
+      readonly: '只读',
       decommissioning: '搬空中',
-      decommissioned: '已下线'
+      decommissioned: '已下线',
+      stale: '心跳迟到',
+      lost: '失联',
+      shutdown: '已退出'
+    },
+    axes: {
+      admin: '运维意图',
+      liveness: '心跳'
     },
     liveness: {
       running: '心跳正常',
@@ -63,28 +73,30 @@ export default {
     },
     actions: {
       detail: '详情',
-      cordon: '停止接新数据',
-      uncordon: '恢复接新数据',
+      cordon: '只读',
+      uncordon: '恢复读写',
       decommission: '下线',
       cancelDecommission: '取消搬空',
       forceDecommission: '强制退役',
       recommission: '接回集群',
       profile: '火焰图',
-      confirm: '{action} Worker {worker}？',
+      confirm: '确认对 Worker {worker} 执行「{action}」？',
       forceConfirm: '强制退役 Worker {worker}？未能搬走的块会被删除，其中没有其它副本的块将不可读。',
       forceWarning: '该操作会删除节点上的残留块，之后接回集群也无法恢复。',
-      cancelHint: '停止搬空，节点停在「只出不进」，数据不动。',
+      cordonHint: '节点变成只读：不再接收新块（旧版「加入黑名单」的效果），已有的块照常可读。',
+      uncordonHint: '节点恢复读写，重新参与新块分配，正在读的客户端不受影响。',
+      cancelHint: '停止搬空，节点停在「只读」，数据不动。',
       decommissionHint: '先把块搬到其它节点，搬空之前节点仍可读。'
     },
     actionVerb: {
-      cordon: '停止接新数据',
-      uncordon: '恢复接新数据',
+      cordon: '设为只读',
+      uncordon: '恢复读写',
       decommission: '下线',
       'cancel-decommission': '取消搬空',
       'force-decommission': '强制退役',
       recommission: '接回集群',
-      blacklist: '停止接新数据',
-      allow: '恢复接新数据'
+      blacklist: '设为只读',
+      allow: '恢复读写'
     },
     detail: {
       title: 'Worker 详情',

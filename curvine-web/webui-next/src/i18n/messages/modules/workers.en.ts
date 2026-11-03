@@ -10,6 +10,9 @@ export default {
       activeWorkers: 'active workers',
       usedPercent: '{percent}% used',
       requiresAttention: 'requires attention',
+      readOnlyMeta: 'no new blocks, still readable',
+      decommissioningMeta: 'draining its blocks',
+      decommissionedMeta: 'locations already dropped',
       unhealthy: 'Unhealthy Workers',
       unhealthyMeta: 'cannot accept writes'
     },
@@ -31,7 +34,7 @@ export default {
     filters: {
       all: 'All',
       normal: 'Normal',
-      cordoned: 'Cordoned',
+      readonly: 'Read-only',
       decommissioning: 'Decommissioning',
       decommissioned: 'Decommissioned',
       stale: 'Stale',
@@ -40,9 +43,16 @@ export default {
     },
     states: {
       normal: 'Normal',
-      cordoned: 'Cordoned',
+      readonly: 'Read-only',
       decommissioning: 'Decommissioning',
-      decommissioned: 'Decommissioned'
+      decommissioned: 'Decommissioned',
+      stale: 'Stale',
+      lost: 'Lost',
+      shutdown: 'Shutdown'
+    },
+    axes: {
+      admin: 'Intent',
+      liveness: 'Heartbeat'
     },
     liveness: {
       running: 'Running',
@@ -63,28 +73,30 @@ export default {
     },
     actions: {
       detail: 'Detail',
-      cordon: 'Cordon',
-      uncordon: 'Uncordon',
+      cordon: 'Read-only',
+      uncordon: 'Read/write',
       decommission: 'Decommission',
       cancelDecommission: 'Cancel drain',
       forceDecommission: 'Force retire',
       recommission: 'Recommission',
       profile: 'Profile',
-      confirm: '{action} worker {worker}?',
+      confirm: 'Apply "{action}" to worker {worker}?',
       forceConfirm: 'Force-retire worker {worker}? Blocks that could not be moved are deleted, and blocks with no other replica become unreadable.',
       forceWarning: 'This deletes the blocks left on the node; the data cannot be restored by recommissioning it.',
-      cancelHint: 'The drain stops and the node stays cordoned (no data is touched).',
+      cordonHint: 'The node becomes read-only: it stops taking new blocks (what "blacklist" used to do) and existing blocks stay readable.',
+      uncordonHint: 'The node takes new blocks again; clients that are reading are not affected.',
+      cancelHint: 'The drain stops and the node stays read-only (no data is touched).',
       decommissionHint: 'Blocks are copied off the node first; the node stays readable until the drain finishes.'
     },
     actionVerb: {
-      cordon: 'cordon',
-      uncordon: 'uncordon',
+      cordon: 'read-only',
+      uncordon: 'read/write',
       decommission: 'decommission',
       'cancel-decommission': 'cancel drain',
       'force-decommission': 'force retire',
       recommission: 'recommission',
-      blacklist: 'cordon',
-      allow: 'uncordon'
+      blacklist: 'read-only',
+      allow: 'read/write'
     },
     detail: {
       title: 'Worker Detail',

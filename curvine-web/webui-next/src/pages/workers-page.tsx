@@ -15,10 +15,12 @@ import {
   matchesWorkerFilter,
   workerActionOption,
   workerAdmin,
+  workerState,
   workerLiveness,
-  workerStateLabel,
+  WORKER_STATES,
   type WorkerAdmin,
   type WorkerLiveness,
+  type WorkerState,
   type WorkerStateFilter,
 } from '@/lib/worker-state'
 import { Input } from '@/components/ui/input'
@@ -43,21 +45,25 @@ import { WorkerDetailSheet } from './worker-detail-sheet'
 import { ProfileDialog } from './profile-dialog'
 
 type WorkerRow = WorkerInfo & {
-  /** `admin` or `admin+liveness`, the label the table shows. */
-  rowStatus: string
+  /** The single state the table shows (heartbeat failure wins). */
+  rowState: WorkerState
+  /** Operator intent, used to pick the legal actions. */
   admin: WorkerAdmin
+  /** Heartbeat fact, only used to explain the state in a tooltip. */
   liveness: WorkerLiveness
 }
 
-const FILTERS: WorkerStateFilter[] = [
-  'all',
-  'normal',
-  'cordoned',
-  'decommissioning',
-  'decommissioned',
-  'stale',
+const FILTERS: WorkerStateFilter[] = ['all', ...WORKER_STATES]
+
+/** List order within the same health: broken heartbeats first, then intents. */
+const STATE_SEVERITY: WorkerState[] = [
   'lost',
   'shutdown',
+  'stale',
+  'decommissioning',
+  'decommissioned',
+  'readonly',
+  'normal',
 ]
 
 /** Unhealthy directories, i.e. the worker cannot take new writes for them. */
@@ -111,11 +117,12 @@ export function WorkersPage() {
   useRefreshSignal(refresh)
 
   const allWorkers = useMemo<WorkerRow[]>(() => {
-    const decorate = (worker: WorkerInfo): WorkerRow => {
-      const admin = workerAdmin(worker)
-      const liveness = workerLiveness(worker)
-      return { ...worker, admin, liveness, rowStatus: workerStateLabel(admin, liveness) }
-    }
+    const decorate = (worker: WorkerInfo): WorkerRow => ({
+      ...worker,
+      rowState: workerState(worker),
+      admin: workerAdmin(worker),
+      liveness: workerLiveness(worker),
+    })
     if (data?.workers?.length) return data.workers.map(decorate)
     // An old master has no flat list and no state axes: rebuild what we can from
     // the legacy buckets, which is the only state signal it sends.
@@ -128,16 +135,11 @@ export function WorkersPage() {
     return legacy.map(decorate)
   }, [data])
 
-  /** Fleet count for one axis value; server-side buckets when available. */
+  /** Fleet count for one state. Every worker is in exactly one state. */
   const count = useCallback(
-    (axis: 'admin' | 'liveness', value: string): number => {
-      const fromServer = data?.buckets?.[axis]?.[value]
-      if (typeof fromServer === 'number') return fromServer
-      return allWorkers.filter((worker) =>
-        axis === 'admin' ? worker.admin === value : worker.liveness === value
-      ).length
-    },
-    [allWorkers, data]
+    (...states: WorkerState[]): number =>
+      allWorkers.filter((worker) => states.includes(worker.rowState)).length,
+    [allWorkers]
   )
 
   const filtered = useMemo(() => {
@@ -145,7 +147,7 @@ export function WorkersPage() {
     return allWorkers
       .filter(
         (worker) =>
-          matchesWorkerFilter(worker.admin, worker.liveness, statusFilter) &&
+          matchesWorkerFilter(worker.rowState, statusFilter) &&
           `${workerHostname(worker)} ${workerId(worker)} ${workerAddress(worker)} ${ipAddress(worker)} ${workerShortVersion(
             worker
           )}`
@@ -153,23 +155,24 @@ export function WorkersPage() {
             .includes(needle)
       )
       // Surface problems first: this list exists to show what needs attention.
-      .sort((a, b) => Number(isHealthy(b)) - Number(isHealthy(a)))
+      .sort(
+        (a, b) =>
+          Number(isHealthy(b)) - Number(isHealthy(a)) ||
+          STATE_SEVERITY.indexOf(a.rowState) - STATE_SEVERITY.indexOf(b.rowState)
+      )
   }, [allWorkers, statusFilter, query])
 
   const activeWorkers = useMemo(
-    () => allWorkers.filter((worker) => worker.admin !== 'decommissioned'),
+    () => allWorkers.filter((worker) => worker.rowState !== 'decommissioned'),
     [allWorkers]
   )
 
-  // Two axes, one badge: the admin intent, plus the liveness fact when it is not
-  // `running` (`decommissioning · stale`). Keeping them apart is the whole point
-  // of the state split, so the console must not collapse them.
-  const stateText = (admin: WorkerAdmin, liveness: WorkerLiveness): string => {
-    const base = t(`workers.states.${admin}`)
-    return liveness === 'running' ? base : `${base} · ${t(`workers.liveness.${liveness}`)}`
-  }
-  const stateTone = (admin: WorkerAdmin, liveness: WorkerLiveness) =>
-    workerStatusTone(liveness === 'running' ? admin : liveness)
+  // One badge, one state. The two axes live in `workerState()`; if the
+  // heartbeats stopped, the badge says so instead of prefixing the old intent.
+  const stateText = (state: WorkerState): string => t(`workers.states.${state}`)
+  const axesHint = (worker: WorkerRow): string =>
+    `${t('workers.axes.admin')}: ${t(`workers.states.${worker.admin === 'cordoned' ? 'readonly' : worker.admin}`)} · ` +
+    `${t('workers.axes.liveness')}: ${t(`workers.liveness.${worker.liveness ?? 'running'}`)}`
   const totalCapacity = activeWorkers.reduce((sum, worker) => sum + Number(worker.capacity || 0), 0)
   const totalAvailable = activeWorkers.reduce((sum, worker) => sum + Number(worker.available || 0), 0)
   const clusterUsage = usagePercent(totalCapacity, totalAvailable)
@@ -206,39 +209,53 @@ export function WorkersPage() {
 
       {error && <ErrorAlert message={error} />}
 
-      <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+      <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
         <MetricCard
-          label={t('workers.metrics.liveWorkers')}
-          value={count('admin', 'normal')}
+          label={t('workers.states.normal')}
+          value={count('normal')}
           meta={t('workers.metrics.healthyHeartbeat')}
           delta={delta('online')}
           tone="good"
         />
         <MetricCard
-          label={t('workers.metrics.managed')}
-          value={
-            count('admin', 'cordoned') +
-            count('admin', 'decommissioning') +
-            count('admin', 'decommissioned')
-          }
-          meta={t('workers.metrics.blacklistDecommission')}
-          delta={`${count('admin', 'cordoned')} / ${count('admin', 'decommissioning')} / ${count(
-            'admin',
-            'decommissioned'
+          label={t('workers.states.readonly')}
+          value={count('readonly')}
+          meta={t('workers.metrics.readOnlyMeta')}
+          delta={`${count('readonly')} / ${allWorkers.length}`}
+          tone={count('readonly') ? 'warn' : 'neutral'}
+        />
+        <MetricCard
+          label={t('workers.states.decommissioning')}
+          value={count('decommissioning')}
+          meta={t('workers.metrics.decommissioningMeta')}
+          delta={`${count('decommissioning')} / ${allWorkers.length}`}
+          tone={count('decommissioning') ? 'warn' : 'neutral'}
+        />
+        <MetricCard
+          label={t('workers.states.decommissioned')}
+          value={count('decommissioned')}
+          meta={t('workers.metrics.decommissionedMeta')}
+          delta={`${count('decommissioned')} / ${allWorkers.length}`}
+          tone={count('decommissioned') ? 'warn' : 'neutral'}
+        />
+        <MetricCard
+          label={t('workers.metrics.requiresAttention')}
+          value={count('stale', 'lost', 'shutdown')}
+          meta={`${t('workers.states.stale')} / ${t('workers.states.lost')} / ${t(
+            'workers.states.shutdown'
           )}`}
-          tone={
-            count('admin', 'cordoned') +
-              count('admin', 'decommissioning') +
-              count('admin', 'decommissioned')
-              ? 'warn'
-              : 'neutral'
-          }
+          delta={`${count('stale')} / ${count('lost')} / ${count('shutdown')}`}
+          tone={count('stale', 'lost', 'shutdown') ? 'bad' : 'good'}
         />
         <MetricCard
           label={t('workers.metrics.totalCapacity')}
           value={formatBytes(totalCapacity)}
-          meta={t('workers.metrics.activeWorkers')}
-          delta={t('workers.metrics.usedPercent', { percent: clusterUsage })}
+          meta={`${t('workers.metrics.usedPercent', { percent: clusterUsage })} · ${t(
+            'workers.metrics.activeWorkers'
+          )}`}
+          delta={`${formatBytes(Math.max(0, totalCapacity - totalAvailable))} / ${formatBytes(
+            totalCapacity
+          )}`}
           tone="neutral"
         />
         <MetricCard
@@ -247,22 +264,6 @@ export function WorkersPage() {
           meta={t('workers.metrics.unhealthyMeta')}
           delta={delta(activeWorkers.some((worker) => !isHealthy(worker)) ? 'check' : 'none')}
           tone={activeWorkers.some((worker) => !isHealthy(worker)) ? 'bad' : 'good'}
-        />
-        <MetricCard
-          label={t('workers.metrics.lostWorkers')}
-          value={
-            count('liveness', 'stale') + count('liveness', 'lost') + count('liveness', 'shutdown')
-          }
-          meta={t('workers.metrics.requiresAttention')}
-          delta={`${count('liveness', 'stale')} / ${count('liveness', 'lost')} / ${count(
-            'liveness',
-            'shutdown'
-          )}`}
-          tone={
-            count('liveness', 'stale') + count('liveness', 'lost') + count('liveness', 'shutdown')
-              ? 'bad'
-              : 'good'
-          }
         />
       </section>
 
@@ -329,7 +330,7 @@ export function WorkersPage() {
             const versionIssue = workerVersionIssues(worker)
             const selector = workerAddress(worker)
             return (
-              <TableRow key={`${worker.rowStatus}-${selector}`} data-testid={`worker-row-${selector}`}>
+              <TableRow key={`${worker.rowState}-${selector}`} data-testid={`worker-row-${selector}`}>
                 <TableCell>
                   <div className="flex w-full min-w-0 items-center gap-2">
                     <ServerIcon
@@ -354,11 +355,13 @@ export function WorkersPage() {
                   </div>
                 </TableCell>
                 <TableCell>
-                  <StatusBadge
-                    value={stateText(worker.admin, worker.liveness)}
-                    tone={stateTone(worker.admin, worker.liveness)}
-                    testId={`worker-state-${selector}`}
-                  />
+                  <span title={axesHint(worker)}>
+                    <StatusBadge
+                      value={stateText(worker.rowState)}
+                      tone={workerStatusTone(worker.rowState)}
+                      testId={`worker-state-${selector}`}
+                    />
+                  </span>
                 </TableCell>
                 <TableCell>
                   <StatusBadge
@@ -451,16 +454,10 @@ export function WorkersPage() {
               )}`
             }
             const base = t('workers.actions.confirm', {
-              action: t(option.labelKey),
+              action: t(option.verbKey ?? option.labelKey),
               worker
             })
-            if (option.action === 'decommission') {
-              return `${base} ${t('workers.actions.decommissionHint')}`
-            }
-            if (option.action === 'cancel-decommission') {
-              return `${base} ${t('workers.actions.cancelHint')}`
-            }
-            return base
+            return option.hintKey ? `${base} ${t(option.hintKey)}` : base
           })()}
           confirmLabel={t('common.confirm')}
           cancelLabel={t('common.cancel')}

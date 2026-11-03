@@ -110,6 +110,12 @@ export interface WorkerInfo {
   version?: string | null
   storage_map?: Record<string, WorkerStorageInfo> | null
   status?: string | null
+  /**
+   * The single state of the worker: `normal` | `readonly` | `decommissioning` |
+   * `decommissioned` | `stale` | `lost` | `shutdown`. Preferred over the two
+   * axes below, which stay available for explaining *why*.
+   */
+  state?: string | null
   /** CV-60 state axes: operator intent and heartbeat fact, kept separate. */
   worker_state?: WorkerState | null
   /** Worker fact: can it take new writes at all? */
@@ -120,6 +126,8 @@ export interface WorkerInfo {
 }
 
 export interface WorkerState {
+  /** The derived single state (`normal` | `readonly` | `stale` | ...). */
+  state?: string | null
   /** normal | cordoned | decommissioning | decommissioned */
   admin?: string | null
   /** running | stale | lost | shutdown */

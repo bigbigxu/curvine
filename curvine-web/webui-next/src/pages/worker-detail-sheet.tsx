@@ -25,6 +25,7 @@ import {
   workerActionOption,
   workerAdmin,
   workerLiveness,
+  workerState,
 } from '@/lib/worker-state'
 import {
   formatBytes,
@@ -106,10 +107,17 @@ export function WorkerDetailSheet({
   const worker = data?.worker ?? {}
   // Prefer the structured axes; fall back to the legacy `state`/`status` string
   // an old master still returns.
-  const admin = workerAdmin({ ...worker, status: worker.status ?? data?.state })
-  const liveness = workerLiveness({ ...worker, status: worker.status ?? data?.state })
-  const stateLabel =
-    liveness === 'running' ? t(`workers.states.${admin}`) : `${t(`workers.states.${admin}`)} · ${t(`workers.liveness.${liveness}`)}`
+  // A worker has exactly one state; the fallback tolerates an old master that
+  // still sends only the legacy `state`/`status` string.
+  const legacy = { ...worker, status: worker.status ?? data?.state }
+  const state = workerState(legacy)
+  const admin = workerAdmin(legacy)
+  const liveness = workerLiveness(legacy)
+  // The two axes stay visible here on purpose: the panel is where an operator
+  // asks *why* a node reads as `lost` while it was draining.
+  const axesHint = `${t('workers.axes.admin')}: ${t(
+    `workers.states.${admin === 'cordoned' ? 'readonly' : admin}`
+  )} · ${t('workers.axes.liveness')}: ${t(`workers.liveness.${liveness}`)}`
   const address = workerAddress(worker)
   const shortVersion = String(data?.version || workerShortVersion(worker) || '').trim()
   const versionIssue = versionsMismatch(shortVersion, runtime.version)
@@ -188,11 +196,13 @@ export function WorkerDetailSheet({
   
               <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                 <SummaryTile label={t('workers.list.headerStatus')}>
-                  <StatusBadge
-                    value={stateLabel}
-                    tone={workerStatusTone(liveness === 'running' ? admin : liveness)}
-                    testId="worker-detail-state"
-                  />
+                  <span title={axesHint}>
+                    <StatusBadge
+                      value={t(`workers.states.${state}`)}
+                      tone={workerStatusTone(state)}
+                      testId="worker-detail-state"
+                    />
+                  </span>
                 </SummaryTile>
                 <SummaryTile label={t('workers.list.headerUsage')}>
                   <div className="flex flex-col gap-1.5">
@@ -403,16 +413,10 @@ export function WorkerDetailSheet({
             )}`
           }
           const base = t('workers.actions.confirm', {
-            action: t(option.labelKey),
+            action: t(option.verbKey ?? option.labelKey),
             worker: address
           })
-          if (pendingAction === 'decommission') {
-            return `${base} ${t('workers.actions.decommissionHint')}`
-          }
-          if (pendingAction === 'cancel-decommission') {
-            return `${base} ${t('workers.actions.cancelHint')}`
-          }
-          return base
+          return option.hintKey ? `${base} ${t(option.hintKey)}` : base
         })()}
         confirmLabel={t('common.confirm')}
         cancelLabel={t('common.cancel')}

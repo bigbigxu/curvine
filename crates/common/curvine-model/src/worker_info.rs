@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::state::{AdminState, Liveness, StorageInfo, WorkerAddress, WorkerState, WorkerStatus};
+use crate::state::{
+    AdminState, Liveness, StorageInfo, WorkerAddress, WorkerState, WorkerStatus, WorkerSummary,
+};
 use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::LocalTime;
 use serde::{Deserialize, Serialize};
@@ -231,6 +233,12 @@ impl WorkerInfo {
         self.state().writable()
     }
 
+    /// The single state an operator reads: heartbeat failure first, then the
+    /// operator intent. See [`WorkerState::summary`].
+    pub fn summary(&self) -> WorkerSummary {
+        self.state().summary()
+    }
+
     /// Can the master place new data here?
     pub fn writable(&self) -> bool {
         self.state().writable()
@@ -332,7 +340,7 @@ impl WorkerInfo {
     }
 
     /// Legacy `id,host:port,state` line used by the CLI and the console. The
-    /// state field is the new admin/liveness label (`normal`, `stale`,
+    /// state field is the single derived state (`normal`, `readonly`, `stale`,
     /// `decommissioning`, ...), which is what an operator needs to see.
     pub fn simple_string(&self) -> String {
         format!(
@@ -340,7 +348,7 @@ impl WorkerInfo {
             self.worker_id(),
             self.address.hostname,
             self.address.rpc_port,
-            self.state().as_label()
+            self.state().summary().as_str_name()
         )
     }
 }
@@ -447,10 +455,16 @@ mod tests {
         let mut worker = WorkerInfo::default();
         assert_eq!(worker.status(), WorkerStatus::Live);
 
-        worker.apply_state(WorkerState::new(AdminState::Decommissioning, Liveness::Running));
+        worker.apply_state(WorkerState::new(
+            AdminState::Decommissioning,
+            Liveness::Running,
+        ));
         assert_eq!(worker.status(), WorkerStatus::Live);
 
-        worker.apply_state(WorkerState::new(AdminState::Decommissioned, Liveness::Running));
+        worker.apply_state(WorkerState::new(
+            AdminState::Decommissioned,
+            Liveness::Running,
+        ));
         assert_eq!(worker.status(), WorkerStatus::Decommission);
 
         worker.apply_state(WorkerState::new(AdminState::Normal, Liveness::Stale));

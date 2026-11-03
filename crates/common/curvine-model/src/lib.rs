@@ -98,7 +98,7 @@ pub use self::worker_status::WorkerStatus;
 
 mod worker_admin;
 pub use self::worker_admin::{
-    apply, AdminState, Effect, Facts, Liveness, Refusal, Trigger, WorkerState,
+    apply, AdminState, Effect, Facts, Liveness, Refusal, Trigger, WorkerState, WorkerSummary,
 };
 
 mod mount;

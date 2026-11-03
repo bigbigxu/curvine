@@ -68,6 +68,70 @@ impl Liveness {
     }
 }
 
+/// 面向人的单一 worker 状态。
+///
+/// 一个 worker 在任一时刻恰好处于这 7 个值之一。它由 [`WorkerState::summary`]
+/// 从两轴归并而来：心跳异常（`LOST` / `SHUTDOWN` / `STALE`）优先于运维意图，
+/// 心跳正常时才看各管理状态。控制台、`cv node list` 和日志都展示这个值；
+/// 需要区分「意图」与「心跳」的场合（主备、搬迁、审计）仍然读两条轴。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum WorkerSummary {
+    /// `NORMAL + RUNNING`：正常服务。
+    Normal,
+    /// `CORDONED + RUNNING`：只读（不再分配新数据，已有数据可读）。
+    ReadOnly,
+    /// `DECOMMISSIONING + RUNNING`：搬空中。
+    Decommissioning,
+    /// `DECOMMISSIONED + RUNNING`：已下线。
+    Decommissioned,
+    /// `STALE`：心跳迟到，位置保留、读降级、搬迁暂停。
+    Stale,
+    /// `LOST`：心跳丢失，位置作废、触发补副本。
+    Lost,
+    /// `SHUTDOWN`：进程主动退出，宽限期内保留位置。
+    Shutdown,
+}
+
+impl WorkerSummary {
+    /// 全部 7 个取值，按展示顺序（从需要人关注到健康）。
+    pub const ALL: [WorkerSummary; 7] = [
+        WorkerSummary::Lost,
+        WorkerSummary::Shutdown,
+        WorkerSummary::Stale,
+        WorkerSummary::Decommissioning,
+        WorkerSummary::Decommissioned,
+        WorkerSummary::ReadOnly,
+        WorkerSummary::Normal,
+    ];
+
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            WorkerSummary::Normal => "normal",
+            WorkerSummary::ReadOnly => "readonly",
+            WorkerSummary::Decommissioning => "decommissioning",
+            WorkerSummary::Decommissioned => "decommissioned",
+            WorkerSummary::Stale => "stale",
+            WorkerSummary::Lost => "lost",
+            WorkerSummary::Shutdown => "shutdown",
+        }
+    }
+
+    /// Inverse of [`WorkerSummary::as_str_name`], used when reading the wire format.
+    pub fn from_str_name(name: &str) -> Option<WorkerSummary> {
+        WorkerSummary::ALL
+            .into_iter()
+            .find(|value| value.as_str_name() == name)
+    }
+
+    /// 这个状态是否意味着心跳异常（需要人排查节点本身）。
+    pub fn is_liveness_failure(&self) -> bool {
+        matches!(
+            self,
+            WorkerSummary::Stale | WorkerSummary::Lost | WorkerSummary::Shutdown
+        )
+    }
+}
+
 /// 运维意图。持久化在 intent 表（journal），跨重启、跨主备切换保持。
 ///
 /// 心跳永远不会改变它；只有运维触发和 drain 完成会改变它。
@@ -169,7 +233,12 @@ impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Refusal::BlocksRemain { blocks } => {
-                write!(f, "{}: {} block(s) still located here", self.as_str_name(), blocks)
+                write!(
+                    f,
+                    "{}: {} block(s) still located here",
+                    self.as_str_name(),
+                    blocks
+                )
             }
             _ => f.write_str(self.as_str_name()),
         }
@@ -281,7 +350,37 @@ impl WorkerState {
         if self.liveness == Liveness::Running {
             self.admin.as_str_name().to_string()
         } else {
-            format!("{}+{}", self.admin.as_str_name(), self.liveness.as_str_name())
+            format!(
+                "{}+{}",
+                self.admin.as_str_name(),
+                self.liveness.as_str_name()
+            )
+        }
+    }
+
+    /// 面向人的单一状态：任一时刻只有一个值。
+    ///
+    /// 两轴是存储与转移的实现细节（心跳触发只改 `liveness`，运维触发只改
+    /// `admin`），但运维看的是「这个节点现在是什么」。所以这里给出一条固定的
+    /// 归并规则，而不是把两条轴拼成 `cordoned+stale` 让人自己算：
+    ///
+    /// - 心跳异常优先：`LOST` > `SHUTDOWN` > `STALE`。节点收不到心跳时，
+    ///   「它怎么样了」比「我之前让它干什么」更重要。
+    /// - 心跳正常时才看运维意图：`DECOMMISSIONING` > `DECOMMISSIONED` >
+    ///   `CORDONED`（只读）> `NORMAL`。
+    ///
+    /// 结果是 7 个取值（见 [`WorkerSummary::ALL`]），互斥且穷尽。
+    pub fn summary(&self) -> WorkerSummary {
+        match self.liveness {
+            Liveness::Lost => WorkerSummary::Lost,
+            Liveness::Shutdown => WorkerSummary::Shutdown,
+            Liveness::Stale => WorkerSummary::Stale,
+            Liveness::Running => match self.admin {
+                AdminState::Normal => WorkerSummary::Normal,
+                AdminState::Cordoned => WorkerSummary::ReadOnly,
+                AdminState::Decommissioning => WorkerSummary::Decommissioning,
+                AdminState::Decommissioned => WorkerSummary::Decommissioned,
+            },
         }
     }
 
@@ -294,7 +393,12 @@ impl WorkerState {
 
 impl std::fmt::Display for WorkerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.admin.as_str_name(), self.liveness.as_str_name())
+        write!(
+            f,
+            "{}/{}",
+            self.admin.as_str_name(),
+            self.liveness.as_str_name()
+        )
     }
 }
 
@@ -362,10 +466,7 @@ pub fn apply(
             // 已搬走的块不回滚，所以退回“只出不进”而不是 Normal。
             A::Decommissioning => Ok((
                 state.with_admin(A::Cordoned),
-                vec![
-                    Effect::PersistIntent(A::Cordoned),
-                    Effect::StopDrain,
-                ],
+                vec![Effect::PersistIntent(A::Cordoned), Effect::StopDrain],
             )),
             A::Cordoned => Err(Refusal::AlreadyInState),
             A::Normal | A::Decommissioned => Err(Refusal::NotAllowed),
@@ -380,10 +481,7 @@ pub fn apply(
                 }
                 Ok((
                     state.with_admin(A::Decommissioned),
-                    vec![
-                        Effect::PersistIntent(A::Decommissioned),
-                        Effect::StopDrain,
-                    ],
+                    vec![Effect::PersistIntent(A::Decommissioned), Effect::StopDrain],
                 ))
             }
             A::Decommissioning => Err(Refusal::NotAllowed),
@@ -396,10 +494,7 @@ pub fn apply(
                 if !facts.deadline_passed {
                     return Err(Refusal::DeadlineNotReached);
                 }
-                let mut effects = vec![
-                    Effect::PersistIntent(A::Decommissioned),
-                    Effect::StopDrain,
-                ];
+                let mut effects = vec![Effect::PersistIntent(A::Decommissioned), Effect::StopDrain];
                 if facts.blocks > 0 {
                     effects.push(Effect::DropLocations);
                     effects.push(Effect::RecordOrphans);
@@ -417,9 +512,7 @@ pub fn apply(
         },
 
         Trigger::HeartbeatOk => {
-            let effects = if state.liveness() != L::Running
-                && state.admin() == A::Decommissioning
-            {
+            let effects = if state.liveness() != L::Running && state.admin() == A::Decommissioning {
                 vec![Effect::StartDrain]
             } else {
                 vec![]
@@ -478,6 +571,79 @@ mod tests {
         AdminState::Decommissioning,
         AdminState::Decommissioned,
     ];
+
+    /// 两轴 16 种组合都必须归并成 7 个互斥状态之一，而且心跳异常优先。
+    #[test]
+    fn summary_collapses_the_two_axes_into_one_state() {
+        let expect =
+            |admin: AdminState, liveness: Liveness| WorkerState::new(admin, liveness).summary();
+
+        // 心跳正常时由运维意图决定。
+        assert_eq!(
+            expect(AdminState::Normal, Liveness::Running),
+            WorkerSummary::Normal
+        );
+        assert_eq!(
+            expect(AdminState::Cordoned, Liveness::Running),
+            WorkerSummary::ReadOnly
+        );
+        assert_eq!(
+            expect(AdminState::Decommissioning, Liveness::Running),
+            WorkerSummary::Decommissioning
+        );
+        assert_eq!(
+            expect(AdminState::Decommissioned, Liveness::Running),
+            WorkerSummary::Decommissioned
+        );
+
+        // 心跳异常时，意图让位：节点「怎么了」比「我让它干什么」更重要。
+        for liveness in [Liveness::Stale, Liveness::Lost, Liveness::Shutdown] {
+            let expected = match liveness {
+                Liveness::Stale => WorkerSummary::Stale,
+                Liveness::Lost => WorkerSummary::Lost,
+                _ => WorkerSummary::Shutdown,
+            };
+            for admin in ADMINS {
+                assert_eq!(
+                    expect(admin, liveness),
+                    expected,
+                    "{admin:?} + {liveness:?} must read as the heartbeat fact"
+                );
+            }
+        }
+
+        // 16 种组合全部落在 7 个取值里，且每个取值都可达。
+        let mut seen = Vec::new();
+        for admin in ADMINS {
+            for liveness in LIVENESS {
+                let summary = expect(admin, liveness);
+                if !seen.contains(&summary) {
+                    seen.push(summary);
+                }
+            }
+        }
+        assert_eq!(seen.len(), WorkerSummary::ALL.len());
+        for value in WorkerSummary::ALL {
+            assert!(seen.contains(&value), "{value:?} is unreachable");
+        }
+    }
+
+    #[test]
+    fn summary_names_round_trip() {
+        for value in WorkerSummary::ALL {
+            assert_eq!(
+                WorkerSummary::from_str_name(value.as_str_name()),
+                Some(value)
+            );
+        }
+        assert_eq!(WorkerSummary::from_str_name("cordoned"), None);
+        assert_eq!(
+            WorkerState::new(AdminState::Cordoned, Liveness::Running)
+                .summary()
+                .as_str_name(),
+            "readonly"
+        );
+    }
 
     const TRIGGERS: [Trigger; 12] = [
         Trigger::Cordon,
@@ -776,7 +942,10 @@ mod tests {
         let (decommissioned, effects) = apply(decommissioning, Trigger::DrainCompleted, &drained)
             .expect("drain completion must be accepted");
         assert_eq!(decommissioned.admin(), AdminState::Decommissioned);
-        assert!(!decommissioned.readable(), "DECOMMISSIONED must not serve reads");
+        assert!(
+            !decommissioned.readable(),
+            "DECOMMISSIONED must not serve reads"
+        );
         assert!(
             !decommissioned.accepts_block_report_add(),
             "DECOMMISSIONED must ignore block report adds"
@@ -846,14 +1015,70 @@ mod tests {
     fn capability_matrix_matches_the_design() {
         // (admin, liveness, writable, readable, replicable_source, report_add)
         let expected = [
-            (AdminState::Normal, Liveness::Running, true, true, true, true),
-            (AdminState::Normal, Liveness::Stale, false, true, false, true),
-            (AdminState::Normal, Liveness::Lost, false, false, false, false),
-            (AdminState::Normal, Liveness::Shutdown, false, false, false, false),
-            (AdminState::Cordoned, Liveness::Running, false, true, true, true),
-            (AdminState::Cordoned, Liveness::Stale, false, true, false, true),
-            (AdminState::Cordoned, Liveness::Lost, false, false, false, false),
-            (AdminState::Cordoned, Liveness::Shutdown, false, false, false, false),
+            (
+                AdminState::Normal,
+                Liveness::Running,
+                true,
+                true,
+                true,
+                true,
+            ),
+            (
+                AdminState::Normal,
+                Liveness::Stale,
+                false,
+                true,
+                false,
+                true,
+            ),
+            (
+                AdminState::Normal,
+                Liveness::Lost,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                AdminState::Normal,
+                Liveness::Shutdown,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                AdminState::Cordoned,
+                Liveness::Running,
+                false,
+                true,
+                true,
+                true,
+            ),
+            (
+                AdminState::Cordoned,
+                Liveness::Stale,
+                false,
+                true,
+                false,
+                true,
+            ),
+            (
+                AdminState::Cordoned,
+                Liveness::Lost,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                AdminState::Cordoned,
+                Liveness::Shutdown,
+                false,
+                false,
+                false,
+                false,
+            ),
             (
                 AdminState::Decommissioning,
                 Liveness::Running,
@@ -862,8 +1087,22 @@ mod tests {
                 true,
                 true,
             ),
-            (AdminState::Decommissioning, Liveness::Stale, false, true, false, true),
-            (AdminState::Decommissioning, Liveness::Lost, false, false, false, false),
+            (
+                AdminState::Decommissioning,
+                Liveness::Stale,
+                false,
+                true,
+                false,
+                true,
+            ),
+            (
+                AdminState::Decommissioning,
+                Liveness::Lost,
+                false,
+                false,
+                false,
+                false,
+            ),
             (
                 AdminState::Decommissioning,
                 Liveness::Shutdown,
@@ -880,8 +1119,22 @@ mod tests {
                 false,
                 false,
             ),
-            (AdminState::Decommissioned, Liveness::Stale, false, false, false, false),
-            (AdminState::Decommissioned, Liveness::Lost, false, false, false, false),
+            (
+                AdminState::Decommissioned,
+                Liveness::Stale,
+                false,
+                false,
+                false,
+                false,
+            ),
+            (
+                AdminState::Decommissioned,
+                Liveness::Lost,
+                false,
+                false,
+                false,
+                false,
+            ),
             (
                 AdminState::Decommissioned,
                 Liveness::Shutdown,
@@ -897,7 +1150,12 @@ mod tests {
             assert_eq!(state.writable(), writable, "{:?} writable", state);
             assert_eq!(state.readable(), readable, "{:?} readable", state);
             assert_eq!(state.replicable_source(), source, "{:?} source", state);
-            assert_eq!(state.accepts_block_report_add(), report_add, "{:?} report", state);
+            assert_eq!(
+                state.accepts_block_report_add(),
+                report_add,
+                "{:?} report",
+                state
+            );
             assert_eq!(
                 state.replicable_target(),
                 writable,
@@ -925,8 +1183,16 @@ mod tests {
             reached.insert((state.admin(), state.liveness()));
 
             if state.admin() == AdminState::Decommissioned {
-                assert!(!state.readable(), "step {}: DECOMMISSIONED served reads", step);
-                assert!(!state.writable(), "step {}: DECOMMISSIONED took writes", step);
+                assert!(
+                    !state.readable(),
+                    "step {}: DECOMMISSIONED served reads",
+                    step
+                );
+                assert!(
+                    !state.writable(),
+                    "step {}: DECOMMISSIONED took writes",
+                    step
+                );
                 assert!(
                     !state.accepts_block_report_add(),
                     "step {}: DECOMMISSIONED accepted block report adds",
@@ -939,7 +1205,9 @@ mod tests {
         }
 
         assert!(
-            reached.iter().any(|(a, _)| *a == AdminState::Decommissioned),
+            reached
+                .iter()
+                .any(|(a, _)| *a == AdminState::Decommissioned),
             "random walk never reached DECOMMISSIONED; only {:?}",
             reached
         );

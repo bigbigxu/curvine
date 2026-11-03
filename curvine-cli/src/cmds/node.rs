@@ -156,7 +156,7 @@ impl NodeCommand {
             .chain(info.blacklist_workers.iter())
             .chain(info.decommission_workers.iter())
             .chain(info.lost_workers.iter())
-            .map(|worker| (worker.state().as_label(), worker))
+            .map(|worker| (worker.summary().as_str_name().to_string(), worker))
             .collect();
 
         // Unhealthy nodes first: the list exists to surface problems.
@@ -380,9 +380,7 @@ impl NodeCommand {
                     // legacy flags stay for scripts.
                     (true, false) | (false, false) => ("decommission", "decommissioning"),
                     (false, true) => ("live", "restored"),
-                    (true, true) => {
-                        return err_box!("Specify either --add or --remove, not both")
-                    }
+                    (true, true) => return err_box!("Specify either --add or --remove, not both"),
                 };
                 self.set_decommission_status(client, status.0, status.1, nodes.clone())
                     .await
@@ -395,25 +393,33 @@ impl NodeCommand {
                 self.set_decommission_status(client, "uncordon", "uncordoned", nodes.clone())
                     .await
             }
-            Some(NodeSubCommand::CancelDecommission { nodes }) => self
-                .set_decommission_status(
+            Some(NodeSubCommand::CancelDecommission { nodes }) => {
+                self.set_decommission_status(
                     client,
                     "cancel-decommission",
                     "cancelled the drain of",
                     nodes.clone(),
                 )
-                .await,
-            Some(NodeSubCommand::Recommission { nodes }) => self
-                .set_decommission_status(client, "recommission", "recommissioned", nodes.clone())
-                .await,
-            Some(NodeSubCommand::ForceDecommission { nodes }) => self
-                .set_decommission_status(
+                .await
+            }
+            Some(NodeSubCommand::Recommission { nodes }) => {
+                self.set_decommission_status(
+                    client,
+                    "recommission",
+                    "recommissioned",
+                    nodes.clone(),
+                )
+                .await
+            }
+            Some(NodeSubCommand::ForceDecommission { nodes }) => {
+                self.set_decommission_status(
                     client,
                     "force-decommission",
                     "force-completed the drain of",
                     nodes.clone(),
                 )
-                .await,
+                .await
+            }
         }
     }
 
