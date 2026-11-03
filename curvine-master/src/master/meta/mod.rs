@@ -36,6 +36,6 @@ mod glob_utils;
 pub use glob_utils::*;
 
 mod lock_meta;
-pub use self::lock_meta::LockMeta;
+pub use self::lock_meta::{LockMeta, LockValidity};
 
 pub mod trash;

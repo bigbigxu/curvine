@@ -21,7 +21,7 @@ use curvine_error::FsResult;
 use curvine_model::{
     apply, AdminState, BlockLocation, CommitBlock, ExtendedBlock, Facts, HeartbeatStatus, Liveness,
     LocatedBlock, StorageInfo, StorageType, TransferWorkerCapabilities, Trigger, WorkerAddress,
-    WorkerCommand, WorkerInfo, WorkerState, WorkerStatus,
+    WorkerCommand, WorkerInfo, WorkerState,
 };
 use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::{ByteUnit, LocalTime};
