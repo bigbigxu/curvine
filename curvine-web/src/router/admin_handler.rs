@@ -5477,7 +5477,6 @@ mod version_payload_tests {
     use curvine_model::WorkerAddress;
     use curvine_proto::ComponentInfoProto;
 
-    #[test]
     /// The console reads one state, not two axes: the JSON carries both the
     /// derived `state` and the axes it was derived from.
     #[test]
@@ -5514,6 +5513,7 @@ mod version_payload_tests {
         assert_eq!(value["worker_state"]["admin"], json!("cordoned"));
     }
 
+    #[test]
     fn worker_version_fields_use_software_version_and_commit() {
         let mut worker = WorkerInfo::new(
             WorkerAddress {
