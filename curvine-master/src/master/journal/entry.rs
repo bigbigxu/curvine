@@ -798,8 +798,7 @@ impl JournalEntry {
                         orphan_count: e.orphan_count.unwrap_or_default(),
                         forced_at_ms: e.forced_at_ms.unwrap_or_default(),
                         preflight_blocks: e.preflight_blocks.unwrap_or_default(),
-                        preflight_single_replica: e.preflight_single_replica
-                            .unwrap_or_default(),
+                        preflight_single_replica: e.preflight_single_replica.unwrap_or_default(),
                     },
                 })
             }

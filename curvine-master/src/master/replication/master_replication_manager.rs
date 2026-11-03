@@ -207,7 +207,10 @@ impl MasterReplicationManager {
         // ordinary repairs as well; only STALE/LOST/DECOMMISSIONED are not.
         let candidates: Vec<WorkerId> = match drain_source {
             Some(worker_id) => vec![worker_id],
-            None => locations.iter().map(|location| location.worker_id).collect(),
+            None => locations
+                .iter()
+                .map(|location| location.worker_id)
+                .collect(),
         };
         for worker_id in candidates {
             if let Some(worker) = worker_manager
@@ -854,16 +857,18 @@ impl MasterReplicationManager {
                             info!("Drain move for block {} is no longer needed", block_id);
                         }
                     }),
-                None => self.commit_replication_location(block_id, location).map(|added| {
-                    if added {
-                        info!("Successfully replicated {}", block_id);
-                    } else {
-                        info!(
-                            "Replication result for block {} no longer needs a metadata update",
-                            block_id
-                        );
-                    }
-                }),
+                None => self
+                    .commit_replication_location(block_id, location)
+                    .map(|added| {
+                        if added {
+                            info!("Successfully replicated {}", block_id);
+                        } else {
+                            info!(
+                                "Replication result for block {} no longer needs a metadata update",
+                                block_id
+                            );
+                        }
+                    }),
             };
         } else {
             error!(

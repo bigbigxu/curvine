@@ -18,8 +18,7 @@ pub use self::worker_manager::WorkerManager;
 mod worker_state;
 pub use self::worker_state::{
     legacy_status_of, resolve_action, state_from_legacy, DecommissionedCleanup, DrainProgress,
-    DrainStall, DrainTick,
-    WorkerDrainRegistry, WorkerTransition, ORPHAN_SAMPLE_LIMIT,
+    DrainStall, DrainTick, WorkerDrainRegistry, WorkerTransition, ORPHAN_SAMPLE_LIMIT,
 };
 
 mod heartbeat_checker;

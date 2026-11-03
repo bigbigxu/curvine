@@ -22,8 +22,8 @@ use crate::master::meta::{
     TrashScanPage,
 };
 
-use crate::master::fs::state::{SessionHeartbeat, SessionMap};
 use crate::master::fs::state::WorkerIntent;
+use crate::master::fs::state::{SessionHeartbeat, SessionMap};
 #[cfg(test)]
 use crate::master::fs::state_from_legacy;
 use crate::master::fs::worker_manager::WorkerManager;
@@ -101,7 +101,8 @@ pub struct MasterFilesystem {
     worker_location_locks: Arc<Vec<Mutex<()>>>,
     /// Drain progress for `DECOMMISSIONING` workers. Rebuilt from metadata after
     /// a restart, so it is deliberately not journaled.
-    pub(crate) worker_drains: std::sync::Arc<std::sync::Mutex<crate::master::fs::worker_state::WorkerDrainRegistry>>,
+    pub(crate) worker_drains:
+        std::sync::Arc<std::sync::Mutex<crate::master::fs::worker_state::WorkerDrainRegistry>>,
     /// Serialises drains of `/.Trash/.pending`. The blocking empty-trash call
     /// owns the staging directory across staging and draining, and the
     /// background purger skips a cycle while that lock is held, so the two can
@@ -2104,10 +2105,15 @@ impl MasterFilesystem {
         host: &str,
         intent: WorkerIntent,
     ) -> FsResult<Option<WorkerIntent>> {
-        let previous = self.worker_manager.write().record_intent(host, intent.clone());
+        let previous = self
+            .worker_manager
+            .write()
+            .record_intent(host, intent.clone());
 
         let fs_dir = self.fs_dir.read();
-        fs_dir.journal_writer.log_worker_intent(&fs_dir, host, intent)?;
+        fs_dir
+            .journal_writer
+            .log_worker_intent(&fs_dir, host, intent)?;
         Ok(previous)
     }
 
@@ -3646,7 +3652,10 @@ mod tests {
         let progress = fs.drain_progress(1).unwrap();
         assert_eq!(progress.remaining_count(), 1);
         assert_eq!(progress.single_replica_blocks, 1);
-        assert_eq!(progress.remaining.iter().copied().collect::<Vec<_>>(), vec![block_id]);
+        assert_eq!(
+            progress.remaining.iter().copied().collect::<Vec<_>>(),
+            vec![block_id]
+        );
     }
 
     #[test]
@@ -4190,9 +4199,15 @@ mod tests {
         );
 
         let previous = fs
-            .set_worker_intent(host, WorkerIntent::new(AdminState::Normal, "alice", "back", 0))
+            .set_worker_intent(
+                host,
+                WorkerIntent::new(AdminState::Normal, "alice", "back", 0),
+            )
             .unwrap();
-        assert_eq!(previous.map(|intent| intent.admin), Some(AdminState::Decommissioned));
+        assert_eq!(
+            previous.map(|intent| intent.admin),
+            Some(AdminState::Decommissioned)
+        );
         assert_eq!(
             fs.worker_manager.read().worker_map.intents.admin_of(host),
             AdminState::Normal,
@@ -4236,7 +4251,11 @@ mod tests {
             "a decommissioned worker must not be asked to delete its data"
         );
         assert!(
-            fs.fs_dir.read().get_worker_block_ids(99).unwrap().is_empty(),
+            fs.fs_dir
+                .read()
+                .get_worker_block_ids(99)
+                .unwrap()
+                .is_empty(),
             "a decommissioned worker must not re-enter the replica set"
         );
     }

@@ -116,16 +116,21 @@ impl LoopTask for HeartbeatChecker {
                     if let Err(e) = self.executor.spawn(move || {
                         match fs.drop_locations_of_decommissioned_hosts() {
                             Ok(cleanup) if !cleanup.under_replicated.is_empty() => {
-                                if let Err(e) = rm.report_under_replicated_blocks(
-                                    0,
-                                    cleanup.under_replicated,
-                                ) {
-                                    error!("cannot repair blocks after the promotion cleanup: {}", e);
+                                if let Err(e) =
+                                    rm.report_under_replicated_blocks(0, cleanup.under_replicated)
+                                {
+                                    error!(
+                                        "cannot repair blocks after the promotion cleanup: {}",
+                                        e
+                                    );
                                 }
                             }
                             Ok(_) => {}
                             Err(e) => {
-                                warn!("cannot restore decommissioned locations on promotion: {}", e)
+                                warn!(
+                                    "cannot restore decommissioned locations on promotion: {}",
+                                    e
+                                )
                             }
                         }
                     }) {
@@ -144,11 +149,7 @@ impl LoopTask for HeartbeatChecker {
                     // intent (design #9). The state change is applied under this
                     // write lock, so remember the previous state and record the
                     // event after the lock is released.
-                    let before = wm
-                        .worker_map
-                        .workers
-                        .get(&id)
-                        .map(|worker| worker.state());
+                    let before = wm.worker_map.workers.get(&id).map(|worker| worker.state());
                     if let Some(worker) = wm.mark_stale(id) {
                         stale_workers.push((id, worker.address, worker.last_update, before));
                     }
@@ -237,10 +238,9 @@ impl HeartbeatChecker {
                         transition.to_label(),
                         transition.under_replicated.len()
                     );
-                    if let Err(e) = rm.report_under_replicated_blocks(
-                        id,
-                        transition.under_replicated.clone(),
-                    ) {
+                    if let Err(e) =
+                        rm.report_under_replicated_blocks(id, transition.under_replicated.clone())
+                    {
                         error!(
                             "Errors on reporting under-replicated {} blocks. err: {:?}",
                             transition.under_replicated.len(),
@@ -289,7 +289,10 @@ impl HeartbeatChecker {
             }
         });
         if let Err(e) = res {
-            warn!("cannot schedule shutdown-grace expiry of worker {}: {}", id, e);
+            warn!(
+                "cannot schedule shutdown-grace expiry of worker {}: {}",
+                id, e
+            );
         }
     }
 
@@ -352,10 +355,10 @@ impl HeartbeatChecker {
                 transition.to_label()
             );
             for worker_id in &transition.worker_ids {
-                if let Err(e) = self.replication_manager.report_under_replicated_blocks(
-                    *worker_id,
-                    transition.under_replicated.clone(),
-                ) {
+                if let Err(e) = self
+                    .replication_manager
+                    .report_under_replicated_blocks(*worker_id, transition.under_replicated.clone())
+                {
                     error!(
                         "Errors on reporting under-replicated {} blocks. err: {:?}",
                         transition.under_replicated.len(),
@@ -365,7 +368,6 @@ impl HeartbeatChecker {
             }
         }
     }
-
 }
 
 #[cfg(test)]
@@ -505,7 +507,12 @@ mod tests {
             1,
             "STALE must not drop block locations"
         );
-        let worker = fs.worker_manager.read().get_worker(WORKER_ID).unwrap().clone();
+        let worker = fs
+            .worker_manager
+            .read()
+            .get_worker(WORKER_ID)
+            .unwrap()
+            .clone();
         assert_eq!(worker.liveness(), curvine_model::Liveness::Stale);
         assert_eq!(
             worker.admin(),
@@ -520,7 +527,10 @@ mod tests {
         let (fs, checker) = fixture("shutdown-grace");
         fs.master_monitor.journal_ctl.set_state(RoleState::Leader);
         checker.run().unwrap();
-        fs.worker_manager.write().shutdown_worker(WORKER_ID).unwrap();
+        fs.worker_manager
+            .write()
+            .shutdown_worker(WORKER_ID)
+            .unwrap();
 
         assert_eq!(location_count(&fs), 1, "an End heartbeat keeps data");
         assert_eq!(

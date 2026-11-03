@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::master::fs::state::WorkerIntentTable;
 use curvine_core_error::err_box;
 use curvine_error::{FsError, FsResult};
 use curvine_model::{
@@ -20,7 +21,6 @@ use curvine_model::{
 };
 use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::LocalTime;
-use crate::master::fs::state::WorkerIntentTable;
 use indexmap::IndexMap;
 use log::{error, info, warn};
 
@@ -283,12 +283,8 @@ impl WorkerMap {
 
         info!("remove offline worker {}", worker.address);
         let mut worker = worker;
-        let (state, _) = apply(
-            worker.state(),
-            Trigger::GracefulShutdown,
-            &Facts::default(),
-        )
-        .ok()?;
+        let (state, _) =
+            apply(worker.state(), Trigger::GracefulShutdown, &Facts::default()).ok()?;
         worker.apply_state(state);
         // The grace period is anchored at the moment the process said goodbye.
         worker.last_update = LocalTime::mills();
@@ -310,4 +306,3 @@ impl WorkerMap {
             .is_some_and(|worker| worker.worker_session_id == worker_session_id)
     }
 }
-

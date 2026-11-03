@@ -22,8 +22,8 @@
 //! stores the record and its provenance.
 
 use curvine_model::AdminState;
-use serde::{Deserialize, Serialize};
 use curvine_runtime::common::LocalTime;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// One operator decision about one host.

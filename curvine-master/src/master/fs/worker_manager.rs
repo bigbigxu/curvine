@@ -453,8 +453,7 @@ impl WorkerManager {
         // A cordoned or draining worker still heartbeats: only its liveness axis
         // can make a session invalid.
         self.get_worker(worker_id).is_some_and(|worker| {
-            worker.liveness() == Liveness::Running
-                && worker.worker_session_id == worker_session_id
+            worker.liveness() == Liveness::Running && worker.worker_session_id == worker_session_id
         })
     }
 

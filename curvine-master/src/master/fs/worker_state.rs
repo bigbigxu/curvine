@@ -150,7 +150,10 @@ impl WorkerDrainRegistry {
     }
 
     pub fn total_remaining(&self) -> u64 {
-        self.by_worker.values().map(DrainProgress::remaining_count).sum()
+        self.by_worker
+            .values()
+            .map(DrainProgress::remaining_count)
+            .sum()
     }
 
     pub fn moved(&self, worker_id: u32) -> u64 {
@@ -181,7 +184,8 @@ impl WorkerDrainRegistry {
     }
 
     pub fn retain_workers(&mut self, keep: &[u32]) {
-        self.by_worker.retain(|worker_id, _| keep.contains(worker_id));
+        self.by_worker
+            .retain(|worker_id, _| keep.contains(worker_id));
     }
 }
 
@@ -225,9 +229,7 @@ impl WorkerTransition {
 /// code must obtain states from the state machine.
 pub fn state_from_legacy(status: WorkerStatus) -> WorkerState {
     match status {
-        WorkerStatus::Live | WorkerStatus::Unknown => {
-            WorkerState::registered(AdminState::Normal)
-        }
+        WorkerStatus::Live | WorkerStatus::Unknown => WorkerState::registered(AdminState::Normal),
         WorkerStatus::Blacklist => WorkerState::new(AdminState::Normal, Liveness::Stale),
         WorkerStatus::Decommission => {
             WorkerState::new(AdminState::Decommissioned, Liveness::Running)
@@ -287,7 +289,11 @@ pub fn resolve_action(status: &str, current: AdminState) -> FsResult<Trigger> {
         }
         "recommission" => Trigger::Recommission,
         "force-decommission" | "force_decommission" => Trigger::ForceDecommission,
-        "live" | "allow" | "remove-blacklist" | "remove_blacklist" | "remove-decommission"
+        "live"
+        | "allow"
+        | "remove-blacklist"
+        | "remove_blacklist"
+        | "remove-decommission"
         | "remove_decommission" => match current {
             AdminState::Decommissioned => Trigger::Recommission,
             AdminState::Decommissioning => Trigger::CancelDecommission,
@@ -638,7 +644,13 @@ impl MasterFilesystem {
             }
         }
 
-        let previous = self.worker_manager.read().worker_map.intents.get(host).cloned();
+        let previous = self
+            .worker_manager
+            .read()
+            .worker_map
+            .intents
+            .get(host)
+            .cloned();
         if let Some(mut intent) = previous {
             intent.preflight_blocks = total;
             intent.preflight_single_replica = single_replica;
@@ -1162,13 +1174,7 @@ impl MasterFilesystem {
     /// `count_single_replica` is only set for the preflight scan: the exact count
     /// needs one location lookup per block, so it is not repeated on every
     /// periodic rescan. The periodic scan only walks the `CF_LOCATION` prefix.
-    fn refresh_drain_scan(
-        &self,
-        worker_id: u32,
-        host: &str,
-        now: u64,
-        count_single_replica: bool,
-    ) {
+    fn refresh_drain_scan(&self, worker_id: u32, host: &str, now: u64, count_single_replica: bool) {
         let (ids, single_replica) = {
             let fs_dir = self.fs_dir.read();
             let ids = match fs_dir.get_worker_block_ids(worker_id) {
@@ -1345,7 +1351,12 @@ impl MasterFilesystem {
                         || worker.address.ip_addr == selector
                 }
             };
-            if let Some(worker) = wm.worker_map.workers.values().find(|worker| matches(worker)) {
+            if let Some(worker) = wm
+                .worker_map
+                .workers
+                .values()
+                .find(|worker| matches(worker))
+            {
                 return Ok(worker.address.hostname.clone());
             }
             if let Some(worker) = wm
