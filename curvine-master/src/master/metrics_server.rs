@@ -23,6 +23,7 @@ use axum::{Extension, Json, Router};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;
 use curvine_net::net::{InetAddr, NetUtils};
+use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_rpc::server::ServerConf;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_web::router::ConfigViewState;
@@ -39,6 +40,8 @@ use crate::master::{Master, MasterState};
 #[derive(Clone)]
 struct MasterMetricsHandler {
     fs: MasterFilesystem,
+    /// Journal RocksDB store, exported with the `journal_` metric prefix.
+    journal_store: RocksLogStorage,
     /// Snapshot plus live registry behind the `/config` routes.
     config_view: Arc<ConfigViewState>,
     runtime: MasterRuntimeMetadata,
@@ -54,7 +57,7 @@ struct MasterRuntimeMetadata {
 
 async fn metrics(Extension(handler): Extension<Arc<MasterMetricsHandler>>) -> FsResult<String> {
     let metrics = Master::get_metrics()?;
-    Ok(metrics.text_output(handler.fs.clone())?)
+    Ok(metrics.text_output(handler.fs.clone(), Some(&handler.journal_store))?)
 }
 
 async fn healthz(
@@ -209,6 +212,7 @@ fn metrics_router(handler: MasterMetricsHandler) -> Router {
 pub struct MasterMetricsServer {
     rt: Arc<Runtime>,
     fs: MasterFilesystem,
+    journal_store: RocksLogStorage,
     conf: ServerConf,
     address: InetAddr,
     /// Snapshot plus live registry behind the `/config` routes.
@@ -219,10 +223,12 @@ pub struct MasterMetricsServer {
 }
 
 impl MasterMetricsServer {
+    #[allow(clippy::too_many_arguments)]
     pub fn with_rt(
         rt: Arc<Runtime>,
         conf: ServerConf,
         fs: MasterFilesystem,
+        journal_store: RocksLogStorage,
         config_view: Arc<ConfigViewState>,
         start_time: String,
         start_time_ms: u64,
@@ -232,6 +238,7 @@ impl MasterMetricsServer {
         Self {
             rt,
             fs,
+            journal_store,
             conf,
             address,
             config_view,
@@ -265,6 +272,7 @@ impl MasterMetricsServer {
                     if let Err(err) = Self::serve(
                         listener,
                         self.fs,
+                        self.journal_store,
                         self.config_view,
                         self.runtime,
                         self.profiling,
@@ -300,9 +308,11 @@ impl MasterMetricsServer {
         format!("{hostname}:{}", self.address.port)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn serve(
         listener: TcpListener,
         fs: MasterFilesystem,
+        journal_store: RocksLogStorage,
         config_view: Arc<ConfigViewState>,
         runtime: MasterRuntimeMetadata,
         profiling: curvine_config::ProfilingConf,
@@ -315,6 +325,7 @@ impl MasterMetricsServer {
         );
         let app = metrics_router(MasterMetricsHandler {
             fs,
+            journal_store,
             config_view,
             runtime,
             profiling,
@@ -328,6 +339,7 @@ impl MasterMetricsServer {
         Self::serve(
             listener,
             self.fs,
+            self.journal_store,
             self.config_view,
             self.runtime,
             self.profiling,

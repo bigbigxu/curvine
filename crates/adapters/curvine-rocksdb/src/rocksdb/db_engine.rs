@@ -248,7 +248,13 @@ impl DBEngine {
     // Create a checkpoint.
     pub fn create_checkpoint(&self, id: u64) -> CommonResult<String> {
         self.flush(true)?;
+        self.create_flushed_checkpoint(id)
+    }
 
+    // Create a checkpoint without flushing first. The caller must call `flush(true)`
+    // before, so the checkpoint holds every write. Callers that time the flush and the
+    // checkpoint separately use this; everyone else uses `create_checkpoint`.
+    pub fn create_flushed_checkpoint(&self, id: u64) -> CommonResult<String> {
         let checkpoint_path = self.get_checkpoint_path(id);
         let existed = FileUtils::exists(&checkpoint_path);
 
@@ -378,8 +384,10 @@ impl DBEngine {
     ///
     /// **Units** (properties not listed below are usually **bytes**)
     /// - **Counts**: `rocksdb.num-immutable-mem-table`, `rocksdb.num-snapshots`, `rocksdb.num-live-versions`,
-    ///   `rocksdb.num-running-flushes`, `rocksdb.num-running-compactions`.
-    /// - **0/1 flags**: `rocksdb.compaction-pending`, `rocksdb.mem-table-flush-pending`.
+    ///   `rocksdb.num-running-flushes`, `rocksdb.num-running-compactions`, `rocksdb.num-files-at-level0`,
+    ///   `rocksdb.estimate-num-keys`.
+    /// - **0/1 flags**: `rocksdb.compaction-pending`, `rocksdb.mem-table-flush-pending`, `rocksdb.is-write-stopped`.
+    /// - **Rate**: `rocksdb.actual-delayed-write-rate` is **bytes per second**.
     /// - **Time**: `rocksdb.oldest-snapshot-time` is **Unix seconds** (may be 0 when no snapshot, depending on RocksDB version).
     ///
     /// **DB-level metrics (via `property_int_value`; mostly shared cache + process-wide counters)**
@@ -406,6 +414,13 @@ impl DBEngine {
     /// | `rocksdb.num-snapshots` | Unreleased **Snapshot** count (holding snapshots pins old SSTs). |
     /// | `rocksdb.oldest-snapshot-time` | **Unix timestamp (seconds)** of the oldest snapshot. |
     ///
+    /// **DB-level metrics (write stalls)**
+    ///
+    /// | Property suffix | Meaning |
+    /// |-----------------|---------|
+    /// | `rocksdb.actual-delayed-write-rate` | Rate (bytes/s) writes are throttled to while delayed; **0** when writes are not delayed. |
+    /// | `rocksdb.is-write-stopped` | Whether writes are **stopped** (**0/1**), e.g. after L0 reached `level0_stop_writes_trigger`. |
+    ///
     /// **CF-level metrics (per column family)**
     ///
     /// | Property suffix | Meaning |
@@ -423,6 +438,14 @@ impl DBEngine {
     /// | `rocksdb.compaction-pending` | Whether compaction is pending (**0/1**). |
     /// | `rocksdb.mem-table-flush-pending` | Whether memtable flush is pending (**0/1**). |
     /// | `rocksdb.estimate-pending-compaction-bytes` | Estimated bytes to rewrite for pending compaction (level-style, **bytes**). |
+    /// | `rocksdb.num-files-at-level0` | Number of **L0** SST files; writes slow down at `level0_slowdown_writes_trigger` and stop at `level0_stop_writes_trigger`. |
+    ///
+    /// **CF-level metrics (on-disk size)**
+    ///
+    /// | Property suffix | Meaning |
+    /// |-----------------|---------|
+    /// | `rocksdb.total-sst-files-size` | Size of **all** SST files of this CF, including obsolete files not deleted yet (bytes). |
+    /// | `rocksdb.estimate-num-keys` | **Estimated** number of keys in this CF (memtables and SST files; deletes and overwrites make it approximate). |
     ///
     /// **CF-level metrics (versions / long-lived readers)**
     ///
@@ -451,6 +474,9 @@ impl DBEngine {
     /// - `db_rocksdb_block_cache_hit_count` / `db_rocksdb_block_cache_miss_count` / `db_rocksdb_block_cache_hit_rate_ppm`:
     ///   from `rocksdb.options-statistics` (needs `enable_statistics` in `create_db_opts`). Hit rate is
     ///   `hit / (hit + miss)` scaled to **parts per million** (0–1_000_000); if both are zero, ppm is 0.
+    /// - `db_rocksdb_stall_micros`: cumulative time (microseconds) writes were delayed or stopped by write
+    ///   stalls, from the `rocksdb.stall.micros` ticker of `rocksdb.options-statistics`. Like the block cache
+    ///   keys it needs `enable_statistics`; without it the key is absent.
     pub fn get_rocksdb_metrics(&self) -> CommonResult<HashMap<String, u64>> {
         let mut info = HashMap::new();
 
@@ -465,6 +491,8 @@ impl DBEngine {
             properties::NUM_RUNNING_COMPACTIONS,
             properties::NUM_SNAPSHOTS,
             properties::OLDEST_SNAPSHOT_TIME,
+            properties::ACTUAL_DELAYED_WRITE_RATE,
+            properties::IS_WRITE_STOPPED,
         ];
         for key in db_keys {
             if let Some(value) = self.db.property_int_value(key)? {
@@ -472,7 +500,9 @@ impl DBEngine {
             }
         }
 
-        // CF scope: memtables, immutables, table readers; compaction/flush backlog; live versions.
+        // CF scope: memtables, immutables, table readers; compaction/flush backlog; live versions;
+        // L0 backlog, SST size and key count.
+        let num_files_at_level0 = properties::num_files_at_level(0);
         let cf_keys = vec![
             properties::CUR_SIZE_ALL_MEM_TABLES,
             properties::CUR_SIZE_ACTIVE_MEM_TABLE,
@@ -483,6 +513,9 @@ impl DBEngine {
             properties::MEM_TABLE_FLUSH_PENDING,
             properties::ESTIMATE_PENDING_COMPACTION_BYTES,
             properties::NUM_LIVE_VERSIONS,
+            &*num_files_at_level0,
+            properties::TOTAL_SST_FILES_SIZE,
+            properties::ESTIMATE_NUM_KEYS,
         ];
 
         for cf_name in &self.conf.family_list {
@@ -512,6 +545,9 @@ impl DBEngine {
                 .checked_div(denom)
                 .unwrap_or(0);
             info.insert("db_rocksdb_block_cache_hit_rate_ppm".to_string(), ppm);
+            let stall =
+                Self::parse_statistics_ticker_u64(&stats, Ticker::StallMicros.name()).unwrap_or(0);
+            info.insert("db_rocksdb_stall_micros".to_string(), stall);
         }
 
         Ok(info)
@@ -598,5 +634,27 @@ impl<'a> DbReadSnapshot<'a> {
             Some(v) => Ok(v),
             None => err_box!("cf {} not exists", name),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DBEngine;
+    use rocksdb::statistics::Ticker;
+
+    #[test]
+    fn parse_statistics_ticker_reads_stall_micros() {
+        let stats = "rocksdb.block.cache.hit COUNT : 7\n\
+                     rocksdb.stall.micros COUNT : 1234\n\
+                     rocksdb.db.get.micros P50 : 1.000000 P95 : 2.000000 COUNT : 3 SUM : 4\n";
+
+        assert_eq!(
+            DBEngine::parse_statistics_ticker_u64(stats, Ticker::StallMicros.name()),
+            Some(1234)
+        );
+        assert_eq!(
+            DBEngine::parse_statistics_ticker_u64(stats, Ticker::BlockCacheMiss.name()),
+            None
+        );
     }
 }

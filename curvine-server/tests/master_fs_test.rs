@@ -625,7 +625,7 @@ fn client_heartbeat_rpc_to_standby_is_rejected() -> CommonResult<()> {
 fn rpc_queue_count(fs: &MasterFilesystem, executor: &str) -> u64 {
     let text = Master::get_metrics()
         .expect("test master metrics should initialize")
-        .text_output(fs.clone())
+        .text_output(fs.clone(), None)
         .expect("metrics text output should render");
     // Match on the metric name plus the executor label instead of the exact
     // label string: samples may carry extra process-wide labels (cluster_id),

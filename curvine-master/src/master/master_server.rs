@@ -20,11 +20,13 @@ use curvine_config::{ClusterConf, ConfigSourceMap, RuntimeConfigRegistry, ViewPr
 use curvine_core_error::{err_box, CommonError, CommonResult};
 use curvine_fault::FaultHttpControl;
 use curvine_net::net::ConnState;
+use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_rpc::handler::{HandlerService, LimitConf};
 use curvine_rpc::server::{RpcServer, ServerStateListener};
 use curvine_runtime::common::{LocalTime, Logger};
 use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime, Runtime};
 use curvine_web::router::ConfigViewState;
+use curvine_web::server::WebHandlerService;
 use log::{error, info};
 
 use crate::master::build_master_runtime_registry;
@@ -32,6 +34,7 @@ use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
 use crate::master::metrics_server::{wait_for_metrics_bind, MasterMetricsServer};
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
+use crate::master::router_handler::MasterRouterHandler;
 use crate::master::space::DirSpaceManager;
 use crate::master::{JobHandler, MountManager};
 use crate::master::{JobManager, MasterHandler};
@@ -56,6 +59,8 @@ pub struct MasterService {
     runtime_config: Arc<RuntimeConfigRegistry>,
     /// Shared dir-space query facade; `None` when the feature is disabled.
     pub dir_space_manager: Option<Arc<DirSpaceManager>>,
+    /// Journal RocksDB store; its metrics are exported with a `journal_` prefix.
+    journal_store: RocksLogStorage,
 }
 
 impl MasterService {
@@ -73,6 +78,7 @@ impl MasterService {
         runtime_config: Arc<RuntimeConfigRegistry>,
         limit: LimitConf,
         dir_space_manager: Option<Arc<DirSpaceManager>>,
+        journal_store: RocksLogStorage,
     ) -> Self {
         let actor_rt = Arc::new(AsyncRuntime::new(
             "master-actor",
@@ -95,6 +101,7 @@ impl MasterService {
             fault_http,
             runtime_config,
             dir_space_manager,
+            journal_store,
         }
     }
 
@@ -145,6 +152,20 @@ impl HandlerService for MasterService {
 
     fn get_limit(&self) -> LimitConf {
         self.limit.clone()
+    }
+}
+
+impl WebHandlerService for MasterService {
+    type Item = MasterRouterHandler;
+
+    fn get_handler(&self) -> Self::Item {
+        MasterRouterHandler::new(
+            self.conf.clone(),
+            self.fs.clone(),
+            self.metrics,
+            self.fault_http.clone(),
+            self.journal_store.clone(),
+        )
     }
 }
 
@@ -244,6 +265,7 @@ impl Master {
             runtime_config.clone(),
             limit,
             Some(dir_space_manager),
+            journal_system.log_store(),
         );
 
         let rpc_conf = conf.master_server_conf();
@@ -252,6 +274,7 @@ impl Master {
             rt,
             conf.master_metrics_conf(),
             metrics_fs,
+            journal_system.log_store(),
             config_view,
             start_time,
             start_time_ms,
