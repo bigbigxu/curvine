@@ -346,13 +346,23 @@ impl MasterConf {
             block_based_bloom_filter: true,
             cache_index_and_filter_blocks: true,
             pin_l0_filter_and_index_blocks_in_cache: true,
-            block_cache_size: ByteUnit::gb(2),
+            // Production baseline for a 10-50M inode master with 32-64GB memory
+            // and at least 6 cores. Smaller masters should lower
+            // `block_cache_size` and `max_background_jobs`. A `[master.rocksdb]`
+            // table replaces these defaults (unset keys fall back to
+            // `DBConf::default()`), so copy the full block from
+            // etc/curvine-cluster.toml and keep it in sync with this function.
+            block_cache_size: ByteUnit::gb(4),
             bytes_per_sync: ByteUnit::mb(1),
             compaction_readahead_size: ByteUnit::mb(2),
-            max_background_jobs: (Utils::cpu_nums() / 2).clamp(2, 8),
+            max_background_jobs: 6,
+            max_subcompactions: 2,
             db_write_buffer_size: ByteUnit::mb(512),
             max_write_buffer_number: 4,
             level0_file_num_compaction_trigger: 4,
+            compression_type: DBConf::COMPRESSION_LZ4.to_string(),
+            max_bytes_for_level_base: ByteUnit::gb(2),
+            enable_statistics: true,
             format_version: 5,
             block_cache_type: DBConf::BLOCK_CACHE_LRU.to_string(),
             scan_fill_cache: true,
@@ -705,6 +715,18 @@ mod tests {
         assert!(
             toml::from_str::<MasterConf>("[rocksdb]\nmax_background_jobs = 'invalid'").is_err()
         );
+    }
+
+    #[test]
+    fn rocksdb_defaults_match_production_baseline() {
+        let rocksdb = MasterConf::default().rocksdb;
+
+        assert_eq!(rocksdb.block_cache_size, ByteUnit::gb(4));
+        assert_eq!(rocksdb.max_background_jobs, 6);
+        assert_eq!(rocksdb.max_subcompactions, 2);
+        assert_eq!(rocksdb.compression_type, DBConf::COMPRESSION_LZ4);
+        assert_eq!(rocksdb.max_bytes_for_level_base, ByteUnit::gb(2));
+        assert!(rocksdb.enable_statistics);
     }
 
     #[test]
