@@ -652,6 +652,9 @@ impl ProtoUtils {
                 // Master-only in-flight reservation; not carried on proto.
                 scheduled_bytes: 0,
                 scheduled_since_ms: 0,
+                scheduled_blocks: Default::default(),
+                scheduled_block_bytes: 0,
+                scheduled_seq: 0,
                 // The wire format only carries the legacy single-axis status; it
                 // is projected back onto the two axes here. A peer that speaks
                 // only the old format therefore cannot express cordon or drain.
