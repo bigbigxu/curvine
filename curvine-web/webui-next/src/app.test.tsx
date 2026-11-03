@@ -41,6 +41,7 @@ function workerClient(): Partial<ApiClient> {
     hostname: 'worker-01',
     software_version: version,
     status: 'Live',
+    worker_state: { admin: 'normal', liveness: 'running', writable: true, readable: true },
     capacity: 2048,
     available: 1024,
     block_num: 7,
@@ -308,8 +309,20 @@ describe('Console shell', () => {
   it('renders the workers page filters and empty state', async () => {
     renderApp('/workers', createStubClient())
 
-    expect(await screen.findByTestId('workers-filter-live')).toBeInTheDocument()
+    // The filter set follows the two state axes: four admin states plus the
+    // non-running liveness values.
+    expect(await screen.findByTestId('workers-filter-normal')).toBeInTheDocument()
+    expect(screen.getByTestId('workers-filter-decommissioning')).toBeInTheDocument()
+    expect(screen.getByTestId('workers-filter-stale')).toBeInTheDocument()
     expect(await screen.findByTestId('workers-search')).toBeInTheDocument()
+  })
+
+  it('renders the worker state from the two axes', async () => {
+    renderApp('/workers', createStubClient(workerClient()))
+
+    // Admin intent and liveness are shown as one badge; a running node shows the
+    // admin state alone.
+    expect(await screen.findByTestId('worker-state-worker-01:8995')).toHaveTextContent('Normal')
   })
 
   it('gives the reported worker version its own column', async () => {

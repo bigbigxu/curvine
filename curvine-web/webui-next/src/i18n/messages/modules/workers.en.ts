@@ -30,10 +30,25 @@ export default {
     },
     filters: {
       all: 'All',
-      live: 'Live',
-      blacklist: 'Blacklist',
-      decommission: 'Decommission',
-      lost: 'Lost'
+      normal: 'Normal',
+      cordoned: 'Cordoned',
+      decommissioning: 'Decommissioning',
+      decommissioned: 'Decommissioned',
+      stale: 'Stale',
+      lost: 'Lost',
+      shutdown: 'Shutdown'
+    },
+    states: {
+      normal: 'Normal',
+      cordoned: 'Cordoned',
+      decommissioning: 'Decommissioning',
+      decommissioned: 'Decommissioned'
+    },
+    liveness: {
+      running: 'Running',
+      stale: 'Stale',
+      lost: 'Lost',
+      shutdown: 'Shutdown'
     },
     health: {
       healthy: 'Healthy',
@@ -48,18 +63,28 @@ export default {
     },
     actions: {
       detail: 'Detail',
-      addBlacklist: 'AddBlacklist',
-      allow: 'Allow',
+      cordon: 'Cordon',
+      uncordon: 'Uncordon',
       decommission: 'Decommission',
+      cancelDecommission: 'Cancel drain',
+      forceDecommission: 'Force retire',
       recommission: 'Recommission',
       profile: 'Profile',
       confirm: '{action} worker {worker}?',
+      forceConfirm: 'Force-retire worker {worker}? Blocks that could not be moved are deleted, and blocks with no other replica become unreadable.',
+      forceWarning: 'This deletes the blocks left on the node; the data cannot be restored by recommissioning it.',
+      cancelHint: 'The drain stops and the node stays cordoned (no data is touched).',
+      decommissionHint: 'Blocks are copied off the node first; the node stays readable until the drain finishes.'
     },
     actionVerb: {
-      blacklist: 'blacklist',
-      allow: 'allow',
+      cordon: 'cordon',
+      uncordon: 'uncordon',
       decommission: 'decommission',
-      recommission: 'recommission'
+      'cancel-decommission': 'cancel drain',
+      'force-decommission': 'force retire',
+      recommission: 'recommission',
+      blacklist: 'cordon',
+      allow: 'uncordon'
     },
     detail: {
       title: 'Worker Detail',

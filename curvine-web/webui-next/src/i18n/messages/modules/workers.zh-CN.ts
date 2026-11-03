@@ -30,10 +30,25 @@ export default {
     },
     filters: {
       all: '全部',
-      live: '在线',
-      blacklist: '黑名单',
-      decommission: '下线',
-      lost: '丢失'
+      normal: '正常',
+      cordoned: '只出不进',
+      decommissioning: '搬空中',
+      decommissioned: '已下线',
+      stale: '心跳迟到',
+      lost: '失联',
+      shutdown: '已退出'
+    },
+    states: {
+      normal: '正常',
+      cordoned: '只出不进',
+      decommissioning: '搬空中',
+      decommissioned: '已下线'
+    },
+    liveness: {
+      running: '心跳正常',
+      stale: '心跳迟到',
+      lost: '失联',
+      shutdown: '已退出'
     },
     health: {
       healthy: '健康',
@@ -48,18 +63,28 @@ export default {
     },
     actions: {
       detail: '详情',
-      addBlacklist: '加入黑名单',
-      allow: '允许',
+      cordon: '停止接新数据',
+      uncordon: '恢复接新数据',
       decommission: '下线',
-      recommission: '重新上线',
+      cancelDecommission: '取消搬空',
+      forceDecommission: '强制退役',
+      recommission: '接回集群',
       profile: '火焰图',
       confirm: '{action} Worker {worker}？',
+      forceConfirm: '强制退役 Worker {worker}？未能搬走的块会被删除，其中没有其它副本的块将不可读。',
+      forceWarning: '该操作会删除节点上的残留块，之后接回集群也无法恢复。',
+      cancelHint: '停止搬空，节点停在「只出不进」，数据不动。',
+      decommissionHint: '先把块搬到其它节点，搬空之前节点仍可读。'
     },
     actionVerb: {
-      blacklist: '加入黑名单',
-      allow: '允许',
+      cordon: '停止接新数据',
+      uncordon: '恢复接新数据',
       decommission: '下线',
-      recommission: '重新上线'
+      'cancel-decommission': '取消搬空',
+      'force-decommission': '强制退役',
+      recommission: '接回集群',
+      blacklist: '停止接新数据',
+      allow: '恢复接新数据'
     },
     detail: {
       title: 'Worker 详情',

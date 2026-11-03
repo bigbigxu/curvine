@@ -172,14 +172,29 @@ export function statusTone(value: string | null | undefined): StatusTone {
  */
 export function workerStatusTone(status: string | null | undefined): StatusTone {
   switch (String(status ?? '').trim().toLowerCase()) {
+    // Legacy single-axis values.
     case 'live':
       return 'positive'
-    case 'lost':
-      return 'negative'
     case 'blacklist':
       return 'warning'
     case 'decommission':
       return 'info'
+    // CV-60 admin axis.
+    case 'normal':
+      return 'positive'
+    case 'cordoned':
+      return 'warning'
+    case 'decommissioning':
+      return 'info'
+    case 'decommissioned':
+      return 'neutral'
+    // CV-60 liveness axis.
+    case 'stale':
+      return 'warning'
+    case 'lost':
+      return 'negative'
+    case 'shutdown':
+      return 'neutral'
     default:
       return 'neutral'
   }
@@ -188,11 +203,13 @@ export function workerStatusTone(status: string | null | undefined): StatusTone 
 export function StatusBadge({
   value,
   className,
-  tone
+  tone,
+  testId
 }: {
   value: string
   className?: string
   tone?: StatusTone
+  testId?: string
 }) {
   const resolved = tone ?? statusTone(value)
   return (
@@ -200,6 +217,7 @@ export function StatusBadge({
       variant="outline"
       className={cn('gap-1.5', statusToneClasses[resolved], className)}
       data-tone={resolved}
+      data-testid={testId}
     >
       <span aria-hidden className={cn('size-1.5 rounded-full', statusDotClasses[resolved])} />
       {value}

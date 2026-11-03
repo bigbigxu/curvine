@@ -21,6 +21,12 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '
 import { TableCell, TableRow } from '@/components/ui/table'
 import { useT } from '@/i18n'
 import {
+  availableWorkerActions,
+  workerActionOption,
+  workerAdmin,
+  workerLiveness,
+} from '@/lib/worker-state'
+import {
   formatBytes,
   formatTime,
   versionsMismatch,
@@ -29,7 +35,6 @@ import {
   workerId,
   workerShortVersion
 } from '@/lib/format'
-import { translateStatus, translateWorkerAction } from '@/lib/i18nLabels'
 import { useMasterRuntime } from '@/master-runtime/master-runtime-context'
 import { cn } from '@/lib/utils'
 import { PANEL_FALLBACK_CLASS, PANEL_SHARE, useContentWidth } from '@/lib/use-content-width'
@@ -99,14 +104,19 @@ export function WorkerDetailSheet({
   const { data, loading, error, reload } = useAsync(load, [load])
 
   const worker = data?.worker ?? {}
-  const rawStatus = data?.state || worker.status || ''
+  // Prefer the structured axes; fall back to the legacy `state`/`status` string
+  // an old master still returns.
+  const admin = workerAdmin({ ...worker, status: worker.status ?? data?.state })
+  const liveness = workerLiveness({ ...worker, status: worker.status ?? data?.state })
+  const stateLabel =
+    liveness === 'running' ? t(`workers.states.${admin}`) : `${t(`workers.states.${admin}`)} · ${t(`workers.liveness.${liveness}`)}`
   const address = workerAddress(worker)
   const shortVersion = String(data?.version || workerShortVersion(worker) || '').trim()
   const versionIssue = versionsMismatch(shortVersion, runtime.version)
   const storageItems: WorkerStorageInfo[] = Object.values(worker.storage_map || {})
   const usage = usagePercent(worker.capacity, worker.available)
   const displayIp = worker.display_ip || worker.address?.ip_addr || '-'
-  const manageable = rawStatus !== 'Lost'
+  const actions = availableWorkerActions(admin)
 
   const titleParts = [workerHostname(worker), workerAddress(worker)]
   if (displayIp !== '-') titleParts.push(`${t('workers.detail.runtime.ip')} ${displayIp}`)
@@ -157,46 +167,17 @@ export function WorkerDetailSheet({
                 <SheetDescription className="truncate">{titleParts.join(' - ')}</SheetDescription>
               </div>
               <div className="ml-auto flex flex-wrap items-center gap-2">
-                {manageable && rawStatus !== 'Blacklist' && (
+                {actions.map((option) => (
                   <Button
-                    variant="outline"
+                    key={option.action}
+                    variant={option.destructive ? 'destructive' : 'outline'}
                     size="sm"
-                    onClick={() => setPendingAction('blacklist')}
-                    data-testid="worker-detail-blacklist"
+                    onClick={() => setPendingAction(option.action)}
+                    data-testid={`worker-detail-${option.action}`}
                   >
-                    {t('workers.actions.addBlacklist')}
+                    {t(option.labelKey)}
                   </Button>
-                )}
-                {rawStatus === 'Blacklist' && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setPendingAction('allow')}
-                    data-testid="worker-detail-allow"
-                  >
-                    {t('workers.actions.allow')}
-                  </Button>
-                )}
-                {manageable && rawStatus !== 'Decommission' && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setPendingAction('decommission')}
-                    data-testid="worker-detail-decommission"
-                  >
-                    {t('workers.actions.decommission')}
-                  </Button>
-                )}
-                {rawStatus === 'Decommission' && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setPendingAction('recommission')}
-                    data-testid="worker-detail-recommission"
-                  >
-                    {t('workers.actions.recommission')}
-                  </Button>
-                )}
+                ))}
               </div>
             </div>
           </SheetHeader>
@@ -208,8 +189,9 @@ export function WorkerDetailSheet({
               <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                 <SummaryTile label={t('workers.list.headerStatus')}>
                   <StatusBadge
-                    value={rawStatus ? translateStatus(t, rawStatus) : '-'}
-                    tone={workerStatusTone(rawStatus)}
+                    value={stateLabel}
+                    tone={workerStatusTone(liveness === 'running' ? admin : liveness)}
+                    testId="worker-detail-state"
                   />
                 </SummaryTile>
                 <SummaryTile label={t('workers.list.headerUsage')}>
@@ -411,15 +393,31 @@ export function WorkerDetailSheet({
 
       <ConfirmDialog
         open={pendingAction !== null}
-        title={translateWorkerAction(t, pendingAction ?? '')}
-        description={t('workers.actions.confirm', {
-          action: translateWorkerAction(t, pendingAction ?? ''),
-          worker: address
-        })}
+        title={pendingAction ? t(workerActionOption(pendingAction).labelKey) : ''}
+        description={(() => {
+          if (!pendingAction) return ''
+          const option = workerActionOption(pendingAction)
+          if (option.dataLoss) {
+            return `${t('workers.actions.forceConfirm', { worker: address })} ${t(
+              'workers.actions.forceWarning'
+            )}`
+          }
+          const base = t('workers.actions.confirm', {
+            action: t(option.labelKey),
+            worker: address
+          })
+          if (pendingAction === 'decommission') {
+            return `${base} ${t('workers.actions.decommissionHint')}`
+          }
+          if (pendingAction === 'cancel-decommission') {
+            return `${base} ${t('workers.actions.cancelHint')}`
+          }
+          return base
+        })()}
         confirmLabel={t('common.confirm')}
         cancelLabel={t('common.cancel')}
         pending={submitting}
-        destructive={pendingAction === 'decommission' || pendingAction === 'blacklist'}
+        destructive={pendingAction ? workerActionOption(pendingAction).destructive : false}
         onOpenChange={(open) => {
           if (!open) setPendingAction(null)
         }}

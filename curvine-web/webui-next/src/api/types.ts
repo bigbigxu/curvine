@@ -110,6 +110,8 @@ export interface WorkerInfo {
   version?: string | null
   storage_map?: Record<string, WorkerStorageInfo> | null
   status?: string | null
+  /** CV-60 state axes: operator intent and heartbeat fact, kept separate. */
+  worker_state?: WorkerState | null
   /** Worker fact: can it take new writes at all? */
   accepting_allocations?: boolean | null
   /** Master decision: does the scheduler route new blocks here? */
@@ -117,14 +119,41 @@ export interface WorkerInfo {
   [key: string]: unknown
 }
 
+export interface WorkerState {
+  /** normal | cordoned | decommissioning | decommissioned */
+  admin?: string | null
+  /** running | stale | lost | shutdown */
+  liveness?: string | null
+  writable?: boolean | null
+  readable?: boolean | null
+}
+
 export interface WorkersData {
+  /** Flat, deduplicated list carrying both state axes (preferred). */
+  workers?: WorkerInfo[]
+  /** Fleet counts per axis. */
+  buckets?: {
+    admin?: Record<string, number>
+    liveness?: Record<string, number>
+  }
+  /** Legacy buckets, kept for old masters; still how an old response is shaped. */
   live_workers?: WorkerInfo[]
   blacklist_workers?: WorkerInfo[]
   decommission_workers?: WorkerInfo[]
   lost_workers?: WorkerInfo[]
+  total?: number
 }
 
-export type WorkerAction = 'blacklist' | 'allow' | 'decommission' | 'recommission'
+export type WorkerAction =
+  | 'cordon'
+  | 'uncordon'
+  | 'decommission'
+  | 'cancel-decommission'
+  | 'force-decommission'
+  | 'recommission'
+  // Legacy names still accepted by the master; kept here for deep links.
+  | 'blacklist'
+  | 'allow'
 
 export interface WorkerDetailData {
   worker?: WorkerInfo

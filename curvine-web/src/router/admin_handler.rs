@@ -337,6 +337,20 @@ fn worker_matches(worker: &WorkerInfo, selector: &str) -> bool {
         || worker.address.ip_addr == selector
 }
 
+/// Console view of the two orthogonal state axes (CV-60).
+///
+/// `admin` is the operator intent and `liveness` the heartbeat fact, so the
+/// console can show "decommissioning + stale" without inventing a combined
+/// state. `status` stays as the legacy single-axis projection for old scripts.
+fn worker_state_view(worker: &WorkerInfo) -> Value {
+    json!({
+        "admin": worker.admin().as_str_name(),
+        "liveness": worker.liveness().as_str_name(),
+        "writable": worker.writable(),
+        "readable": worker.readable(),
+    })
+}
+
 fn worker_json(worker: WorkerInfo) -> Value {
     let display_ip = resolve_display_ip(&worker.address.hostname, &worker.address.ip_addr);
     // Derived views for consoles and scripts: the worker fact (can it take
@@ -344,6 +358,8 @@ fn worker_json(worker: WorkerInfo) -> Value {
     // operator tell "node cannot write" from "we do not want to use it".
     let accepting_allocations = worker.accepting_allocations();
     let schedulable = worker.schedulable();
+    let worker_state = worker_state_view(&worker);
+    let legacy_status = format!("{:?}", worker.status());
     let mut value = json!(worker);
     if let Some(object) = value.as_object_mut() {
         object.insert("display_ip".to_string(), json!(display_ip));
@@ -352,6 +368,10 @@ fn worker_json(worker: WorkerInfo) -> Value {
             json!(accepting_allocations),
         );
         object.insert("schedulable".to_string(), json!(schedulable));
+        object.insert("worker_state".to_string(), worker_state);
+        // Restored for compatibility: the model no longer has a single `status`
+        // field, but dashboards and scripts still read it.
+        object.insert("status".to_string(), json!(legacy_status));
     }
     value
 }
@@ -380,9 +400,13 @@ fn worker_payload(worker: WorkerInfo, state: &str) -> Value {
     };
     let storage_count = worker.storage_map.len();
     let (version, version_commit) = worker_version_fields(&worker);
+    let worker_state = worker_state_view(&worker);
+    let status = format!("{:?}", worker.status());
     json!({
         "worker": worker_json(worker),
         "state": state,
+        "status": status,
+        "worker_state": worker_state,
         "usage_percent": usage_percent,
         "storage_count": storage_count,
         "version": version,
@@ -3411,11 +3435,49 @@ async fn workers_v1(
         + decommission_workers.len()
         + lost_workers.len();
 
+    // Flat, deduplicated view carrying both state axes, plus the per-axis counts
+    // the console groups by. The four legacy bucket keys stay so existing scripts
+    // and dashboards keep working.
+    let mut workers: Vec<WorkerInfo> = Vec::with_capacity(total);
+    let mut seen = std::collections::HashSet::with_capacity(total);
+    for worker in live_workers
+        .iter()
+        .chain(blacklist_workers.iter())
+        .chain(decommission_workers.iter())
+        .chain(lost_workers.iter())
+    {
+        if seen.insert(worker.worker_id()) {
+            workers.push(worker.clone());
+        }
+    }
+    let mut admin_counts = json!({
+        "normal": 0, "cordoned": 0, "decommissioning": 0, "decommissioned": 0
+    });
+    let mut liveness_counts = json!({
+        "running": 0, "stale": 0, "lost": 0, "shutdown": 0
+    });
+    for worker in &workers {
+        let admin = worker.admin().as_str_name();
+        let liveness = worker.liveness().as_str_name();
+        if let Some(counts) = admin_counts.as_object_mut() {
+            if let Some(count) = counts.get_mut(admin) {
+                *count = json!(count.as_i64().unwrap_or(0) + 1);
+            }
+        }
+        if let Some(counts) = liveness_counts.as_object_mut() {
+            if let Some(count) = counts.get_mut(liveness) {
+                *count = json!(count.as_i64().unwrap_or(0) + 1);
+            }
+        }
+    }
+
     Ok(api_success(json!({
         "live_workers": live_workers.into_iter().map(worker_json).collect::<Vec<_>>(),
         "blacklist_workers": blacklist_workers.into_iter().map(worker_json).collect::<Vec<_>>(),
         "decommission_workers": decommission_workers.into_iter().map(worker_json).collect::<Vec<_>>(),
         "lost_workers": lost_workers.into_iter().map(worker_json).collect::<Vec<_>>(),
+        "workers": workers.into_iter().map(worker_json).collect::<Vec<_>>(),
+        "buckets": { "admin": admin_counts, "liveness": liveness_counts },
         "total": total
     })))
 }
@@ -3427,19 +3489,19 @@ async fn worker_detail_v1(
     let master_info = current_master_info(&instance).await?;
     for item in master_info.live_workers {
         if worker_matches(&item, &worker) {
-            let state = format!("{:?}", item.status());
+            let state = item.state().as_label();
             return Ok(api_success(worker_payload(item, &state)));
         }
     }
     for item in master_info.blacklist_workers {
         if worker_matches(&item, &worker) {
-            let state = format!("{:?}", item.status());
+            let state = item.state().as_label();
             return Ok(api_success(worker_payload(item, &state)));
         }
     }
     for item in master_info.decommission_workers {
         if worker_matches(&item, &worker) {
-            let state = format!("{:?}", item.status());
+            let state = item.state().as_label();
             return Ok(api_success(worker_payload(item, &state)));
         }
     }

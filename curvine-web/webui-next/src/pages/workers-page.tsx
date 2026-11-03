@@ -10,6 +10,17 @@ import { Meter, usagePercent } from '@/components/meter'
 import { MetricCard } from '@/components/metric-card'
 import { PageHeader } from '@/components/page-header'
 import { ResourceTable, StatusBadge, workerStatusTone } from '@/components/resource-table'
+import {
+  availableWorkerActions,
+  matchesWorkerFilter,
+  workerActionOption,
+  workerAdmin,
+  workerLiveness,
+  workerStateLabel,
+  type WorkerAdmin,
+  type WorkerLiveness,
+  type WorkerStateFilter,
+} from '@/lib/worker-state'
 import { Input } from '@/components/ui/input'
 import { TableCell, TableRow } from '@/components/ui/table'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
@@ -23,7 +34,7 @@ import {
   workerId,
   workerShortVersion
 } from '@/lib/format'
-import { translateDelta, translateStatus, translateWorkerAction } from '@/lib/i18nLabels'
+import { translateDelta } from '@/lib/i18nLabels'
 import { useMasterRuntime } from '@/master-runtime/master-runtime-context'
 import { useRefreshSignal } from '@/refresh/refresh-context'
 import { useAsync } from '@/lib/use-async'
@@ -31,10 +42,23 @@ import { useSlidingSheet } from '@/lib/use-sliding-sheet'
 import { WorkerDetailSheet } from './worker-detail-sheet'
 import { ProfileDialog } from './profile-dialog'
 
-type WorkerRow = WorkerInfo & { rowStatus: string }
+type WorkerRow = WorkerInfo & {
+  /** `admin` or `admin+liveness`, the label the table shows. */
+  rowStatus: string
+  admin: WorkerAdmin
+  liveness: WorkerLiveness
+}
 
-const FILTERS = ['all', 'live', 'blacklist', 'decommission', 'lost'] as const
-type StatusFilter = (typeof FILTERS)[number]
+const FILTERS: WorkerStateFilter[] = [
+  'all',
+  'normal',
+  'cordoned',
+  'decommissioning',
+  'decommissioned',
+  'stale',
+  'lost',
+  'shutdown',
+]
 
 /** Unhealthy directories, i.e. the worker cannot take new writes for them. */
 function unhealthyDirs(worker: WorkerInfo) {
@@ -70,7 +94,7 @@ export function WorkersPage() {
   const detail = useSlidingSheet(Boolean(detailSelector), detailSelector)
   const { runtime } = useMasterRuntime()
 
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
+  const [statusFilter, setStatusFilter] = useState<WorkerStateFilter>('all')
   const [query, setQuery] = useState('')
   const [pendingAction, setPendingAction] = useState<{ worker: WorkerRow; action: WorkerAction } | null>(
     null
@@ -86,20 +110,34 @@ export function WorkersPage() {
   const { data, loading, error, reload, refresh } = useAsync(load, [load])
   useRefreshSignal(refresh)
 
-  const groups = useMemo(() => {
-    const withStatus = (workers: WorkerInfo[] | undefined, rowStatus: string): WorkerRow[] =>
-      (workers || []).map((worker) => ({ ...worker, rowStatus }))
-    return {
-      live: withStatus(data?.live_workers, 'live'),
-      blacklist: withStatus(data?.blacklist_workers, 'blacklist'),
-      decommission: withStatus(data?.decommission_workers, 'decommission'),
-      lost: withStatus(data?.lost_workers, 'lost')
+  const allWorkers = useMemo<WorkerRow[]>(() => {
+    const decorate = (worker: WorkerInfo): WorkerRow => {
+      const admin = workerAdmin(worker)
+      const liveness = workerLiveness(worker)
+      return { ...worker, admin, liveness, rowStatus: workerStateLabel(admin, liveness) }
     }
+    if (data?.workers?.length) return data.workers.map(decorate)
+    // An old master has no flat list and no state axes: rebuild what we can from
+    // the legacy buckets, which is the only state signal it sends.
+    const legacy: WorkerInfo[] = [
+      ...(data?.live_workers || []),
+      ...(data?.blacklist_workers || []),
+      ...(data?.decommission_workers || []),
+      ...(data?.lost_workers || []),
+    ]
+    return legacy.map(decorate)
   }, [data])
 
-  const allWorkers = useMemo(
-    () => [...groups.live, ...groups.blacklist, ...groups.decommission, ...groups.lost],
-    [groups]
+  /** Fleet count for one axis value; server-side buckets when available. */
+  const count = useCallback(
+    (axis: 'admin' | 'liveness', value: string): number => {
+      const fromServer = data?.buckets?.[axis]?.[value]
+      if (typeof fromServer === 'number') return fromServer
+      return allWorkers.filter((worker) =>
+        axis === 'admin' ? worker.admin === value : worker.liveness === value
+      ).length
+    },
+    [allWorkers, data]
   )
 
   const filtered = useMemo(() => {
@@ -107,7 +145,7 @@ export function WorkersPage() {
     return allWorkers
       .filter(
         (worker) =>
-          (statusFilter === 'all' || worker.rowStatus === statusFilter) &&
+          matchesWorkerFilter(worker.admin, worker.liveness, statusFilter) &&
           `${workerHostname(worker)} ${workerId(worker)} ${workerAddress(worker)} ${ipAddress(worker)} ${workerShortVersion(
             worker
           )}`
@@ -119,9 +157,19 @@ export function WorkersPage() {
   }, [allWorkers, statusFilter, query])
 
   const activeWorkers = useMemo(
-    () => [...groups.live, ...groups.blacklist, ...groups.decommission],
-    [groups]
+    () => allWorkers.filter((worker) => worker.admin !== 'decommissioned'),
+    [allWorkers]
   )
+
+  // Two axes, one badge: the admin intent, plus the liveness fact when it is not
+  // `running` (`decommissioning · stale`). Keeping them apart is the whole point
+  // of the state split, so the console must not collapse them.
+  const stateText = (admin: WorkerAdmin, liveness: WorkerLiveness): string => {
+    const base = t(`workers.states.${admin}`)
+    return liveness === 'running' ? base : `${base} · ${t(`workers.liveness.${liveness}`)}`
+  }
+  const stateTone = (admin: WorkerAdmin, liveness: WorkerLiveness) =>
+    workerStatusTone(liveness === 'running' ? admin : liveness)
   const totalCapacity = activeWorkers.reduce((sum, worker) => sum + Number(worker.capacity || 0), 0)
   const totalAvailable = activeWorkers.reduce((sum, worker) => sum + Number(worker.available || 0), 0)
   const clusterUsage = usagePercent(totalCapacity, totalAvailable)
@@ -161,17 +209,30 @@ export function WorkersPage() {
       <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
         <MetricCard
           label={t('workers.metrics.liveWorkers')}
-          value={groups.live.length}
+          value={count('admin', 'normal')}
           meta={t('workers.metrics.healthyHeartbeat')}
           delta={delta('online')}
           tone="good"
         />
         <MetricCard
           label={t('workers.metrics.managed')}
-          value={groups.blacklist.length + groups.decommission.length}
+          value={
+            count('admin', 'cordoned') +
+            count('admin', 'decommissioning') +
+            count('admin', 'decommissioned')
+          }
           meta={t('workers.metrics.blacklistDecommission')}
-          delta={`${groups.blacklist.length} / ${groups.decommission.length}`}
-          tone={groups.blacklist.length + groups.decommission.length ? 'warn' : 'neutral'}
+          delta={`${count('admin', 'cordoned')} / ${count('admin', 'decommissioning')} / ${count(
+            'admin',
+            'decommissioned'
+          )}`}
+          tone={
+            count('admin', 'cordoned') +
+              count('admin', 'decommissioning') +
+              count('admin', 'decommissioned')
+              ? 'warn'
+              : 'neutral'
+          }
         />
         <MetricCard
           label={t('workers.metrics.totalCapacity')}
@@ -189,10 +250,19 @@ export function WorkersPage() {
         />
         <MetricCard
           label={t('workers.metrics.lostWorkers')}
-          value={groups.lost.length}
+          value={
+            count('liveness', 'stale') + count('liveness', 'lost') + count('liveness', 'shutdown')
+          }
           meta={t('workers.metrics.requiresAttention')}
-          delta={delta(groups.lost.length ? 'check' : 'none')}
-          tone={groups.lost.length ? 'bad' : 'good'}
+          delta={`${count('liveness', 'stale')} / ${count('liveness', 'lost')} / ${count(
+            'liveness',
+            'shutdown'
+          )}`}
+          tone={
+            count('liveness', 'stale') + count('liveness', 'lost') + count('liveness', 'shutdown')
+              ? 'bad'
+              : 'good'
+          }
         />
       </section>
 
@@ -206,7 +276,7 @@ export function WorkersPage() {
             type="single"
             value={statusFilter}
             onValueChange={(value) => {
-              if (value) setStatusFilter(value as StatusFilter)
+              if (value) setStatusFilter(value as WorkerStateFilter)
             }}
             data-testid="workers-filter"
           >
@@ -285,8 +355,9 @@ export function WorkersPage() {
                 </TableCell>
                 <TableCell>
                   <StatusBadge
-                    value={translateStatus(t, worker.rowStatus)}
-                    tone={workerStatusTone(worker.rowStatus)}
+                    value={stateText(worker.admin, worker.liveness)}
+                    tone={stateTone(worker.admin, worker.liveness)}
+                    testId={`worker-state-${selector}`}
                   />
                 </TableCell>
                 <TableCell>
@@ -353,30 +424,13 @@ export function WorkersPage() {
                       label={t('workers.actions.profile')}
                       onClick={() => setProfileWorker(worker)}
                     />
-                    {worker.rowStatus !== 'lost' && worker.rowStatus !== 'blacklist' && (
+                    {availableWorkerActions(worker.admin).map((option) => (
                       <WorkerActionButton
-                        label={t('workers.actions.addBlacklist')}
-                        onClick={() => setPendingAction({ worker, action: 'blacklist' })}
+                        key={option.action}
+                        label={t(option.labelKey)}
+                        onClick={() => setPendingAction({ worker, action: option.action })}
                       />
-                    )}
-                    {worker.rowStatus === 'blacklist' && (
-                      <WorkerActionButton
-                        label={t('workers.actions.allow')}
-                        onClick={() => setPendingAction({ worker, action: 'allow' })}
-                      />
-                    )}
-                    {worker.rowStatus !== 'lost' && worker.rowStatus !== 'decommission' && (
-                      <WorkerActionButton
-                        label={t('workers.actions.decommission')}
-                        onClick={() => setPendingAction({ worker, action: 'decommission' })}
-                      />
-                    )}
-                    {worker.rowStatus === 'decommission' && (
-                      <WorkerActionButton
-                        label={t('workers.actions.recommission')}
-                        onClick={() => setPendingAction({ worker, action: 'recommission' })}
-                      />
-                    )}
+                    ))}
                   </div>
                 </TableCell>
               </TableRow>
@@ -386,15 +440,32 @@ export function WorkersPage() {
 
         <ConfirmDialog
           open={pendingAction !== null}
-          title={translateWorkerAction(t, pendingAction?.action ?? '')}
-          description={t('workers.actions.confirm', {
-            action: translateWorkerAction(t, pendingAction?.action ?? ''),
-            worker: pendingAction ? workerAddress(pendingAction.worker) : ''
-          })}
+          title={pendingAction ? t(workerActionOption(pendingAction.action).labelKey) : ''}
+          description={(() => {
+            if (!pendingAction) return ''
+            const worker = workerAddress(pendingAction.worker)
+            const option = workerActionOption(pendingAction.action)
+            if (option.dataLoss) {
+              return `${t('workers.actions.forceConfirm', { worker })} ${t(
+                'workers.actions.forceWarning'
+              )}`
+            }
+            const base = t('workers.actions.confirm', {
+              action: t(option.labelKey),
+              worker
+            })
+            if (option.action === 'decommission') {
+              return `${base} ${t('workers.actions.decommissionHint')}`
+            }
+            if (option.action === 'cancel-decommission') {
+              return `${base} ${t('workers.actions.cancelHint')}`
+            }
+            return base
+          })()}
           confirmLabel={t('common.confirm')}
           cancelLabel={t('common.cancel')}
           pending={submitting}
-          destructive={pendingAction?.action === 'decommission' || pendingAction?.action === 'blacklist'}
+          destructive={pendingAction ? workerActionOption(pendingAction.action).destructive : false}
           onOpenChange={(open) => {
             if (!open) setPendingAction(null)
           }}
