@@ -34,7 +34,7 @@ use crate::transfer::{
     MAX_JOBS_PER_STORE_TRANSACTION, MAX_TASKS_PER_STORE_TRANSACTION,
 };
 
-const TRANSFER_SCHEMA_VERSION: u64 = 5;
+const TRANSFER_SCHEMA_VERSION: u64 = 4;
 const TRANSFER_SCHEMA_V3: u64 = 3;
 const TRANSFER_SCHEMA_V4: u64 = 4;
 const MYSQL_SCHEMA_LOCK_NAME: &str = "curvine_transfer_schema";
@@ -1722,11 +1722,6 @@ fn migrate_mysql_schema(conn: &mut PooledConn, mut version: u64, now_ms: u64) ->
         update_mysql_schema_version(conn, TRANSFER_SCHEMA_V4, now_ms)?;
         version = TRANSFER_SCHEMA_V4;
     }
-    if version == TRANSFER_SCHEMA_V4 {
-        migrate_mysql_schema_v4_to_v5(conn)?;
-        update_mysql_schema_version(conn, TRANSFER_SCHEMA_VERSION, now_ms)?;
-        version = TRANSFER_SCHEMA_VERSION;
-    }
     if version != TRANSFER_SCHEMA_VERSION {
         return Err(FsError::common(format!(
             "Unsupported mysql transfer schema version {}, expected {}",
@@ -1735,13 +1730,6 @@ fn migrate_mysql_schema(conn: &mut PooledConn, mut version: u64, now_ms: u64) ->
     }
     migrate_mysql_task_runtime_columns(conn)?;
     ensure_mysql_ttl_purge_index(conn)
-}
-
-/// v5 is a version-only bump: the instance registry and topology tables that
-/// once lived here are unused now that placement comes from configuration.
-/// Existing deployments keep the leftover tables; new ones never create them.
-fn migrate_mysql_schema_v4_to_v5(_conn: &mut PooledConn) -> FsResult<()> {
-    Ok(())
 }
 
 fn migrate_mysql_schema_v2_to_v3(conn: &mut PooledConn) -> FsResult<()> {
