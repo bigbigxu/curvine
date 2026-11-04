@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{ClusterConf, CompatibilityConf, DBConf, DirSpaceConf};
+use crate::{deserialize_master_rocksdb, ClusterConf, CompatibilityConf, DBConf, DirSpaceConf};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_runtime::common::{ByteUnit, DurationUnit, LogConf, Utils};
 use curvine_runtime::runtime::GroupExecutor;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -242,9 +242,13 @@ pub struct MasterConf {
     /// explicitly configured).
     pub compatibility: CompatibilityConf,
 
+    /// Partial-table semantics (#1966): keys present in the TOML table
+    /// override `MasterConf::rocksdb_default()`; keys left out keep the
+    /// component default (not `DBConf::default()`). The field-level
+    /// `default` still covers the fully-absent-table case.
     #[serde(
         default = "MasterConf::rocksdb_default",
-        deserialize_with = "MasterConf::deserialize_rocksdb"
+        deserialize_with = "deserialize_master_rocksdb"
     )]
     pub rocksdb: DBConf,
 
@@ -348,10 +352,11 @@ impl MasterConf {
             pin_l0_filter_and_index_blocks_in_cache: true,
             // Production baseline for a 10-50M inode master with 32-64GB memory
             // and at least 6 cores. Smaller masters should lower
-            // `block_cache_size` and `max_background_jobs`. A `[master.rocksdb]`
-            // table replaces these defaults (unset keys fall back to
-            // `DBConf::default()`), so copy the full block from
-            // etc/curvine-cluster.toml and keep it in sync with this function.
+            // `block_cache_size` and `max_background_jobs`. A partial
+            // `[master.rocksdb]` table overlays these defaults: keys you
+            // write override them, keys you leave out keep them (#1966),
+            // so there is no need to copy the full block from
+            // etc/curvine-cluster.toml.
             block_cache_size: ByteUnit::gb(4),
             bytes_per_sync: ByteUnit::mb(1),
             compaction_readahead_size: ByteUnit::mb(2),
@@ -372,22 +377,6 @@ impl MasterConf {
             rate_limiter_fairness: 10,
             ..Default::default()
         }
-    }
-
-    fn deserialize_rocksdb<'de, D>(deserializer: D) -> Result<DBConf, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        // A partial table must inherit Master defaults, not DBConf's generic ones.
-        // Merge raw values so explicit false/zero values and lists are preserved.
-        let overrides = toml::Table::deserialize(deserializer)?;
-        let mut defaults =
-            toml::Value::try_from(Self::rocksdb_default()).map_err(serde::de::Error::custom)?;
-        defaults
-            .as_table_mut()
-            .expect("DBConf must serialize to a table")
-            .extend(overrides);
-        defaults.try_into().map_err(serde::de::Error::custom)
     }
 
     pub fn heartbeat_interval_ms(&self) -> u64 {
@@ -714,6 +703,40 @@ mod tests {
     fn rocksdb_invalid_field_types_are_rejected() {
         assert!(
             toml::from_str::<MasterConf>("[rocksdb]\nmax_background_jobs = 'invalid'").is_err()
+        );
+    }
+
+    #[test]
+    fn partial_rocksdb_table_keeps_component_defaults() {
+        // #1966: a partial [master.rocksdb] table must overlay the component
+        // baseline, not the generic DBConf::default().
+        let raw = r#"
+            block_report_limit = 1000
+            [rocksdb]
+            block_cache_size = "1GB"
+        "#;
+        let conf: MasterConf = toml::from_str(raw).unwrap();
+
+        assert_eq!(conf.rocksdb.block_cache_size, ByteUnit::gb(1));
+        assert!(conf.rocksdb.disable_wal);
+        assert_eq!(conf.rocksdb.compression_type, DBConf::COMPRESSION_LZ4);
+        assert_eq!(conf.rocksdb.max_background_jobs, 6);
+        assert_eq!(conf.rocksdb.max_subcompactions, 2);
+        assert_eq!(conf.rocksdb.max_bytes_for_level_base, ByteUnit::gb(2));
+        assert!(conf.rocksdb.enable_statistics);
+        assert!(conf.rocksdb.use_bloom_filter);
+    }
+
+    #[test]
+    fn empty_rocksdb_table_equals_default() {
+        let conf: MasterConf = toml::from_str("[rocksdb]").unwrap();
+        let expected = MasterConf::default().rocksdb;
+        assert_eq!(conf.rocksdb.disable_wal, expected.disable_wal);
+        assert_eq!(conf.rocksdb.compression_type, expected.compression_type);
+        assert_eq!(conf.rocksdb.block_cache_size, expected.block_cache_size);
+        assert_eq!(
+            conf.rocksdb.max_background_jobs,
+            expected.max_background_jobs
         );
     }
 
