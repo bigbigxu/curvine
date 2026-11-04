@@ -39,6 +39,166 @@ use std::sync::Arc;
 use tracing;
 use uuid;
 
+/// Whether an `ETag` header value is strong (`"x"`) rather than weak (`W/"x"`).
+///
+/// RFC 9110 §8.8.3: only a strong validator may satisfy `If-Match`.
+fn is_strong(tag: &str) -> bool {
+    // The weakness prefix is case-insensitive per RFC 9110 §8.8.3.
+    !tag.trim_start()
+        .get(..2)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("W/"))
+}
+
+/// The opaque value of an `ETag`, without the weakness prefix and quotes.
+///
+/// S3 also accepts an unquoted value, and comparison is case-insensitive
+/// because digests are compared as text.
+fn etag_value(tag: &str) -> String {
+    tag.trim()
+        .trim_start_matches("W/")
+        .trim_matches('"')
+        .to_ascii_lowercase()
+}
+
+/// Conditional request headers, as received.
+#[derive(Debug, Default, Clone)]
+pub struct Preconditions {
+    pub if_match: Option<String>,
+    pub if_none_match: Option<String>,
+    pub if_modified_since: Option<String>,
+    pub if_unmodified_since: Option<String>,
+    /// `true` when evaluating `x-amz-copy-source-if-*` against the source.
+    pub is_copy_source: bool,
+}
+
+impl Preconditions {
+    pub fn is_empty(&self) -> bool {
+        self.if_match.is_none()
+            && self.if_none_match.is_none()
+            && self.if_modified_since.is_none()
+            && self.if_unmodified_since.is_none()
+    }
+
+    /// Read the conditional headers from a request.
+    ///
+    /// `copy_source` selects the `x-amz-copy-source-if-*` family, which
+    /// `CopyObject` applies to the source object rather than the destination.
+    pub fn from_headers<H: crate::auth::sig_v4::VHeader>(header: &H, copy_source: bool) -> Self {
+        let prefix = if copy_source {
+            "x-amz-copy-source-"
+        } else {
+            ""
+        };
+        let get = |name: &str| header.get_header(&format!("{prefix}{name}"));
+        Self {
+            if_match: get("if-match"),
+            if_none_match: get("if-none-match"),
+            if_modified_since: get("if-modified-since"),
+            if_unmodified_since: get("if-unmodified-since"),
+            is_copy_source: copy_source,
+        }
+    }
+}
+
+/// Truncate a millisecond timestamp to whole seconds.
+///
+/// An HTTP-date carries no sub-second precision, so comparing a millisecond
+/// mtime against one must compare at the same granularity. Without this a
+/// client that echoes the exact `Last-Modified` it was given fails its own
+/// `If-Unmodified-Since`.
+fn to_whole_seconds(timestamp_ms: i64) -> i64 {
+    timestamp_ms.div_euclid(1000) * 1000
+}
+
+/// Parse an HTTP-date, accepting the three forms RFC 9110 permits.
+fn parse_http_date(value: &str) -> Option<i64> {
+    for format in [
+        "%a, %d %b %Y %H:%M:%S GMT",
+        "%A, %d-%b-%y %H:%M:%S GMT",
+        "%a %b %e %H:%M:%S %Y",
+    ] {
+        if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(value.trim(), format) {
+            return Some(to_whole_seconds(parsed.and_utc().timestamp_millis()));
+        }
+    }
+    chrono::DateTime::parse_from_rfc2822(value.trim())
+        .ok()
+        .map(|dt| to_whole_seconds(dt.timestamp_millis()))
+}
+
+/// Evaluate conditional headers per RFC 9110 §13.2.2.
+///
+/// Order is fixed by the RFC:
+/// 1. `If-Match` — strong comparison; failure is 412.
+/// 2. `If-Unmodified-Since` — ignored when `If-Match` is present.
+/// 3. `If-None-Match` — weak comparison; a match is 304.
+/// 4. `If-Modified-Since` — ignored when `If-None-Match` is present.
+pub fn evaluate_precondition_headers(
+    headers: &Preconditions,
+    etag: Option<&str>,
+    last_modified_ms: Option<i64>,
+) -> Option<u16> {
+    let has_if_match = headers.if_match.is_some();
+    let has_if_none_match = headers.if_none_match.is_some();
+
+    if let Some(header) = headers.if_match.as_deref() {
+        let satisfied = match etag {
+            None => false,
+            Some(current) => header.split(',').any(|tag| {
+                let tag = tag.trim();
+                tag == "*" || (is_strong(tag) && etag_value(tag) == etag_value(current))
+            }),
+        };
+        if !satisfied {
+            return Some(412);
+        }
+    }
+
+    if !has_if_match {
+        if let Some(raw) = headers.if_unmodified_since.as_deref() {
+            if let Some(limit) = parse_http_date(raw) {
+                match last_modified_ms {
+                    Some(mtime) if to_whole_seconds(mtime) > limit => return Some(412),
+                    None => return Some(412),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if let Some(header) = headers.if_none_match.as_deref() {
+        let matched = match etag {
+            None => false,
+            Some(current) => header.split(',').any(|tag| {
+                let tag = tag.trim();
+                tag == "*" || etag_value(tag) == etag_value(current)
+            }),
+        };
+        if matched {
+            return Some(304);
+        }
+    }
+
+    if !has_if_none_match {
+        if let Some(raw) = headers.if_modified_since.as_deref() {
+            if let Some(limit) = parse_http_date(raw) {
+                if let Some(mtime) = last_modified_ms {
+                    if to_whole_seconds(mtime) <= limit {
+                        return Some(304);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Error text the S3 API layer maps to `NoSuchBucket` (404).
+pub const NO_SUCH_BUCKET: &str = "NoSuchBucket: the specified bucket does not exist";
+/// Error text the S3 API layer maps to `BucketNotEmpty` (409).
+pub const BUCKET_NOT_EMPTY: &str = "BucketNotEmpty: the bucket you tried to delete is not empty";
+
 #[derive(Clone)]
 pub struct S3Handlers {
     pub fs: UnifiedFileSystem,
@@ -73,6 +233,26 @@ impl S3Handlers {
             rt,
             get_chunk_size_bytes: get_chunk_size_bytes.clamp(512 * 1024, 4 * 1024 * 1024),
         }
+    }
+
+    /// Evaluate the conditional request headers for one object.
+    ///
+    /// Implements RFC 9110 §13.2.2 evaluation order and the S3 extensions:
+    /// `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`.
+    /// Returns the status a conditional request must answer with (412 or 304),
+    /// or `None` when it should be served normally.
+    pub async fn evaluate_preconditions(
+        &self,
+        path: &Path,
+        headers: &Preconditions,
+    ) -> Option<u16> {
+        if headers.is_empty() {
+            return None;
+        }
+        let status = self.fs.get_status(path).await.ok()?;
+        let current_etag = crate::utils::s3_utils::generate_etag(&status);
+
+        evaluate_precondition_headers(headers, Some(&current_etag), Some(status.mtime))
     }
 
     #[inline]
@@ -115,11 +295,10 @@ impl S3Handlers {
     }
 
     #[inline]
-    #[allow(clippy::result_unit_err)]
     pub async fn handle_get_bucket_location(
         &self,
         _loc: Option<&str>,
-    ) -> Result<Option<&'static str>, ()> {
+    ) -> Result<Option<&'static str>, String> {
         match self.region.as_str() {
             "us-east-1" => Ok(Some("us-east-1")),
             "us-west-1" => Ok(Some("us-west-1")),
@@ -396,11 +575,13 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
 impl PutObjectHandler for S3Handlers {
     fn handle(
         &self,
-        _opt: PutObjectOption,
+        opt: PutObjectOption,
         bucket: String,
         object: String,
         mut body: crate::utils::io::PollReaderEnum,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<String, String>> + Send {
+        let fs = self.fs.clone();
+        let path = self.cv_object_path(&bucket, &object);
         let context = PutContext::new(
             self.fs.clone(),
             self.rt.clone(),
@@ -409,11 +590,51 @@ impl PutObjectHandler for S3Handlers {
             self.cv_object_path(&bucket, &object),
         );
 
-        async move { PutOperation::execute(context, &mut body).await }
+        async move {
+            // S3 applies `If-Match` / `If-None-Match` to the DESTINATION on
+            // PutObject. Without this an `If-Match: <old>` overwrite silently
+            // clobbered a concurrently-replaced object, which is the lost
+            // update the GET path already guards against. `If-None-Match: *`
+            // is the "create only if absent" form.
+            let dest_conditions = crate::s3::handlers::Preconditions {
+                if_match: opt.if_match.clone(),
+                if_none_match: opt.if_none_match.clone(),
+                ..Default::default()
+            };
+            if !dest_conditions.is_empty() {
+                let dest = path.as_ref().map_err(|e| e.to_string())?.clone();
+                let existing = fs.get_status(&dest).await.ok();
+                let etag = existing.as_ref().map(crate::utils::s3_utils::generate_etag);
+                if crate::s3::handlers::evaluate_precondition_headers(
+                    &dest_conditions,
+                    etag.as_deref(),
+                    existing.as_ref().map(|st| st.mtime),
+                )
+                .is_some()
+                {
+                    return Err("PreconditionFailed: destination condition not met".to_string());
+                }
+            }
+
+            // Metadata is written to the staging inode, so the rename publishes
+            // body and metadata as one step. Writing it afterwards left a
+            // window where the object answered HEAD with the fallback ETag, and
+            // a failed `set_attr` reported 500 for an object already visible.
+            let metadata = crate::utils::s3_utils::S3Metadata::from_put_option(&opt);
+            let expect_length = opt
+                .content_length
+                .and_then(|v| usize::try_from(v).ok())
+                .filter(|v| *v > 0);
+            let md5 = PutOperation::execute(context, &mut body, metadata, expect_length).await?;
+            let _ = path;
+
+            // Report what HEAD/GET will report for the same object.
+            Ok(format!("\"{md5}\""))
+        }
     }
 
-    fn get_temp_dir(&self) -> String {
-        self.temp_storage.config().temp_dir.clone()
+    fn temp_storage(&self) -> std::sync::Arc<TempStorageEnum> {
+        self.temp_storage.clone()
     }
 }
 
@@ -431,6 +652,7 @@ impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
             match fs.delete(&path, false).await {
                 Ok(_) => Ok(()),
                 Err(e) => {
+                    let _ = &e;
                     let msg = e.to_string();
                     if msg.contains("No such file")
                         || msg.contains("not exists")
@@ -481,11 +703,135 @@ impl crate::s3::s3_api::DeleteBucketHandler for S3Handlers {
 
         async move {
             let path = path.map_err(|e| e.to_string())?;
+
+            // S3 requires DeleteBucket to fail on a missing bucket (404) and on
+            // a non-empty one (409). Passing straight to `delete` answered 500
+            // for a non-empty bucket and left the client guessing.
+            let status = fs.get_status(&path).await.map_err(|e| e.to_string())?;
+            if !status.is_dir {
+                return Err(NO_SUCH_BUCKET.to_string());
+            }
+            if status.children_num > 0 {
+                return Err(BUCKET_NOT_EMPTY.to_string());
+            }
+
             fs.delete(&path, false)
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         }
+    }
+}
+
+impl S3Handlers {
+    /// Server-side copy, the operation behind `x-amz-copy-source`.
+    ///
+    /// Without this branch a copy request fell through to the normal PUT path,
+    /// which has no body: it created a zero-byte object under the destination
+    /// key and answered success, silently destroying whatever was there.
+    pub async fn copy_object(
+        &self,
+        source_bucket: &str,
+        source_key: &str,
+        dest_bucket: &str,
+        dest_key: &str,
+        source_conditions: &Preconditions,
+    ) -> Result<String, String> {
+        use curvine_fs_api::Reader;
+
+        let src = self
+            .cv_object_path(source_bucket, source_key)
+            .map_err(|e| format!("Invalid copy source: {e}"))?;
+        let dst = self
+            .cv_object_path(dest_bucket, dest_key)
+            .map_err(|e| format!("Invalid copy destination: {e}"))?;
+
+        let status = self.fs.get_status(&src).await.map_err(|_| {
+            format!("NoSuchKey: copy source {source_bucket}/{source_key} does not exist")
+        })?;
+
+        // `x-amz-copy-source-if-*` constrains the SOURCE object, not the
+        // destination, so the conditions are evaluated against `src`.
+        if let Some(code) = self.evaluate_preconditions(&src, source_conditions).await {
+            return Err(format!(
+                "PreconditionFailed: copy source condition returned {code}"
+            ));
+        }
+
+        // Copy through the same staging-then-rename path a PUT uses, so a
+        // failed copy cannot truncate an existing destination object.
+        let staging_id = uuid::Uuid::new_v4().to_string();
+        let staging = {
+            let parent = dst
+                .parent()
+                .map_err(|e| format!("Invalid destination parent: {e}"))?
+                .ok_or_else(|| format!("Destination {dst} has no parent"))?;
+            Path::from_str(format!("{parent}/.curvine-s3-copy-{staging_id}"))
+                .map_err(|e| format!("Invalid staging path: {e}"))?
+        };
+
+        let mut reader = self.fs.open(&src).await.map_err(|e| e.to_string())?;
+        let mut writer = self
+            .fs
+            .create(&staging, true)
+            .await
+            .map_err(|e| format!("Failed to create copy staging object: {e}"))?;
+
+        let mut md5 = md5::Context::new();
+        loop {
+            let mut buf = vec![0u8; self.get_chunk_size_bytes];
+            let n = match reader.read(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = writer.cancel().await;
+                    let _ = self.fs.delete(&staging, false).await;
+                    return Err(format!("Failed to read copy source: {e}"));
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            buf.truncate(n);
+            md5.consume(&buf);
+            if let Err(e) = writer.write(&buf).await {
+                let _ = writer.cancel().await;
+                let _ = self.fs.delete(&staging, false).await;
+                return Err(format!("Failed to write copy destination: {e}"));
+            }
+        }
+
+        if let Err(e) = writer.complete().await {
+            let _ = self.fs.delete(&staging, false).await;
+            return Err(format!("Failed to complete copy destination: {e}"));
+        }
+        if let Err(e) = self.fs.rename(&staging, &dst).await {
+            let _ = self.fs.delete(&staging, false).await;
+            return Err(format!("Failed to publish copy destination: {e}"));
+        }
+
+        let etag = format!("{:x}", md5.compute());
+        // Copy inherits the source's Content-Type and user metadata; the
+        // upload path records them the same way.
+        let mut opts = curvine_model::SetAttrOptsBuilder::new().add_x_attr(
+            crate::utils::s3_utils::XATTR_S3_ETAG,
+            etag.as_bytes().to_vec(),
+        );
+        if let Some(ct) = status
+            .x_attr
+            .get(crate::utils::s3_utils::XATTR_S3_CONTENT_TYPE)
+        {
+            opts = opts.add_x_attr(crate::utils::s3_utils::XATTR_S3_CONTENT_TYPE, ct.clone());
+        }
+        for (k, v) in &status.x_attr {
+            if k.starts_with(crate::utils::s3_utils::XATTR_S3_META_PREFIX) {
+                opts = opts.add_x_attr(k.clone(), v.clone());
+            }
+        }
+        if let Err(e) = self.fs.set_attr(&dst, opts.build()).await {
+            tracing::warn!("Failed to record copy metadata for {dst}: {e}");
+        }
+
+        Ok(etag)
     }
 }
 
@@ -503,7 +849,7 @@ impl crate::s3::s3_api::GetBucketLocationHandler for S3Handlers {
     fn handle(
         &self,
         loc: Option<&str>,
-    ) -> impl std::future::Future<Output = Result<Option<&'static str>, ()>> + Send {
+    ) -> impl std::future::Future<Output = Result<Option<&'static str>, String>> + Send {
         self.handle_get_bucket_location(loc)
     }
 }
@@ -527,19 +873,20 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
         Ok(upload_id)
     }
 
-    async fn handle_upload_part(
+    async fn handle_upload_part<R: crate::utils::io::PollRead + Send>(
         &self,
         _bucket: String,
         _key: String,
         upload_id: String,
         part_number: u32,
-        mut body: crate::utils::io::AsyncReadEnum,
+        body: &mut R,
+        expect: crate::utils::temp_storage::StageExpect<'_>,
     ) -> Result<String, ()> {
-        // Use streaming write to avoid loading entire part into memory
-        // This is critical for large parts (S3 allows up to 5GB per part)
+        // Streaming write: a part can be up to the S3 5 GiB limit, so it is
+        // hashed and written chunk by chunk instead of buffered in memory.
         match self
             .temp_storage
-            .write_part_stream(&upload_id, part_number, &mut body)
+            .write_part_stream(&upload_id, part_number, body, expect)
             .await
         {
             Ok(etag) => {
@@ -570,20 +917,12 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
         upload_id: String,
         data: Vec<(String, u32)>,
         _opts: crate::s3::s3_api::MultiUploadObjectCompleteOption,
-    ) -> Result<String, ()> {
+    ) -> Result<String, String> {
         let final_path = match self.cv_object_path(&bucket, &key) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("Invalid object path: {}", e);
-                return Err(());
-            }
-        };
-
-        let mut writer = match self.fs.create(&final_path, true).await {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::error!("Failed to create final file: {}", e);
-                return Err(());
+                return Err(format!("Invalid object path: {e}"));
             }
         };
 
@@ -591,12 +930,43 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
         let mut part_list = data;
         part_list.sort_by_key(|(_, n)| *n);
 
+        // Validate the upload before touching the destination. Creating the
+        // final object first meant a bad upload id, or a part that is not
+        // staged, still left a zero-byte object under the destination key —
+        // destroying any previous object and reporting failure afterwards.
+        for (_, part_num) in part_list.iter() {
+            if !self.temp_storage.part_exists(&upload_id, *part_num).await {
+                return Err(format!(
+                    "NoSuchUpload: part {part_num} of upload {upload_id} is not staged"
+                ));
+            }
+        }
+
+        // Stage the assembled object beside the destination and publish it with
+        // a rename, so the destination is only ever the previous object or the
+        // complete new one.
+        let staging_id = uuid::Uuid::new_v4().to_string();
+        let staging = match final_path.parent() {
+            Ok(Some(parent)) => Path::from_str(format!("{parent}/.curvine-s3-mp-{staging_id}"))
+                .map_err(|e| format!("Invalid staging path: {e}"))?,
+            _ => return Err("Destination has no parent".to_string()),
+        };
+
+        let mut writer = match self.fs.create(&staging, true).await {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!("Failed to create final file: {}", e);
+                return Err(format!("Failed to create final file: {e}"));
+            }
+        };
+
         // Stream each part directly to final file (memory-efficient)
         // This avoids loading entire parts into memory
-        for (_, part_num) in part_list {
+        let mut part_etags: Vec<String> = Vec::with_capacity(part_list.len());
+        for (etag, part_num) in part_list.iter() {
             if let Err(e) = self
                 .temp_storage
-                .read_part_stream(&upload_id, part_num, &mut writer)
+                .read_part_stream(&upload_id, *part_num, etag, &mut writer)
                 .await
             {
                 tracing::error!(
@@ -606,16 +976,57 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
                     e
                 );
                 // Cleanup on failure
+                let _ = writer.cancel().await;
+                let _ = self.fs.delete(&staging, false).await;
                 let _ = self.temp_storage.cleanup(&upload_id).await;
-                return Err(());
+                // A missing part means the upload id or the part list does not
+                // match what was staged; S3 answers 404 NoSuchUpload.
+                return Err(format!("NoSuchUpload: {e}"));
             }
+            part_etags.push(etag.trim_matches('"').to_ascii_lowercase());
         }
 
         if let Err(e) = writer.complete().await {
             tracing::error!("Failed to complete final file write: {}", e);
             // Cleanup on failure
+            let _ = self.fs.delete(&staging, false).await;
             let _ = self.temp_storage.cleanup(&upload_id).await;
-            return Err(());
+            return Err(format!("Failed to complete final file write: {e}"));
+        }
+
+        // S3 multipart ETag: md5 of the concatenated part MD5s, plus `-N`.
+        // The response used to be the literal "etag-not-computed", so no client
+        // could validate a multipart upload.
+        let multipart_etag = multipart_etag(&part_etags);
+
+        // Record the ETag on the staging inode, so the rename below publishes
+        // body and ETag together. Writing it afterwards left the object
+        // answering HEAD with the fallback ETag if `set_attr` failed, and the
+        // response ETag could differ from HEAD permanently.
+        if let Err(e) = self
+            .fs
+            .set_attr(
+                &staging,
+                curvine_model::SetAttrOptsBuilder::new()
+                    .add_x_attr(
+                        crate::utils::s3_utils::XATTR_S3_ETAG,
+                        multipart_etag.trim_matches('"').as_bytes().to_vec(),
+                    )
+                    .build(),
+            )
+            .await
+        {
+            let _ = self.fs.delete(&staging, false).await;
+            let _ = self.temp_storage.cleanup(&upload_id).await;
+            return Err(format!("Failed to record multipart etag: {e}"));
+        }
+
+        // Publish: the destination is only ever replaced by a complete object
+        // that already carries its metadata.
+        if let Err(e) = self.fs.rename(&staging, &final_path).await {
+            let _ = self.fs.delete(&staging, false).await;
+            let _ = self.temp_storage.cleanup(&upload_id).await;
+            return Err(format!("Failed to publish assembled object: {e}"));
         }
 
         // Cleanup temp files after successful completion
@@ -628,13 +1039,14 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
         }
 
         tracing::info!(
-            "Completed multipart upload for s3://{}/{} (upload_id: {})",
+            "Completed multipart upload for s3://{}/{} (upload_id: {}, parts: {})",
             bucket,
             key,
-            upload_id
+            upload_id,
+            part_etags.len()
         );
 
-        Ok("etag-not-computed".to_string())
+        Ok(multipart_etag)
     }
 
     async fn handle_abort(
@@ -705,6 +1117,18 @@ impl ListObjectHandler for S3Handlers {
             } else {
                 (bkt_path.clone(), String::new())
             };
+
+            // A missing bucket must be an error, not an empty listing: S3
+            // answers 404, and clients rely on it to detect a wrong bucket
+            // instead of concluding the bucket is empty.
+            let bucket_status = this
+                .fs
+                .get_status(&bkt_path)
+                .await
+                .map_err(|_| NO_SUCH_BUCKET.to_string())?;
+            if !bucket_status.is_dir {
+                return Err(NO_SUCH_BUCKET.to_string());
+            }
 
             let list = this
                 .fs
@@ -824,5 +1248,250 @@ impl ListObjectVersionsHandler for S3Handlers {
 
             Ok(result)
         }
+    }
+}
+
+/// S3 multipart ETag: `hex(md5(concat(part-md5-bytes)))-<part count>`.
+///
+/// Each part's ETag is already the hex MD5 of that part, so the digest is
+/// computed over the decoded bytes of those hex strings, exactly as S3 does.
+fn multipart_etag(part_etags: &[String]) -> String {
+    let mut ctx = md5::Context::new();
+    for etag in part_etags {
+        match hex::decode(etag) {
+            Ok(bytes) => ctx.consume(&bytes),
+            // A part ETag that is not a hex MD5 cannot be part of a spec ETag;
+            // hashing its text keeps the value deterministic.
+            Err(_) => ctx.consume(etag.as_bytes()),
+        }
+    }
+    format!("\"{:x}-{}\"", ctx.compute(), part_etags.len())
+}
+
+#[cfg(test)]
+mod multipart_etag_tests {
+    use super::multipart_etag;
+
+    /// S3 defines a multipart ETag as md5 over the part MD5 bytes, suffixed
+    /// with the part count. Two uploads of identical parts must agree.
+    #[test]
+    fn multipart_etag_is_spec_shaped_and_deterministic() {
+        let parts = vec!["d41d8cd98f00b204e9800998ecf8427e".to_string()];
+        let etag = multipart_etag(&parts);
+        // Shaped like "<32 hex>-<count>", wrapped in quotes.
+        assert!(etag.starts_with('"'), "{etag}");
+        assert!(etag.ends_with("-1\""), "{etag}");
+        assert_eq!(etag, multipart_etag(&parts));
+    }
+
+    #[test]
+    fn multipart_etag_changes_with_content_and_count() {
+        let a = multipart_etag(&["aaaa".to_string(), "bbbb".to_string()]);
+        let b = multipart_etag(&["aaaa".to_string(), "cccc".to_string()]);
+        let c = multipart_etag(&["aaaa".to_string()]);
+        assert_ne!(a, b, "different part digests must differ");
+        assert_ne!(a, c, "different part counts must differ");
+    }
+
+    /// A completed upload used to return the literal "etag-not-computed".
+    #[test]
+    fn multipart_etag_is_not_a_placeholder() {
+        let etag = multipart_etag(&["d41d8cd98f00b204e9800998ecf8427e".to_string()]);
+        assert!(!etag.contains("not-computed"), "{etag}");
+    }
+}
+
+#[cfg(test)]
+mod precondition_tests {
+    use super::{
+        etag_value, evaluate_precondition_headers, is_strong, parse_http_date, Preconditions,
+    };
+
+    const ETAG: &str = "\"a826b09d5f9122902dbaef2a70d3e48f\"";
+    // 2026-11-04T09:00:00Z
+    const MTIME: i64 = 1_793_782_800_000;
+
+    fn http_date(ms: i64) -> String {
+        chrono::DateTime::from_timestamp(ms / 1000, 0)
+            .unwrap()
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string()
+    }
+
+    fn eval(
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
+        if_modified_since: Option<&str>,
+        if_unmodified_since: Option<&str>,
+    ) -> Option<u16> {
+        evaluate_precondition_headers(
+            &Preconditions {
+                if_match: if_match.map(str::to_string),
+                if_none_match: if_none_match.map(str::to_string),
+                if_modified_since: if_modified_since.map(str::to_string),
+                if_unmodified_since: if_unmodified_since.map(str::to_string),
+                is_copy_source: false,
+            },
+            Some(ETAG),
+            Some(MTIME),
+        )
+    }
+
+    #[test]
+    fn unconditional_requests_pass() {
+        assert_eq!(eval(None, None, None, None), None);
+    }
+
+    // ---- If-Match: strong comparison (RFC 9110 8.8.3) ----
+    #[test]
+    fn if_match_requires_a_strong_match() {
+        assert_eq!(eval(Some(ETAG), None, None, None), None);
+        // An unquoted value is still a strong validator in S3.
+        assert_eq!(
+            eval(Some("a826b09d5f9122902dbaef2a70d3e48f"), None, None, None),
+            None
+        );
+        // A weak validator never satisfies If-Match.
+        assert_eq!(
+            eval(Some(&format!("W/{ETAG}")), None, None, None),
+            Some(412)
+        );
+        assert_eq!(eval(Some("\"deadbeef\""), None, None, None), Some(412));
+        // A list matches if any member matches.
+        assert_eq!(
+            eval(Some(&format!("\"nope\", {ETAG}")), None, None, None),
+            None
+        );
+        assert_eq!(eval(Some("*"), None, None, None), None);
+    }
+
+    // ---- If-None-Match: weak comparison ----
+    #[test]
+    fn if_none_match_uses_weak_comparison() {
+        assert_eq!(eval(None, Some(ETAG), None, None), Some(304));
+        // Weak and strong forms compare equal here.
+        assert_eq!(
+            eval(None, Some(&format!("W/{ETAG}")), None, None),
+            Some(304)
+        );
+        assert_eq!(eval(None, Some("\"other\""), None, None), None);
+        assert_eq!(eval(None, Some("*"), None, None), Some(304));
+    }
+
+    // ---- Time conditions ----
+    #[test]
+    fn if_modified_since_returns_304_when_not_modified() {
+        // mtime == limit: not modified since the client's copy.
+        assert_eq!(eval(None, None, Some(&http_date(MTIME)), None), Some(304));
+        // Object newer than the limit: serve it.
+        assert_eq!(
+            eval(None, None, Some(&http_date(MTIME - 60_000)), None),
+            None
+        );
+    }
+
+    #[test]
+    fn if_unmodified_since_returns_412_when_modified() {
+        assert_eq!(
+            eval(None, None, None, Some(&http_date(MTIME - 60_000))),
+            Some(412)
+        );
+        assert_eq!(eval(None, None, None, Some(&http_date(MTIME))), None);
+    }
+
+    /// RFC 9110 13.2.2: a present If-Match overrides If-Unmodified-Since,
+    /// and a present If-None-Match overrides If-Modified-Since.
+    #[test]
+    fn etag_conditions_take_precedence_over_dates() {
+        // If-Match passes, so If-Unmodified-Since must be ignored.
+        assert_eq!(
+            eval(Some(ETAG), None, None, Some(&http_date(MTIME - 60_000))),
+            None
+        );
+        // If-None-Match does not match, so If-Modified-Since must be ignored.
+        assert_eq!(
+            eval(None, Some("\"other\""), Some(&http_date(MTIME)), None),
+            None
+        );
+    }
+
+    #[test]
+    fn unparsable_dates_are_ignored() {
+        assert_eq!(eval(None, None, Some("not a date"), None), None);
+        assert_eq!(eval(None, None, None, Some("nonsense")), None);
+    }
+
+    #[test]
+    fn http_dates_parse_in_their_permitted_forms() {
+        assert!(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").is_some());
+        assert!(parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT").is_some());
+        assert!(parse_http_date("Sun Nov  6 08:49:37 1994").is_some());
+        assert!(parse_http_date("2026-11-04T09:00:00Z").is_none());
+    }
+
+    /// A missing object cannot satisfy If-Match, and must not answer 304.
+    #[test]
+    fn missing_object_fails_if_match_but_not_if_none_match() {
+        let cond = |im: Option<&str>, inm: Option<&str>| Preconditions {
+            if_match: im.map(str::to_string),
+            if_none_match: inm.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_precondition_headers(&cond(Some(ETAG), None), None, None),
+            Some(412)
+        );
+        assert_eq!(
+            evaluate_precondition_headers(&cond(None, Some(ETAG)), None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn weakness_and_quoting_are_normalised() {
+        assert!(is_strong("\"abc\""));
+        assert!(is_strong("abc"));
+        assert!(!is_strong("W/\"abc\""));
+        assert!(!is_strong("w/\"abc\""));
+        for form in ["\"a826\"", "a826", "W/\"a826\"", "\"A826\""] {
+            assert_eq!(etag_value(form), "a826", "{form}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod put_destination_condition_tests {
+    use crate::s3::handlers::{evaluate_precondition_headers, Preconditions};
+
+    fn cond(if_match: Option<&str>, if_none_match: Option<&str>) -> Preconditions {
+        Preconditions {
+            if_match: if_match.map(str::to_string),
+            if_none_match: if_none_match.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// PutObject applies the destination conditions; a stale `If-Match` must be
+    /// refused so a concurrent replacement is not silently overwritten.
+    #[test]
+    fn put_destination_conditions_are_enforced() {
+        let etag = "\"abc123\"";
+        assert_eq!(
+            evaluate_precondition_headers(&cond(Some("\"old\""), None), Some(etag), None),
+            Some(412)
+        );
+        assert_eq!(
+            evaluate_precondition_headers(&cond(Some(etag), None), Some(etag), None),
+            None
+        );
+        // `If-None-Match: *` refuses to overwrite an existing object.
+        assert_eq!(
+            evaluate_precondition_headers(&cond(None, Some("*")), Some(etag), None),
+            Some(304)
+        );
+        assert_eq!(
+            evaluate_precondition_headers(&cond(None, Some("*")), None, None),
+            None
+        );
     }
 }

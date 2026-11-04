@@ -37,8 +37,10 @@ class S3TestConfig:
     
     def __init__(self):
         self.endpoint_url = 'http://localhost:9900'
-        self.access_key = 'AqU4axe4feDyIielarPI'
-        self.secret_key = '0CJZ2QfHi2tDb4DKuCJ2vnBEUXg5EYQt'
+        # Read the credentials from the environment; see the README for how to
+        # create one with `curvine-s3-gateway credential generate`.
+        self.access_key = os.environ.get('AWS_ACCESS_KEY_ID', '')
+        self.secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY', '')
         self.region = 'us-east-1'
         self.test_bucket = f'python-test-{int(time.time())}'
         self.temp_dir = tempfile.mkdtemp(prefix='curvine-s3-test-')
@@ -158,6 +160,62 @@ class S3BasicOperationsTest:
             self._record_test(f"Put Object ({key})", False)
             return False
     
+    def test_overwrite_is_atomic(self, key: str) -> bool:
+        """A successful overwrite must replace the object in one visible step.
+
+        The failure half of this property is covered by
+        `test_local_write_part_stream_removes_a_partial_part` and the staging
+        unit tests, not here: a short body is rejected by hyper with 400 before
+        the handler runs, so an early socket close cannot reach the staging
+        code and would make this assertion pass trivially. What is testable from
+        outside is that a normal overwrite publishes the new body whole.
+        """
+        v1 = b"first version of the object"
+        v2 = b"second version, longer than the first"
+
+        if not self.test_put_object(key, v1):
+            return False
+        ok, body = self.test_get_object(key)
+        if not ok or body != v1:
+            print("  FAIL: first version unreadable")
+            return False
+
+        if not self.test_put_object(key, v2):
+            return False
+        ok, body = self.test_get_object(key)
+        if not ok or body != v2:
+            print(f"  FAIL: overwrite did not publish the second version ({body!r})")
+            return False
+
+        # The ETag must follow the content, which is what makes the atomic
+        # publish observable to a client.
+        import subprocess
+
+        head = subprocess.run(
+            [
+                "aws",
+                "--endpoint-url",
+                self.client.config.endpoint_url,
+                "s3api",
+                "head-object",
+                "--bucket",
+                self.client.config.test_bucket,
+                "--key",
+                key,
+                "--query",
+                "ETag",
+                "--output",
+                "text",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        expected = '"' + hashlib.md5(v2).hexdigest() + '"'
+        if head.stdout.strip() != expected:
+            print(f"  FAIL: ETag {head.stdout.strip()} != content md5 {expected}")
+            return False
+        return True
+
     def test_get_object(self, key: str) -> Tuple[bool, Optional[bytes]]:
         """Test getting an object"""
         try:
@@ -627,6 +685,10 @@ class ComprehensiveS3TestSuite:
                 print(f"Data mismatch for {key}")
                 return False
         
+        # A failed overwrite must not destroy the existing object
+        if not basic_test.test_overwrite_is_atomic("overwrite-object"):
+            return False
+
         # Test list operations
         success, objects = basic_test.test_list_objects()
         if not success or len(objects) != len(test_data):

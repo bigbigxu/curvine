@@ -2903,7 +2903,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-s3-gateway"
-version = "0.2.1-beta"
+version = "0.2.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2931,7 +2931,6 @@ dependencies = [
  "rand 0.8.8",
  "scopeguard",
  "serde",
- "serde-xml-rs",
  "serde_json",
  "sha1",
  "sha2 0.10.9",
@@ -10149,18 +10148,6 @@ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
  "serde_derive",
-]
-
-[[package]]
-name = "serde-xml-rs"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb3aa78ecda1ebc9ec9847d5d3aba7d618823446a049ba2491940506da6e2782"
-dependencies = [
- "log",
- "serde",
- "thiserror 1.0.69",
- "xml-rs",
 ]
 
 [[package]]

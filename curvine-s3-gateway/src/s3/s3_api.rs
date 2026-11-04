@@ -15,7 +15,6 @@
 pub use crate::s3::error_code::Error;
 use std::{
     fmt::{Debug, Display},
-    io::Write,
     str::FromStr,
 };
 
@@ -92,9 +91,8 @@ pub trait GetObjectHandler: HeadHandler {
 extern crate serde;
 use serde::Serialize;
 use sha1::Digest;
-use tokio::io::AsyncSeekExt;
 
-use crate::utils::io::{PollRead, PollWrite};
+use crate::utils::io::PollWrite;
 
 pub use crate::s3::dto::{Bucket, Buckets, CommonPrefix, ListAllMyBucketsResult, Owner};
 pub use crate::s3::dto::{ListObjectContent, ListObjectResult};
@@ -167,12 +165,18 @@ pub trait ListObjectVersionsHandler: Send + Sync {
     ) -> impl std::future::Future<Output = Result<ListObjectVersionsResult, String>> + Send;
 }
 
+/// Legacy generic entry point, superseded by `S3Router::handle_head_object_request`.
+///
+/// Kept for API compatibility only: the live HEAD route reads metadata through
+/// `S3Handlers::lookup`. Aborts instead of panicking so a mis-wired caller
+/// cannot take the gateway down in a `panic = "abort"` build.
 pub fn handle_head_object<T: VRequest, F: VResponse, E: HeadHandler>(
     _req: &T,
-    _resp: &mut F,
+    resp: &mut F,
     _handler: &E,
 ) {
-    todo!()
+    resp.set_status(501);
+    resp.send_header();
 }
 
 /// Handle S3 GET Object requests with streaming support and range capabilities
@@ -513,7 +517,7 @@ pub async fn handle_get_list_object<
     let ret = handler.handle(&opt, bucket.as_str()).await;
     match ret {
         Ok(ans) => {
-            let (contents, common_prefixes) = if let Some(ref delim) = opt.delimiter {
+            let (mut contents, common_prefixes) = if let Some(ref delim) = opt.delimiter {
                 let files = ans
                     .into_iter()
                     .filter(|item| !item.key.ends_with(delim))
@@ -523,6 +527,28 @@ pub async fn handle_get_list_object<
                 (ans, vec![])
             };
 
+            // S3 requires lexicographic key order and honours
+            // `max-keys`/`continuation-token`; without this a directory with
+            // more than 1000 objects was returned in one response.
+            contents.sort_by(|a, b| a.key.cmp(&b.key));
+            if let Some(start_after) = opt.start_after.as_deref() {
+                contents.retain(|item| item.key.as_str() > start_after);
+            }
+            if let Some(token) = opt.continuation_token.as_deref() {
+                contents.retain(|item| item.key.as_str() > token);
+            }
+
+            let max_keys = opt.max_keys.unwrap_or(1000).max(1) as usize;
+            let is_truncated = contents.len() > max_keys;
+            if is_truncated {
+                contents.truncate(max_keys);
+            }
+            let next_continuation_token = if is_truncated {
+                contents.last().map(|item| item.key.clone())
+            } else {
+                None
+            };
+
             let total_count = contents.len() + common_prefixes.len();
 
             let result = ListObjectResult {
@@ -530,9 +556,11 @@ pub async fn handle_get_list_object<
                 name: bucket,
                 prefix: opt.prefix,
                 key_count: Some(total_count as u32),
-                max_keys: Some(opt.max_keys.unwrap_or(1000) as u32),
+                max_keys: Some(max_keys as u32),
                 delimiter: opt.delimiter,
-                is_truncated: false,
+                continuation_token: opt.continuation_token,
+                next_continuation_token,
+                is_truncated,
                 contents,
                 common_prefixes,
             };
@@ -565,7 +593,15 @@ pub async fn handle_get_list_object<
                 }
             }
         }
-        Err(err) => log::error!("get_list_object error {err}"),
+        Err(err) => {
+            // Without a status this answered whatever the response defaulted
+            // to, so "bucket does not exist" looked like an empty listing or a
+            // silent failure.
+            let status = status_for_error(&err);
+            log::warn!("get_list_object failed ({status}): {err}");
+            resp.set_status(status);
+            resp.send_header();
+        }
     }
 }
 
@@ -579,7 +615,7 @@ pub trait GetBucketLocationHandler: Send + Sync {
     fn handle(
         &self,
         loc: Option<&str>,
-    ) -> impl std::future::Future<Output = Result<Option<&'static str>, ()>> + Send;
+    ) -> impl std::future::Future<Output = Result<Option<&'static str>, String>> + Send;
 }
 #[derive(Debug)]
 pub struct ListBucketsOption {
@@ -682,16 +718,20 @@ pub use crate::s3::dto::{
     ChecksumAlgorithm, ObjectLockLegalHoldStatus, ObjectLockMode, PutObjectOption, RequestPayer,
 };
 pub trait PutObjectHandler: Send + Sync {
+    /// Writes the object and returns its ETag, which the S3 response echoes.
     fn handle(
         &self,
         opt: PutObjectOption,
         bucket: String,
         object: String,
         body: crate::utils::io::PollReaderEnum,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    ) -> impl std::future::Future<Output = Result<String, String>> + Send;
 
-    /// Get the temporary directory path for storing temporary files during PUT operations
-    fn get_temp_dir(&self) -> String;
+    /// Temporary storage used to stage object bodies before Curvine sees them.
+    ///
+    /// Exposed instead of a bare directory path: with distributed temp storage
+    /// the staging area is a Curvine path, which `tokio::fs` cannot write.
+    fn temp_storage(&self) -> std::sync::Arc<crate::utils::temp_storage::TempStorageEnum>;
 }
 
 /// Parse bucket and object names from URL path for PUT operations
@@ -742,11 +782,12 @@ pub async fn handle_put_object<
     F: VResponse,
     H: PutObjectHandler + Send + Sync,
 >(
-    mut v4head: crate::auth::sig_v4::V4Head,
+    v4head: crate::auth::sig_v4::V4Head,
     req: T,
     resp: &mut F,
     handler: &H,
 ) {
+    let _ = &v4head;
     if req.method() != "PUT" {
         resp.set_status(405);
         resp.send_header();
@@ -813,6 +854,22 @@ pub async fn handle_put_object<
         write_offset_bytes: req
             .get_header("x-amz-write-offset-bytes")
             .and_then(|v| v.parse::<i64>().ok()),
+        metadata: {
+            // S3 user metadata travels as `x-amz-meta-<name>`; keep the name
+            // without the prefix so HEAD can emit it back unchanged.
+            let mut map = std::collections::HashMap::new();
+            req.rng_header(|k, v| {
+                if let Some(name) = k.strip_prefix("x-amz-meta-") {
+                    map.insert(name.to_string(), v.to_string());
+                }
+                true
+            });
+            if map.is_empty() {
+                None
+            } else {
+                Some(map)
+            }
+        },
     };
 
     enum ContentSha256 {
@@ -843,7 +900,7 @@ pub async fn handle_put_object<
             return;
         }
     };
-    let r = match req.get_body_reader().await {
+    let mut r = match req.get_body_reader().await {
         Ok(val) => val,
         Err(err) => {
             log::error!(
@@ -855,7 +912,7 @@ pub async fn handle_put_object<
             return;
         }
     };
-    let ret: Result<(), String> = match content_sha256 {
+    let ret: Result<String, String> = match content_sha256 {
         ContentSha256::Hash(cs) => {
             let content_length = match opt.content_length {
                 Some(val) => val as usize,
@@ -921,236 +978,117 @@ pub async fn handle_put_object<
                                 resp.send_header();
                                 return;
                             }
+                            BodyParseError::Unsupported(_) => {
+                                log::warn!(
+                                    "{}",
+                                    curvine_core_error::err_msg!(
+                                        "Unsupported body framing: {}",
+                                        err
+                                    )
+                                );
+                                resp.set_status(400);
+                                resp.send_header();
+                                return;
+                            }
                         }
                     }
                 }
             } else {
-                let temp_dir = handler.get_temp_dir();
-                // Ensure temp directory exists (for local filesystem only)
-                if !temp_dir.starts_with("/system") {
-                    let _ = tokio::fs::create_dir_all(&temp_dir).await;
-                }
-                match tokio::fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .read(true)
-                    .mode(0o644)
-                    .open(format!("{}/{}", temp_dir, cs))
+                // Stage through the configured temp storage: with distributed
+                // staging the path lives in Curvine and `tokio::fs` cannot
+                // write it.
+                let storage = handler.temp_storage();
+                let staging_id = uuid::Uuid::new_v4().to_string();
+                let reader = match storage
+                    .stage_object(
+                        &staging_id,
+                        &mut r,
+                        crate::utils::temp_storage::StageExpect {
+                            sha256_hex: Some(&cs),
+                            content_length: Some(content_length),
+                        },
+                    )
                     .await
                 {
-                    Ok(mut fd) => match parse_body(r, &mut fd, &cs, content_length).await {
-                        Ok(_) => {
-                            if let Err(err) = fd.seek(std::io::SeekFrom::Start(0)).await {
-                                log::error!("fd seek failed {err}");
-                                resp.set_status(500);
-                                resp.send_header();
-                                return;
-                            }
-                            let reader = crate::utils::io::PollReaderEnum::File(fd);
-                            handler
-                                .handle(opt.clone(), bucket.to_string(), object.to_string(), reader)
-                                .await
-                        }
-                        Err(err) => match err {
-                            ParseBodyError::HashMismatch => {
-                                log::warn!("put object hash not match");
-                                resp.set_status(400);
-                                resp.send_header();
-                                return;
-                            }
-                            ParseBodyError::ContentLengthMismatch => {
-                                log::warn!("content length invalid");
-                                resp.set_status(400);
-                                resp.send_header();
-                                return;
-                            }
-                            ParseBodyError::Io(err) => {
-                                log::error!("parse body io error {err}");
-                                resp.set_status(500);
-                                resp.send_header();
-                                return;
-                            }
-                            ParseBodyError::InvalidEncoding(err) => {
-                                log::error!("invalid content encoding: {err}");
-                                resp.set_status(400);
-                                resp.send_header();
-                                return;
-                            }
-                        },
-                    },
-                    Err(err) => {
-                        log::error!("open local path error {err}");
-                        resp.set_status(500);
+                    Ok(reader) => reader,
+                    Err(e) => {
+                        log::warn!("failed to stage PUT body: {e}");
+                        let _ = storage.cleanup_object(&staging_id).await;
+                        resp.set_status(if e.contains("does not match") {
+                            400
+                        } else {
+                            500
+                        });
                         resp.send_header();
                         return;
                     }
+                };
+
+                let ret = handler
+                    .handle(opt.clone(), bucket.to_string(), object.to_string(), reader)
+                    .await;
+                if let Err(e) = storage.cleanup_object(&staging_id).await {
+                    log::warn!("failed to clean staging {staging_id}: {e}");
                 }
+                ret
             }
         }
         ContentSha256::Streaming => {
-            let temp_dir = handler.get_temp_dir();
-            // Ensure temp directory exists (for local filesystem only)
-            if !temp_dir.starts_with("/system") {
-                let _ = tokio::fs::create_dir_all(&temp_dir).await;
-            }
-            let file_name = uuid::Uuid::new_v4().to_string()[..8].to_string();
-            let file_name = format!("{}/{}", temp_dir, file_name);
-            let ret = match tokio::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .read(true)
-                .mode(0o644)
-                .open(file_name.as_str())
-                .await
-            {
-                Ok(mut fd) => crate::utils::chunk_parse(r, &mut fd, v4head.hasher()).await,
-                Err(err) => {
-                    log::error!("open local temp file error {err}");
-                    resp.set_status(500);
-                    resp.send_header();
-                    return;
-                }
-            };
-            if let Err(err) = ret {
-                if let Err(cleanup_err) = tokio::fs::remove_file(file_name.as_str()).await {
-                    log::warn!("remove temp file {file_name} failed: {cleanup_err}");
-                }
-                match err {
-                    crate::utils::ChunkParseError::HashNoMatch => {
-                        log::warn!("accept hash no match request");
-                        resp.set_status(400);
-                        resp.send_header();
-                        return;
-                    }
-                    crate::utils::ChunkParseError::IllegalContent => {
-                        log::warn!("accept illegal content request");
-                        resp.set_status(400);
-                        resp.send_header();
-                        return;
-                    }
-                    crate::utils::ChunkParseError::Io(err) => {
-                        log::error!("local io error {err}");
-                        resp.set_status(500);
-                        resp.send_header();
-                        return;
-                    }
-                }
-            }
-            match tokio::fs::OpenOptions::new()
-                .read(true)
-                .open(file_name.as_str())
-                .await
-            {
-                Ok(fd) => {
-                    let reader = crate::utils::io::PollReaderEnum::File(fd);
-                    let ret = handler
-                        .handle(opt.clone(), bucket.to_string(), object.to_string(), reader)
-                        .await;
-                    if let Err(cleanup_err) = tokio::fs::remove_file(file_name.as_str()).await {
-                        log::warn!("remove temp file {file_name} failed: {cleanup_err}");
-                    }
-                    ret
-                }
-                Err(err) => {
-                    log::error!("open file {file_name} error {err}");
-                    resp.set_status(500);
-                    resp.send_header();
-                    if let Err(cleanup_err) = tokio::fs::remove_file(file_name.as_str()).await {
-                        log::warn!("remove temp file {file_name} failed: {cleanup_err}");
-                    }
-                    return;
-                }
-            }
+            // Chunked SigV4 payloads are rejected earlier by `get_body_stream`;
+            // reaching here means the framing was not decoded, so fail with a
+            // client error instead of staging an unverified body.
+            log::warn!("STREAMING-AWS4-HMAC-SHA256-PAYLOAD bodies are not supported");
+            resp.set_status(400);
+            resp.send_header();
+            return;
         }
         ContentSha256::Unsigned => {
-            // No hash verification; stream body into a temp file, then pass to handler
-            let temp_dir = handler.get_temp_dir();
-            // Ensure temp directory exists (for local filesystem only)
-            if !temp_dir.starts_with("/system") {
-                let _ = tokio::fs::create_dir_all(&temp_dir).await;
-            }
-            let file_name = uuid::Uuid::new_v4().to_string()[..8].to_string();
-            let file_name = format!("{}/{}", temp_dir, file_name);
-            let ret = match tokio::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .read(true)
-                .mode(0o644)
-                .open(file_name.as_str())
-                .await
-            {
-                Ok(mut fd) => {
-                    // write all body to temp file using BytesMut accumulation
-                    let mut reader = r;
-                    use bytes::BytesMut;
-                    use tokio::io::AsyncWriteExt;
-                    loop {
-                        match reader.poll_read().await {
-                            Ok(Some(buf)) => {
-                                // Use BytesMut to avoid zero-prefill Vec issues
-                                let mut bytes_chunk = BytesMut::with_capacity(buf.len());
-                                bytes_chunk.extend_from_slice(&buf);
-                                if let Err(e) = fd.write_all(&bytes_chunk).await {
-                                    log::error!("unsigned write error {e}");
-                                    break Err(format!("write error {e}"));
-                                }
-                            }
-                            Ok(None) => break Ok(()),
-                            Err(e) => {
-                                log::error!("unsigned read error {e}");
-                                break Err(e);
-                            }
-                        }
-                    }
-                }
-                Err(err) => {
-                    log::error!("open local temp file error {err}");
-                    resp.set_status(500);
-                    resp.send_header();
-                    return;
-                }
+            // No hash to verify, so the body can be staged through the
+            // configured temp storage (local or Curvine) and streamed to the
+            // handler; `tokio::fs` cannot address a Curvine staging path.
+            let storage = handler.temp_storage();
+            let staging_id = uuid::Uuid::new_v4().to_string();
+            let expect = crate::utils::temp_storage::StageExpect {
+                sha256_hex: None,
+                content_length: opt.content_length.and_then(|v| usize::try_from(v).ok()),
             };
-
-            if let Err(_err) = ret {
-                let _ = tokio::fs::remove_file(file_name.as_str()).await;
-                resp.set_status(500);
-                resp.send_header();
-                return;
-            }
-
-            match tokio::fs::OpenOptions::new()
-                .read(true)
-                .open(file_name.as_str())
-                .await
-            {
-                Ok(fd) => {
-                    let reader = crate::utils::io::PollReaderEnum::File(fd);
+            match storage.stage_object(&staging_id, &mut r, expect).await {
+                Ok(reader) => {
                     let ret = handler
                         .handle(opt.clone(), bucket.to_string(), object.to_string(), reader)
                         .await;
-                    let _ = tokio::fs::remove_file(file_name.as_str()).await;
+                    if let Err(e) = storage.cleanup_object(&staging_id).await {
+                        log::warn!("failed to clean staging {staging_id}: {e}");
+                    }
                     ret
                 }
-                Err(err) => {
-                    log::error!("open file {file_name} error {err}");
-                    resp.set_status(500);
+                Err(e) => {
+                    log::warn!("failed to stage unsigned PUT body: {e}");
+                    let _ = storage.cleanup_object(&staging_id).await;
+                    resp.set_status(if e.contains("does not match") {
+                        400
+                    } else {
+                        500
+                    });
                     resp.send_header();
-                    let _ = tokio::fs::remove_file(file_name.as_str()).await;
                     return;
                 }
             }
         }
     };
-    //
     match ret {
-        Ok(_) => {
+        Ok(etag) => {
+            resp.set_header("etag", &etag);
             resp.set_status(200);
             resp.send_header();
         }
         Err(err) => {
-            resp.set_status(500);
+            // A failed `If-Match` / `If-None-Match` is 412, not a server error;
+            // clients must be able to tell a lost update from an outage.
+            let status = status_for_error(&err);
+            log::warn!("put object failed ({status}): {err}");
+            resp.set_status(status);
             resp.send_header();
-            log::error!("put object handle error: {err}");
         }
     }
 }
@@ -1234,9 +1172,17 @@ pub async fn handle_post_delete_objects<
         }
     };
 
-    // Parse XML
-    let parsed: Result<DeleteObjectsRequest, _> =
-        quick_xml::de::from_str(unsafe { std::str::from_utf8_unchecked(&body) });
+    // Parse XML. The body is client-controlled, so decode it with validation
+    // rather than fabricating a `&str` from unchecked memory.
+    let parsed: Result<DeleteObjectsRequest, _> = match std::str::from_utf8(&body) {
+        Ok(xml) => quick_xml::de::from_str(xml),
+        Err(e) => {
+            log::error!("DeleteObjects body is not valid UTF-8: {e}");
+            resp.set_status(400);
+            resp.send_header();
+            return;
+        }
+    };
     let req_obj = match parsed {
         Ok(v) => v,
         Err(e) => {
@@ -1334,18 +1280,25 @@ pub struct MultiUploadObjectCompleteOption {
 ///
 /// Deep async call chains require heap-allocated futures to prevent stack overflow.
 /// This is a necessary trade-off: async_trait boxes futures, but prevents crashes.
-/// AsyncReadEnum still provides zero-allocation for body reading.
+/// Part bodies are streamed straight into temp storage, so nothing here
+/// buffers a whole part.
 #[async_trait::async_trait]
 pub trait MultiUploadObjectHandler: Send + Sync {
     async fn handle_create_session(&self, bucket: String, key: String) -> Result<String, ()>;
 
-    async fn handle_upload_part(
+    /// Stages the part body into the configured temp storage.
+    ///
+    /// `expect` carries the checks the body must satisfy before the part is
+    /// visible; leaving it to the handler lets both the local and the Curvine
+    /// backend verify while streaming, without buffering the part in memory.
+    async fn handle_upload_part<R: crate::utils::io::PollRead + Send>(
         &self,
         bucket: String,
         key: String,
         upload_id: String,
         part_number: u32,
-        body: crate::utils::io::AsyncReadEnum,
+        body: &mut R,
+        expect: crate::utils::temp_storage::StageExpect<'_>,
     ) -> Result<String, ()>;
 
     async fn handle_complete(
@@ -1355,7 +1308,7 @@ pub trait MultiUploadObjectHandler: Send + Sync {
         upload_id: String,
         data: Vec<(String, u32)>,
         opts: MultiUploadObjectCompleteOption,
-    ) -> Result<String, ()>;
+    ) -> Result<String, String>;
 
     async fn handle_abort(&self, bucket: String, key: String, upload_id: String) -> Result<(), ()>;
 }
@@ -1481,8 +1434,32 @@ pub async fn handle_multipart_upload_part<
         return;
     }
 
+    use crate::auth::sig_v4::VHeader as _;
     let header = req.take_header();
-    let body_reader = match req.get_body_reader().await {
+    // The part streams straight into the configured temp storage. Buffering it
+    // first would hold a whole part (up to the S3 5 GiB limit) in memory, and
+    // `panic = "abort"` turns that out-of-memory into a gateway-wide abort.
+    if let Err(status) = reject_streaming_part(&header) {
+        log::warn!("chunked aws-chunked part bodies are not supported");
+        resp.set_status(status);
+        resp.send_header();
+        return;
+    }
+    let content_length = match multipart_part_length(&header) {
+        Ok(length) => length,
+        Err(status) => {
+            resp.set_status(status);
+            resp.send_header();
+            return;
+        }
+    };
+    let declared_sha256 = header.get_header("x-amz-content-sha256");
+    let expect = crate::utils::temp_storage::StageExpect {
+        sha256_hex: part_sha256(declared_sha256.as_deref()),
+        content_length: Some(content_length),
+    };
+
+    let mut body_reader = match req.get_body_reader().await {
         Ok(body_reader) => body_reader,
         Err(err) => {
             log::error!("get body reader failed {err}");
@@ -1492,47 +1469,16 @@ pub async fn handle_multipart_upload_part<
         }
     };
 
-    let (body, release) = match get_body_stream(body_reader, &header).await {
-        Ok(data) => data,
-        Err(err) => {
-            log::error!("get body stream error {err}");
-            resp.set_status(500);
-            resp.send_header();
-            return;
-        }
-    };
-
-    let ret = match body {
-        StreamType::File(file) => {
-            let body = crate::utils::io::AsyncReadEnum::File(file);
-            handler
-                .handle_upload_part(
-                    raw[0].to_string(),
-                    raw[1].to_string(),
-                    upload_id.clone(),
-                    part_number,
-                    body,
-                )
-                .await
-        }
-
-        StreamType::Buff(buf_reader) => {
-            let body = crate::utils::io::AsyncReadEnum::BufCursor(buf_reader);
-            handler
-                .handle_upload_part(
-                    raw[0].to_string(),
-                    raw[1].to_string(),
-                    upload_id.clone(),
-                    part_number,
-                    body,
-                )
-                .await
-        }
-    };
-
-    if let Some(release) = release {
-        release.await;
-    }
+    let ret = handler
+        .handle_upload_part(
+            raw[0].to_string(),
+            raw[1].to_string(),
+            upload_id.clone(),
+            part_number,
+            &mut body_reader,
+            expect,
+        )
+        .await;
 
     if let Ok(etag) = ret {
         resp.set_header("etag", &etag);
@@ -1540,6 +1486,54 @@ pub async fn handle_multipart_upload_part<
         resp.set_status(500);
         resp.send_header();
     }
+}
+
+/// Reject the SigV4 streaming framing, which this build does not decode.
+///
+/// Its bytes are length-prefixed chunk records, not part content, so staging
+/// them would store a corrupt part. `Content-Length` is also only an estimate
+/// for that framing, which makes the length check meaningless.
+fn reject_streaming_part<H: crate::auth::sig_v4::VHeader>(header: &H) -> Result<(), u16> {
+    // The whole `STREAMING-...` family (including the `-TRAILER` variants) is
+    // aws-chunked framing, so match the prefix rather than one exact value.
+    if header
+        .get_header("x-amz-content-sha256")
+        .is_some_and(|value| value.starts_with("STREAMING-"))
+    {
+        return Err(400);
+    }
+    Ok(())
+}
+
+/// Largest part S3 accepts. A larger declared length is a client error, not a
+/// reason to allocate whichever size the header names.
+const MAX_PART_BYTES: usize = 5 << 30;
+
+/// Digest a part body must match, or `None` when the client sent no verifiable
+/// hash.
+///
+/// `UNSIGNED-PAYLOAD` carries no whole-body digest. Comparing that literal
+/// string with the computed hash is what used to fail every unsigned part
+/// above the in-memory threshold. The streaming framing is rejected earlier,
+/// so it never reaches this filter.
+fn part_sha256(declared: Option<&str>) -> Option<&str> {
+    declared.filter(|value| *value != "UNSIGNED-PAYLOAD")
+}
+
+/// Declared part length, or the status to answer with.
+///
+/// A part body is only streamable with a known length: without it the read
+/// loop cannot bound the part or report a truncated upload.
+fn multipart_part_length<H: crate::auth::sig_v4::VHeader>(header: &H) -> Result<usize, u16> {
+    let raw = match header.get_header("content-length") {
+        Some(value) => value,
+        None => return Err(411),
+    };
+    let length = raw.trim().parse::<usize>().map_err(|_| 400_u16)?;
+    if length > MAX_PART_BYTES {
+        return Err(400);
+    }
+    Ok(length)
 }
 
 pub async fn handle_multipart_complete_session<
@@ -1584,9 +1578,16 @@ pub async fn handle_multipart_complete_session<
 
         match req.body().await {
             Ok(body) => {
-                match quick_xml::de::from_str::<CompleteMultiPartUploadRequest>(unsafe {
-                    std::str::from_utf8_unchecked(&body)
-                }) {
+                let parsed = match std::str::from_utf8(&body) {
+                    Ok(xml) => quick_xml::de::from_str::<CompleteMultiPartUploadRequest>(xml),
+                    Err(e) => {
+                        log::error!("CompleteMultipartUpload body is not valid UTF-8: {e}");
+                        resp.set_status(400);
+                        resp.send_header();
+                        return;
+                    }
+                };
+                match parsed {
                     Ok(upload_request) => {
                         let data = upload_request
                             .parts
@@ -1651,9 +1652,12 @@ pub async fn handle_multipart_complete_session<
                                     }
                                 }
                             }
-                            Err(_) => {
-                                log::error!("handle_complete error");
-                                resp.set_status(500);
+                            Err(e) => {
+                                // An unknown upload id is 404 NoSuchUpload, not
+                                // a server error; clients retry 500s.
+                                let status = status_for_error(&e);
+                                log::warn!("handle_complete failed ({status}): {e}");
+                                resp.set_status(status);
                                 resp.send_header();
                             }
                         }
@@ -1676,17 +1680,66 @@ pub async fn handle_multipart_complete_session<
     }
 }
 
-/// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
+/// Handles `DELETE /{bucket}/{key}?uploadId=...` (AbortMultipartUpload).
+///
+/// SDKs abort an upload after any part failure, so this must remove the staged
+/// parts instead of leaving them behind until manual cleanup.
+pub async fn handle_abort_multipart_upload<
+    T: VRequest,
+    F: VResponse,
+    H: MultiUploadObjectHandler + Send + Sync,
+>(
+    req: T,
+    resp: &mut F,
+    handler: &H,
+) {
+    let url_path = req.url_path();
+    let path = url_path.trim_matches('/');
+    let (bucket, key) = match path.split_once('/') {
+        Some((b, k)) if !b.is_empty() && !k.is_empty() => (b.to_string(), k.to_string()),
+        _ => {
+            resp.set_status(400);
+            resp.send_header();
+            return;
+        }
+    };
+
+    let upload_id = match req.get_query("uploadId") {
+        Some(id) if !id.is_empty() => id.as_str().to_string(),
+        _ => {
+            resp.set_status(400);
+            resp.send_header();
+            return;
+        }
+    };
+
+    match handler.handle_abort(bucket, key, upload_id).await {
+        Ok(()) => {
+            resp.set_status(204);
+            resp.send_header();
+        }
+        Err(()) => {
+            resp.set_status(500);
+            resp.send_header();
+        }
+    }
+}
+
+/// Legacy generic entry point, superseded by `S3Router::handle_multipart_abort_request`.
+///
+/// Responds 501 rather than panicking: this crate is built with `panic = "abort"`,
+/// so an unimplemented protocol path must never be able to terminate the process.
 pub async fn handle_multipart_abort_session<
     T: VRequest,
     F: VResponse,
     H: MultiUploadObjectHandler + Send + Sync,
 >(
     _req: T,
-    _resp: &mut F,
+    resp: &mut F,
     _handler: &H,
 ) {
-    todo!()
+    resp.set_status(501);
+    resp.send_header();
 }
 pub struct CreateBucketOption {
     pub grant_full_control: Option<String>,
@@ -2053,137 +2106,35 @@ pub async fn handle_delete_bucket<
             resp.send_header();
         }
         Err(e) => {
-            resp.set_status(500);
-            log::error!("delete object handler error: {e}")
+            let status = status_for_error(&e);
+            log::warn!("delete bucket failed ({status}): {e}");
+            resp.set_status(status);
+            resp.send_header();
         }
+    }
+}
+
+/// Map a handler error to the HTTP status the S3 protocol requires.
+///
+/// Handlers report protocol conditions as text; without this the caller could
+/// only answer 500, which hid "bucket does not exist" and "bucket not empty"
+/// from every S3 client.
+pub(crate) fn status_for_error(err: &str) -> u16 {
+    if err.starts_with("NoSuchBucket") {
+        404
+    } else if err.starts_with("BucketNotEmpty") {
+        409
+    } else if err.starts_with("NoSuchKey") || err.starts_with("NoSuchUpload") {
+        404
+    } else if err.starts_with("PreconditionFailed") {
+        412
+    } else {
+        500
     }
 }
 
 //utils
-// Use unified BodyParseError from crate::error module
 pub use crate::error::BodyParseError as ParseBodyError;
-enum StreamType {
-    File(tokio::fs::File),
-    Buff(tokio::io::BufReader<std::io::Cursor<Vec<u8>>>),
-}
-
-async fn get_body_stream<T: crate::utils::io::PollRead + Send, H: crate::auth::sig_v4::VHeader>(
-    mut src: T,
-    header: &H,
-) -> Result<
-    (
-        StreamType,
-        Option<std::pin::Pin<Box<dyn Send + std::future::Future<Output = ()>>>>,
-    ),
-    ParseBodyError,
-> {
-    let cl = header.get_header("content-length");
-    let acs = header
-        .get_header("x-amz-content-sha256")
-        .ok_or(ParseBodyError::HashMismatch)?;
-    if let Some(cl) = cl {
-        let cl = cl
-            .as_str()
-            .parse::<usize>()
-            .or(Err(ParseBodyError::ContentLengthMismatch))?;
-        if acs.as_str() != "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
-            if cl <= 10 << 20 {
-                // Use BytesMut to avoid zero-prefilled Vec allocation
-                use bytes::BytesMut;
-                let mut buff = BytesMut::new();
-
-                // Read data using PollRead and accumulate in BytesMut
-                let mut hsh = sha2::Sha256::new();
-                let mut remaining = cl;
-                while let Some(chunk) = src.poll_read().await.map_err(ParseBodyError::Io)? {
-                    let chunk_len = chunk.len();
-                    if remaining < chunk_len {
-                        return Err(ParseBodyError::ContentLengthMismatch);
-                    }
-                    remaining -= chunk_len;
-                    let _ = hsh.write_all(&chunk);
-                    buff.extend_from_slice(&chunk);
-                }
-
-                // Verify SHA256 if not UNSIGNED-PAYLOAD
-                if acs.as_str() != "UNSIGNED-PAYLOAD" {
-                    let ret = hsh.finalize();
-                    let real_sha256 = hex::encode(ret);
-                    if real_sha256.as_str() != acs.as_str() {
-                        return Err(ParseBodyError::HashMismatch);
-                    }
-                }
-
-                return Ok((
-                    StreamType::Buff(tokio::io::BufReader::new(std::io::Cursor::new(
-                        buff.to_vec(),
-                    ))),
-                    None,
-                ));
-            } else {
-                let file_name = format!(
-                    "/tmp/curvine-temp/{}",
-                    &uuid::Uuid::new_v4().to_string()[..8]
-                );
-                let mut fd = tokio::fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .mode(0o644)
-                    .open(file_name.as_str())
-                    .await
-                    .map_err(|err| ParseBodyError::Io(err.to_string()))?;
-                parse_body(src, &mut fd, &acs, cl).await?;
-                drop(fd);
-                match tokio::fs::OpenOptions::new()
-                    .read(true)
-                    .open(file_name.as_str())
-                    .await
-                {
-                    Ok(fd) => {
-                        return Ok((
-                            StreamType::File(fd),
-                            Some({
-                                Box::pin(async move {
-                                    let _ = tokio::fs::remove_file(file_name.as_str()).await;
-                                })
-                            }),
-                        ))
-                    }
-                    Err(err) => {
-                        let _ = tokio::fs::remove_file(file_name.as_str()).await;
-                        return Err(ParseBodyError::Io(err.to_string()));
-                    }
-                }
-                // return Ok(())
-            }
-        }
-    }
-    //chunk
-    todo!()
-}
-
-async fn parse_body<
-    T: crate::utils::io::PollRead + Send,
-    E: tokio::io::AsyncWrite + Send + Unpin,
->(
-    src: T,
-    dst: &mut E,
-    content_sha256: &str,
-    content_length: usize,
-) -> Result<(), ParseBodyError> {
-    use tokio::io::AsyncWriteExt;
-
-    let (chunks, _hash) = read_and_validate_body(src, content_sha256, content_length).await?;
-
-    // Write all chunks to destination
-    for chunk in chunks {
-        dst.write_all(&chunk)
-            .await
-            .map_err(|err| ParseBodyError::Io(format!("write error {err}")))?;
-    }
-
-    Ok(())
-}
 
 #[async_trait::async_trait]
 impl crate::utils::io::PollRead for tokio::io::BufReader<std::io::Cursor<Vec<u8>>> {
@@ -2267,4 +2218,194 @@ async fn read_body_to_vec<T: crate::utils::io::PollRead + Send>(
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::sig_v4::VHeader;
+    use std::collections::HashMap;
+
+    struct Headers(HashMap<String, String>);
+
+    impl VHeader for Headers {
+        fn get_header(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+
+        fn set_header(&mut self, key: &str, val: &str) {
+            self.0.insert(key.to_string(), val.to_string());
+        }
+
+        fn delete_header(&mut self, key: &str) {
+            self.0.remove(key);
+        }
+
+        fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
+            for (key, value) in &self.0 {
+                if !cb(key, value) {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn part_header(length: &str, sha256: Option<&str>) -> Headers {
+        let mut map = HashMap::from([("content-length".to_string(), length.to_string())]);
+        if let Some(sha256) = sha256 {
+            map.insert("x-amz-content-sha256".to_string(), sha256.to_string());
+        }
+        Headers(map)
+    }
+
+    /// The declared length is a client claim: an oversized part must be
+    /// refused before anything allocates that much memory.
+    #[test]
+    fn rejects_an_oversized_part_length() {
+        assert_eq!(multipart_part_length(&part_header("6GB", None)), Err(400));
+        assert_eq!(
+            multipart_part_length(&part_header("5368709121", None)),
+            Err(400)
+        );
+        assert_eq!(
+            multipart_part_length(&part_header("5368709120", None)),
+            Ok(MAX_PART_BYTES)
+        );
+    }
+
+    /// Without a length the part cannot be bounded or checked for truncation.
+    #[test]
+    fn rejects_a_part_without_content_length() {
+        let header = Headers(HashMap::new());
+        assert_eq!(multipart_part_length(&header), Err(411));
+    }
+
+    /// A part body is not staged into memory, so the digest and length are
+    /// enforced while writing it. An unsigned part must not be compared with
+    /// the literal header text, which used to fail every such part.
+    #[tokio::test]
+    async fn write_part_stream_verifies_length_and_digest() {
+        use crate::utils::temp_storage::{LocalTempStorage, StageExpect, TempStorageConfig};
+        use std::io::Cursor;
+
+        let dir = std::env::temp_dir().join(format!("curvine-part-{}", uuid::Uuid::new_v4()));
+        let storage = LocalTempStorage::new(TempStorageConfig::new(
+            dir.to_str().unwrap().to_string(),
+            1024,
+            4096,
+        ));
+        let data = vec![7u8; 8192];
+        let digest = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&data))
+        };
+
+        let mut body = tokio::io::BufReader::new(Cursor::new(data.clone()));
+        let etag = storage
+            .write_part_stream(
+                "upload",
+                1,
+                &mut body,
+                StageExpect {
+                    sha256_hex: Some(&digest),
+                    content_length: Some(data.len()),
+                },
+            )
+            .await
+            .expect("a verified part must be staged");
+        assert!(etag.starts_with('"') && etag.ends_with('"'));
+
+        // Unsigned payload: length only.
+        let mut body = tokio::io::BufReader::new(Cursor::new(data.clone()));
+        storage
+            .write_part_stream(
+                "upload",
+                2,
+                &mut body,
+                StageExpect {
+                    sha256_hex: None,
+                    content_length: Some(data.len()),
+                },
+            )
+            .await
+            .expect("an unsigned part must be accepted");
+
+        // A wrong digest must fail and leave no part behind for Complete.
+        let mut body = tokio::io::BufReader::new(Cursor::new(data.clone()));
+        let err = storage
+            .write_part_stream(
+                "upload",
+                3,
+                &mut body,
+                StageExpect {
+                    sha256_hex: Some("00"),
+                    content_length: Some(data.len()),
+                },
+            )
+            .await
+            .expect_err("a wrong digest must be rejected");
+        assert!(err.contains("sha256"), "{err}");
+        assert!(
+            !tokio::fs::try_exists(storage_part_path(&dir, "upload", 3))
+                .await
+                .unwrap_or(false),
+            "a rejected part must not be left for Complete"
+        );
+
+        // A short body must not silently produce a truncated part.
+        let mut body = tokio::io::BufReader::new(Cursor::new(data[..16].to_vec()));
+        let err = storage
+            .write_part_stream(
+                "upload",
+                4,
+                &mut body,
+                StageExpect {
+                    sha256_hex: None,
+                    content_length: Some(data.len()),
+                },
+            )
+            .await
+            .expect_err("a short body must be rejected");
+        assert!(err.contains("length"), "{err}");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    fn storage_part_path(dir: &std::path::Path, upload_id: &str, part: u32) -> std::path::PathBuf {
+        dir.join(upload_id).join(part.to_string())
+    }
+
+    /// Staging an undecoded aws-chunked body would store chunk framing as part
+    /// data, so the whole `STREAMING-` family must be refused, not just the one
+    /// value that was matched before.
+    #[test]
+    fn rejects_the_undecoded_streaming_framing() {
+        for framing in [
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+        ] {
+            assert_eq!(
+                reject_streaming_part(&part_header("64", Some(framing))),
+                Err(400),
+                "{framing} is aws-chunked framing and must not be staged"
+            );
+        }
+        for verifiable in ["UNSIGNED-PAYLOAD", "abc"] {
+            assert_eq!(
+                reject_streaming_part(&part_header("64", Some(verifiable))),
+                Ok(()),
+                "{verifiable} is a real payload and must be accepted"
+            );
+        }
+        assert_eq!(reject_streaming_part(&part_header("64", None)), Ok(()));
+    }
+
+    #[test]
+    fn unsigned_parts_carry_no_digest() {
+        assert_eq!(part_sha256(Some("UNSIGNED-PAYLOAD")), None);
+        assert_eq!(part_sha256(None), None);
+        // A real digest is verified, not skipped.
+        assert_eq!(part_sha256(Some("abc")), Some("abc"));
+    }
 }

@@ -91,9 +91,14 @@ impl sig_v4::VHeader for Request {
 
     fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
         for (k, v) in self.request.headers().iter() {
-            if !cb(k.as_str(), unsafe {
-                std::str::from_utf8_unchecked(v.as_bytes())
-            }) {
+            // Header values are raw bytes; skip the non-UTF-8 ones instead of
+            // producing a `&str` from unchecked memory (UB, and a panic-abort
+            // build turns it into a process crash).
+            let Ok(value) = v.to_str() else {
+                log::warn!("skip header {} with non-UTF-8 value", k.as_str());
+                continue;
+            };
+            if !cb(k.as_str(), value) {
                 return;
             }
         }
@@ -205,9 +210,11 @@ impl sig_v4::VHeader for HeaderWarp {
 
     fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
         for (k, v) in self.0.iter() {
-            if !cb(k.as_str(), unsafe {
-                std::str::from_utf8_unchecked(v.as_bytes())
-            }) {
+            let Ok(value) = v.to_str() else {
+                log::warn!("skip header {} with non-UTF-8 value", k.as_str());
+                continue;
+            };
+            if !cb(k.as_str(), value) {
                 return;
             }
         }
@@ -267,9 +274,11 @@ impl sig_v4::VHeader for Response {
 
     fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
         self.headers.iter().all(|(k, v)| {
-            cb(k.as_str(), unsafe {
-                std::str::from_utf8_unchecked(v.as_bytes())
-            })
+            let Ok(value) = v.to_str() else {
+                log::warn!("skip header {} with non-UTF-8 value", k.as_str());
+                return true;
+            };
+            cb(k.as_str(), value)
         });
     }
 }
@@ -326,17 +335,26 @@ pub async fn stream_get_object(
     let object = path_parts[1];
 
     use crate::auth::sig_v4::VHeader;
-    let range_header = req.get_header("range");
-    let (range_start, range_end) = if let Some(range_str) = range_header {
-        parse_range_header(&range_str)
-    } else {
-        (None, None)
+    // Parse the Range header once, with the validating parser that also
+    // rejects unsatisfiable ranges (`Range::to_byte_range` returns `None`).
+    let requested_range = match req.get_header("range") {
+        Some(range_str) => match crate::s3::types::Range::parse(&range_str) {
+            Ok(range) => Some(range),
+            Err(e) => {
+                tracing::warn!("invalid Range header {range_str:?}: {e}");
+                return axum::response::Response::builder()
+                    .status(400)
+                    .body(axum::body::Body::from("Invalid Range header"))
+                    .unwrap();
+            }
+        },
+        None => None,
     };
-
     let opt = GetObjectOption {
-        range_start,
-        range_end,
+        range_start: None,
+        range_end: None,
     };
+    let _ = &opt;
 
     let cv_path = match handlers.cv_object_path(bucket, object) {
         Ok(path) => path,
@@ -366,28 +384,35 @@ pub async fn stream_get_object(
     };
 
     let file_size = reader.remaining().max(0) as u64;
-    let (content_length, content_range, status_code) = if let Some(range_end) = opt.range_end {
-        if range_end > u64::MAX / 2 {
-            let suffix_len = u64::MAX - range_end;
-            if suffix_len > file_size {
-                (file_size, None, 200)
-            } else {
-                let start_pos = file_size - suffix_len;
-                if let Err(e) = reader.seek(start_pos as i64).await {
-                    tracing::error!("Failed to seek to position {}: {}", start_pos, e);
-                    return axum::response::Response::builder()
-                        .status(500)
-                        .body(axum::body::Body::from("Internal Server Error"))
-                        .unwrap();
-                }
-                let content_range = format!("bytes {}-{}/{}", start_pos, file_size - 1, file_size);
-                (suffix_len, Some(content_range), 206)
-            }
-        } else {
-            let start = opt.range_start.unwrap_or(0);
-            let end = std::cmp::min(range_end, file_size - 1);
-            let length = end - start + 1;
 
+    // Conditional request evaluation. S3 clients use If-Match / If-None-Match
+    // for optimistic concurrency and cache validation; ignoring them silently
+    // acknowledged writes against a stale ETag.
+    // Conditional request evaluation: all four RFC 9110 headers.
+    let preconditions = crate::s3::handlers::Preconditions::from_headers(&req, false);
+    if let Some(status) = handlers
+        .evaluate_preconditions(&cv_path, &preconditions)
+        .await
+    {
+        return axum::response::Response::builder()
+            .status(status)
+            .header(
+                "x-amz-request-id",
+                crate::utils::s3_utils::generate_request_id(),
+            )
+            .body(axum::body::Body::empty())
+            .unwrap();
+    }
+
+    // `to_byte_range` clamps the end, validates the start and returns `None`
+    // for a range that cannot be satisfied, so no subtraction below can
+    // underflow (the previous arithmetic wrapped to ~2^64 in release builds).
+    let byte_range = requested_range
+        .as_ref()
+        .map(|range| range.to_byte_range(file_size));
+
+    let (content_length, content_range, status_code) = match byte_range {
+        Some(Some((start, length))) => {
             if let Err(e) = reader.seek(start as i64).await {
                 tracing::error!("Failed to seek to position {}: {}", start, e);
                 return axum::response::Response::builder()
@@ -395,24 +420,33 @@ pub async fn stream_get_object(
                     .body(axum::body::Body::from("Internal Server Error"))
                     .unwrap();
             }
-
-            let content_range = format!("bytes {}-{}/{}", start, end, file_size);
-            (length, Some(content_range), 206)
+            let end = start + length - 1;
+            (
+                length,
+                Some(format!("bytes {}-{}/{}", start, end, file_size)),
+                206,
+            )
         }
-    } else if let Some(start) = opt.range_start {
-        if let Err(e) = reader.seek(start as i64).await {
-            tracing::error!("Failed to seek to position {}: {}", start, e);
+        Some(None) => {
+            // Unsatisfiable: an empty object or a start beyond the end.
             return axum::response::Response::builder()
-                .status(500)
-                .body(axum::body::Body::from("Internal Server Error"))
+                .status(416)
+                .header("content-range", format!("bytes */{}", file_size))
+                .header("accept-ranges", "bytes")
+                .header(
+                    "x-amz-request-id",
+                    crate::utils::s3_utils::generate_request_id(),
+                )
+                .header("x-amz-id-2", crate::utils::s3_utils::generate_host_id())
+                .body(axum::body::Body::empty())
                 .unwrap();
         }
-        let length = file_size - start;
-        let content_range = format!("bytes {}-{}/{}", start, file_size - 1, file_size);
-        (length, Some(content_range), 206)
-    } else {
-        (file_size, None, 200)
+        None => (file_size, None, 200),
     };
+
+    // Reuse the HEAD metadata mapping so GET and HEAD agree on a response for
+    // the same object (ETag, Content-Type, Last-Modified, x-amz-meta-*).
+    let head = crate::utils::s3_utils::file_status_to_head_object_result(reader.status(), object);
 
     let stream_adapter =
         CurvineStreamAdapter::new(reader, content_length, handlers.get_chunk_size_bytes);
@@ -425,6 +459,25 @@ pub async fn stream_get_object(
 
     if let Some(content_range) = content_range {
         builder = builder.header("content-range", content_range);
+    }
+    if let Some(etag) = head.etag.as_deref() {
+        builder = builder.header("etag", etag);
+    }
+    if let Some(content_type) = head.content_type.as_deref() {
+        builder = builder.header("content-type", content_type);
+    }
+    if let Some(last_modified) = head.last_modified.as_deref() {
+        builder = builder.header("last-modified", last_modified);
+    }
+    if let Some(metadata) = head.metadata.as_ref() {
+        for (key, value) in metadata {
+            let header_name = if key.starts_with("x-amz-meta-") {
+                key.clone()
+            } else {
+                format!("x-amz-meta-{}", key)
+            };
+            builder = builder.header(header_name, value);
+        }
     }
 
     builder = builder
@@ -594,7 +647,10 @@ pub async fn handle_authorization_middleware(
 
     let circle_hasher = match ret {
         Ok((sig, circle_hasher)) => {
-            if sig != base_arg.signature {
+            // Constant-time, like the V2 path: a byte-wise early exit leaks how
+            // much of a guess was correct.
+            if !crate::auth::sig_v2::constant_time_eq(sig.as_bytes(), base_arg.signature.as_bytes())
+            {
                 return (axum::http::StatusCode::FORBIDDEN, b"").into_response();
             }
             circle_hasher
@@ -708,25 +764,5 @@ impl CurvineStreamAdapter {
                 tracing::warn!("Failed to complete reader cleanup in stream adapter: {}", e);
             }
         }
-    }
-}
-
-fn parse_range_header(range_str: &str) -> (Option<u64>, Option<u64>) {
-    if !range_str.starts_with("bytes=") {
-        return (None, None);
-    }
-
-    let range_spec = &range_str[6..];
-    let parts: Vec<&str> = range_spec.split('-').collect();
-
-    if parts.len() != 2 {
-        return (None, None);
-    }
-
-    match (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
-        (Ok(start), Ok(end)) => (Some(start), Some(end)),
-        (Ok(start), Err(_)) => (Some(start), None),
-        (Err(_), Ok(suffix_len)) => (None, Some(u64::MAX - suffix_len)),
-        _ => (None, None),
     }
 }

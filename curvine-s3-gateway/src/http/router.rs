@@ -29,6 +29,7 @@
 //! 3. Delegate to specific operation handlers (direct calls, no trait objects)
 //! 4. Handle errors and responses uniformly
 
+use crate::auth::sig_v4::VHeader;
 use crate::http::axum::{Request, Response};
 use crate::s3::handlers::S3Handlers;
 use crate::s3::s3_api::*;
@@ -98,6 +99,10 @@ impl S3Router {
 
             if is_upload_part {
                 Self::handle_multipart_upload_part_request(req, &handlers).await
+            } else if req.get_header("x-amz-copy-source").is_some() {
+                // Server-side copy. Routing it to the PUT handler created a
+                // zero-byte object because a copy request carries no body.
+                Self::handle_copy_object_request(req, &handlers).await
             } else {
                 Self::handle_put_object_request(req, &handlers, v4head).await
             }
@@ -169,10 +174,16 @@ impl S3Router {
         let rr_len = rr.len();
 
         if rr_len == 1 || (rr_len == 2 && rr[1].is_empty()) {
-            Self::handle_delete_bucket_request(Request::from(req), &handlers).await
-        } else {
-            Self::handle_delete_object_request(Request::from(req), &handlers).await
+            return Self::handle_delete_bucket_request(Request::from(req), &handlers).await;
         }
+
+        let req = Request::from(req);
+        // `DELETE /{bucket}/{key}?uploadId=...` is AbortMultipartUpload, not a
+        // plain object delete: SDKs abort after any part failure.
+        if req.get_query("uploadId").is_some() {
+            return Self::handle_multipart_abort_request(req, &handlers).await;
+        }
+        Self::handle_delete_object_request(req, &handlers).await
     }
 
     async fn handle_head_request(
@@ -200,6 +211,26 @@ impl S3Router {
         } else if args.len() != 2 {
             (StatusCode::BAD_REQUEST, b"").into_response()
         } else {
+            // RFC 9110 §13.2.2 requires HEAD to evaluate conditions exactly as
+            // GET does; a stale `If-Match` must be 412, not a full 200 with
+            // headers. S3 clients use HEAD preconditions for existence checks.
+            let object_path = match handlers.cv_object_path(args[0], args[1]) {
+                Ok(p) => p,
+                Err(_) => return (StatusCode::NOT_FOUND, b"").into_response(),
+            };
+            let conditions = crate::s3::handlers::Preconditions::from_headers(&req, false);
+            if let Some(code) = handlers
+                .evaluate_preconditions(&object_path, &conditions)
+                .await
+            {
+                let status = StatusCode::from_u16(code).unwrap_or(StatusCode::PRECONDITION_FAILED);
+                let mut builder = axum::response::Response::builder().status(status);
+                if code == 304 {
+                    // A 304 must not carry the body-framing headers of a 200.
+                    builder = builder.header("accept-ranges", "bytes");
+                }
+                return builder.body(axum::body::Body::empty()).unwrap();
+            }
             Self::handle_head_object_request(args[0], args[1], &handlers).await
         }
     }
@@ -273,6 +304,80 @@ impl S3Router {
         let mut resp = Response::default();
         handle_multipart_upload_part(req, &mut resp, handlers.as_ref()).await;
         resp.into()
+    }
+
+    /// `PUT` with `x-amz-copy-source`: copy an existing object server-side.
+    async fn handle_copy_object_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        use crate::s3::s3_api::VRequest;
+
+        // "bucket/key" or "/bucket/key", URL-encoded, optionally carrying
+        // "?versionId=..." which this backend does not version.
+        let raw = match req.get_header("x-amz-copy-source") {
+            Some(value) => value,
+            None => return (StatusCode::BAD_REQUEST, b"").into_response(),
+        };
+        let source = raw
+            .split('?')
+            .next()
+            .unwrap_or(&raw)
+            .trim_start_matches('/');
+        let decoded = urlencoding::decode(source)
+            .map(|cow| cow.into_owned())
+            .unwrap_or_else(|_| source.to_string());
+        let (src_bucket, src_key) = match decoded.split_once('/') {
+            Some((b, k)) if !b.is_empty() && !k.is_empty() => (b, k),
+            _ => {
+                log::warn!("invalid x-amz-copy-source: {raw}");
+                return (StatusCode::BAD_REQUEST, b"").into_response();
+            }
+        };
+
+        let dest_path = req.url_path();
+        let dest = dest_path
+            .trim_start_matches('/')
+            .splitn(2, '/')
+            .collect::<Vec<&str>>();
+        if dest.len() != 2 || dest[1].is_empty() {
+            return (StatusCode::BAD_REQUEST, b"").into_response();
+        }
+
+        let source_conditions = crate::s3::handlers::Preconditions::from_headers(&req, true);
+        match handlers
+            .copy_object(src_bucket, src_key, dest[0], dest[1], &source_conditions)
+            .await
+        {
+            Ok(etag) => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<CopyObjectResult>\
+<ETag>\"{etag}\"</ETag>\
+<LastModified>{}</LastModified>\
+</CopyObjectResult>",
+                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                );
+                (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "application/xml")],
+                    body,
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                // Map every protocol status the handler may report; a missing
+                // arm silently degraded 412 to 500.
+                let status = match crate::s3::s3_api::status_for_error(&e) {
+                    404 => StatusCode::NOT_FOUND,
+                    409 => StatusCode::CONFLICT,
+                    412 => StatusCode::PRECONDITION_FAILED,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                log::warn!("copy object failed ({status}): {e}");
+                (status, b"".to_vec()).into_response()
+            }
+        }
     }
 
     async fn handle_put_object_request(
@@ -462,6 +567,15 @@ impl S3Router {
     ) -> axum::response::Response {
         let mut resp = Response::default();
         handle_multipart_complete_session(req, &mut resp, handlers.as_ref()).await;
+        resp.into()
+    }
+
+    async fn handle_multipart_abort_request(
+        req: Request,
+        handlers: &Arc<S3Handlers>,
+    ) -> axum::response::Response {
+        let mut resp = Response::default();
+        crate::s3::s3_api::handle_abort_multipart_upload(req, &mut resp, handlers.as_ref()).await;
         resp.into()
     }
 }
