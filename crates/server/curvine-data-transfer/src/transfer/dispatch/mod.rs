@@ -570,26 +570,41 @@ where
         for index in 0..workers {
             let scheduler = self.clone();
             let stop = stop.clone();
-            rt.spawn(async move {
-                while !stop.load(Ordering::Relaxed) {
-                    let delay = match scheduler.run_once().await {
-                        Ok(true) => SCHEDULER_ACTIVE_INTERVAL,
-                        Ok(false) => scheduler.idle_interval(),
-                        Err(err) => {
-                            warn!("transfer scheduler worker {} tick failed: {}", index, err);
-                            SCHEDULER_ACTIVE_INTERVAL
-                        }
-                    };
-                    tokio::time::sleep(delay).await;
-                }
-            });
+            let rt = rt.clone();
+            // Dedicated thread (same model as the report workers and the
+            // worker heartbeat): the loop lives off the shared runtime, so a
+            // stalled tick can never park every worker including the IO
+            // driver. Without this a slow store call froze accept(), which
+            // showed up as the pod failing readiness for ~25 minutes.
+            let spawn_result = std::thread::Builder::new()
+                .name(format!("transfer-scheduler-{index}"))
+                .spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let delay = match rt.block_on(scheduler.run_once()) {
+                            Ok(true) => SCHEDULER_ACTIVE_INTERVAL,
+                            Ok(false) => scheduler.idle_interval(),
+                            Err(err) => {
+                                warn!("transfer scheduler worker {} tick failed: {}", index, err);
+                                SCHEDULER_ACTIVE_INTERVAL
+                            }
+                        };
+                        std::thread::sleep(delay);
+                    }
+                });
+            if let Err(err) = spawn_result {
+                error!("failed to start transfer scheduler worker {}: {}", index, err);
+            }
         }
     }
 
     async fn run_once(&self) -> FsResult<bool> {
         let now_ms = now_ms();
-        self.cleanup_terminal_transfers(now_ms)?;
-        self.record_job_counts_if_due(now_ms)?;
+        // Store calls are blocking; keep them off the shared runtime workers.
+        // The per-tick hot path (cleanup/counts/acquire/get) is bridged to the
+        // blocking pool here; state handlers still run their own store calls
+        // inline, but each one is now bounded by the MySQL socket timeout.
+        Self::blocking(&self, move |s| s.cleanup_terminal_transfers(now_ms)).await?;
+        Self::blocking(&self, move |s| s.record_job_counts_if_due(now_ms)).await?;
         // Fairness: every N ticks, prefer acquiring a brand-new Pending job
         // over continuing to service this scheduler's already-held jobs.
         // Without this, a scheduler holding many long-running jobs services
@@ -597,20 +612,22 @@ where
         // waited 34 minutes while 19 existing jobs were dispatched).
         let tick = self.acquire_tick.fetch_add(1, Ordering::Relaxed);
         let prefer_pending = tick.is_multiple_of(ACQUIRE_PENDING_EVERY_N_TICKS);
-        let Some(lease) = self.store.acquire_runnable_transfer(
-            &self.owner,
-            duration_ms(self.conf.lease_timeout),
-            now_ms,
-            self.conf.max_executing_transfers(),
-            prefer_pending,
-        )?
-        else {
+        let lease_timeout = duration_ms(self.conf.lease_timeout);
+        let max_executing = self.conf.max_executing_transfers();
+        let acquired = Self::blocking(self, move |s| {
+            s.store
+                .acquire_runnable_transfer(&s.owner, lease_timeout, now_ms, max_executing, prefer_pending)
+        })
+        .await?;
+        let Some(lease) = acquired else {
             record_metric(|metrics| metrics.inc_acquire("empty"));
             return Ok(false);
         };
         record_metric(|metrics| metrics.inc_acquire("ok"));
 
-        let Some(job) = self.store.get_transfer(&lease.job_id)? else {
+        let job_id = lease.job_id.clone();
+        let job = Self::blocking(self, move |s| s.store.get_transfer(&job_id)).await?;
+        let Some(job) = job else {
             record_metric(|metrics| metrics.inc_acquire("missing_job"));
             return Ok(true);
         };
@@ -690,6 +707,21 @@ where
 
     fn idle_interval(&self) -> Duration {
         scheduler_idle_interval(self.conf.lease_timeout)
+    }
+
+    /// Runs a blocking store interaction on the runtime's blocking pool.
+    /// Mirrors `job_mount_snapshot_with_version_async`: a blocking closure is
+    /// awaited from async context so the shared runtime workers never stall
+    /// on synchronous store I/O.
+    async fn blocking<F, R>(scheduler: &Self, task: F) -> FsResult<R>
+    where
+        F: FnOnce(&Self) -> FsResult<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        let scheduler = scheduler.clone();
+        tokio::task::spawn_blocking(move || task(&scheduler))
+            .await
+            .map_err(|_| FsError::common("transfer scheduler blocking task panicked"))?
     }
 
     fn transfer_counts(&self) -> FsResult<(u64, u64)> {

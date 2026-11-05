@@ -23,7 +23,7 @@ use curvine_model::{
     WorkerInflight,
 };
 use mysql::prelude::*;
-use mysql::{params, IsolationLevel, Params, Pool, PooledConn, TxOpts};
+use mysql::{params, Opts, OptsBuilder, IsolationLevel, Params, Pool, PooledConn, TxOpts};
 use std::collections::{BTreeMap, BTreeSet};
 use std::thread;
 use std::time::Duration;
@@ -41,6 +41,14 @@ const MYSQL_SCHEMA_LOCK_NAME: &str = "curvine_transfer_schema";
 const MYSQL_SCHEMA_LOCK_TIMEOUT_SECS: u64 = 60;
 const MYSQL_MIGRATION_DDL_LOCK_TIMEOUT_SECS: u64 = 60;
 const MYSQL_MIGRATION_ROW_LOCK_TIMEOUT_SECS: u64 = 5;
+/// Per-read/write socket timeout. The rust mysql client defaults both to
+/// `None`, so one stalled query parks its caller forever; every caller in
+/// this crate is synchronous (scheduler ticks, submit handlers, report
+/// workers), so an unbounded wait can wedge the whole process. 120s bounds
+/// each wait while still allowing long-running queries that keep returning
+/// bytes and the schema-migration GET_LOCK (60s); a timed-out connection is
+/// dropped and the caller retries.
+const MYSQL_SOCKET_TIMEOUT: Duration = Duration::from_secs(120);
 const MYSQL_TASK_RUNTIME_COLUMNS: &[(&str, &str)] = &[
     ("source_path", "varchar(4096) not null default ''"),
     ("target_path", "varchar(4096) not null default ''"),
@@ -163,7 +171,12 @@ pub struct MysqlTransferStore {
 
 impl MysqlTransferStore {
     pub fn open(url: &str) -> FsResult<Self> {
-        let pool = Pool::new(url).map_err(mysql_err)?;
+        let opts = OptsBuilder::from_opts(
+            Opts::from_url(url).map_err(|err| mysql_url_err(err))?,
+        )
+        .read_timeout(Some(MYSQL_SOCKET_TIMEOUT))
+        .write_timeout(Some(MYSQL_SOCKET_TIMEOUT));
+        let pool = Pool::new(opts).map_err(mysql_err)?;
         let mut conn = pool.get_conn().map_err(mysql_err)?;
         if !mysql_schema_ready(&mut conn)? {
             configure_mysql_migration_connection(&mut conn)?;
@@ -2570,6 +2583,14 @@ fn mysql_err(err: mysql::Error) -> FsError {
     FsError::transfer_store_unavailable(format!(
         "Transfer metadata store is unavailable; verify transfer.store_url and database connectivity: {}",
         store_error_detail(&err)
+    ))
+}
+
+fn mysql_url_err(err: mysql::UrlError) -> FsError {
+    log::warn!("transfer MySQL store URL is invalid: {}", err);
+    FsError::transfer_store_unavailable(format!(
+        "Transfer metadata store URL is invalid; verify transfer.store_url: {}",
+        err
     ))
 }
 
