@@ -247,7 +247,13 @@ impl WorkerBlacklist {
 struct InflightLedger {
     ttl_ms: u64,
     refreshed_at_ms: AtomicU64,
-    entries: DashMap<u32, (u64, i64)>, // worker_id -> (task_count, estimated_bytes)
+    // worker_id -> (task_count, estimated_bytes). A plain lock-guarded map
+    // instead of DashMap: the live set is tiny (worker count) and every
+    // critical section is a few ns, but under 8 scheduler threads the
+    // DashMap/parking_lot shard-lock path was observed to park futex_waiters
+    // forever (produced an all-scheduler freeze; see the ops runbook). std
+    // RwLock keeps the same semantics without that shard-lock parking layer.
+    entries: std::sync::RwLock<std::collections::HashMap<u32, (u64, i64)>>,
     // Serializes refresh (clear+rebuild) against concurrent account()/get()
     // so a refresh never wipes a just-accounted dispatch (review Required).
     refresh_lock: std::sync::Mutex<()>,
@@ -258,7 +264,7 @@ impl InflightLedger {
         Self {
             ttl_ms: ttl.as_millis() as u64,
             refreshed_at_ms: AtomicU64::new(0),
-            entries: DashMap::new(),
+            entries: std::sync::RwLock::new(Default::default()),
             refresh_lock: std::sync::Mutex::new(()),
         }
     }
@@ -286,50 +292,69 @@ impl InflightLedger {
         // Remember previously-reported worker ids so workers that now have no
         // in-flight tasks get their gauges reset (review Required); otherwise
         // per-worker gauges report stale non-zero values forever.
-        let mut previous: std::collections::HashSet<u32> = Default::default();
-        for entry in self.entries.iter() {
-            previous.insert(*entry.key());
-        }
-        self.entries.clear();
-        for WorkerInflight {
-            worker_id,
-            task_count,
-            estimated_bytes,
-            unknown_bytes_count,
-        } in inflight
+        let new_entries: std::collections::HashMap<u32, (u64, i64)> = inflight
+            .into_iter()
+            .map(
+                |WorkerInflight {
+                     worker_id,
+                     task_count,
+                     estimated_bytes,
+                     unknown_bytes_count,
+                 }| {
+                    (
+                        worker_id,
+                        (
+                            task_count,
+                            inflight_bytes_with_default(
+                                estimated_bytes,
+                                unknown_bytes_count,
+                                default_est,
+                            ),
+                        ),
+                    )
+                },
+            )
+            .collect();
+        // Report the rebuilt table so the dashboard reflects the fresh snapshot;
+        // workers that vanished from the store get their gauges zeroed here.
         {
-            // Unknown-size rows count at the configured default so they cannot
-            // bypass the byte budget (design §3.1 invariant 3).
-            previous.remove(&worker_id);
-            self.entries.insert(
-                worker_id,
-                (
-                    task_count,
-                    inflight_bytes_with_default(estimated_bytes, unknown_bytes_count, default_est),
-                ),
-            );
-            record_metric(|metrics| {
-                metrics.set_worker_inflight(worker_id, task_count, estimated_bytes)
-            });
+            let entries = self.entries.read().unwrap_or_else(|e| e.into_inner());
+            for (worker_id, (task_count, old_bytes)) in entries.iter() {
+                if let Some((_, new_bytes)) = new_entries.get(worker_id) {
+                    if old_bytes != new_bytes {
+                        record_metric(|metrics| {
+                            metrics.set_worker_inflight(*worker_id, *task_count, *new_bytes)
+                        });
+                    }
+                } else {
+                    record_metric(|metrics| metrics.set_worker_inflight(*worker_id, 0, 0));
+                }
+            }
         }
-        // Zero out gauges for workers that no longer have in-flight tasks.
-        for gone in previous {
-            record_metric(|metrics| metrics.set_worker_inflight(gone, 0, 0));
-        }
+        *self.entries.write().unwrap_or_else(|e| e.into_inner()) = new_entries;
         self.refreshed_at_ms.store(now_ms, Ordering::Relaxed);
         Ok(())
     }
 
     fn account(&self, worker_id: u32, count: u64, bytes: i64) {
-        let mut entry = self.entries.entry(worker_id).or_insert((0u64, 0i64));
+        let mut entries = self
+            .entries
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = entries.entry(worker_id).or_insert((0u64, 0i64));
         entry.0 = entry.0.saturating_add(count);
         entry.1 = entry.1.saturating_add(bytes);
+        let (count, bytes) = *entry;
+        drop(entries);
+        record_metric(|metrics| metrics.set_worker_inflight(worker_id, count, bytes));
     }
 
     fn get(&self, worker_id: u32) -> (u64, i64) {
         self.entries
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&worker_id)
-            .map(|entry| *entry)
+            .copied()
             .unwrap_or((0, 0))
     }
 }
@@ -3286,8 +3311,10 @@ mod tests {
         let ledger = InflightLedger::new(Duration::from_secs(15));
         ledger.account(1, 5, 5000);
         // Simulate a store snapshot where worker 1 has less in flight.
-        ledger.entries.clear();
-        ledger.entries.insert(1, (1, 1000));
+        *ledger
+            .entries
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = [(1, (1, 1000))].into_iter().collect();
         ledger
             .refreshed_at_ms
             .store(1, std::sync::atomic::Ordering::Relaxed);
