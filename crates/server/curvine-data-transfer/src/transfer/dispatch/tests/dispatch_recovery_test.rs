@@ -319,3 +319,103 @@ fn dispatch_reads_the_live_worker_task_limit() {
         .unwrap();
     assert!(scheduler.choose_worker(&workers, 10).is_some());
 }
+
+fn scheduler_with_placement(
+    store: Arc<MemoryTransferStore>,
+    endpoints: &[&str],
+    self_addr: &str,
+) -> TransferScheduler<MemoryTransferStore> {
+    let conf = ClusterConf::default();
+    let rt = Arc::new(conf.transfer_server_conf().create_runtime());
+    let fs = CurvineFileSystem::with_rt(ClusterConf::default(), rt.clone()).unwrap();
+    let cache = ClusterMetadataCache::new(fs.clone());
+    let runtime_config = Arc::new(TransferRuntimeConfig::with_limit(1));
+    let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
+    let planner = TransferPlanner::new(
+        fs.clone(),
+        factory.clone(),
+        cache.clone(),
+        conf.client.clone(),
+        runtime_config.clone(),
+        1,
+    );
+    let clients = Arc::new(curvine_rpc::client::ClientFactory::with_rt(
+        conf.client_rpc_conf(),
+        rt,
+    ));
+    let forwarder = Arc::new(crate::transfer::Forwarder::new(
+        endpoints.iter().map(|addr| (*addr).to_string()).collect(),
+        self_addr,
+        clients,
+    ));
+    TransferScheduler::new(
+        store,
+        planner,
+        cache,
+        factory,
+        fs,
+        "test-owner".to_string(),
+        self_addr.to_string(),
+        TransferConf::default(),
+        runtime_config,
+        std::sync::Arc::new(crate::transfer::TaskCache::new()),
+        Some(forwarder),
+    )
+}
+
+/// A job that a scheduler has just leased for planning, with the placement the
+/// submitter recorded for it.
+fn planning_job(job_id: &str, placement_addr: &str) -> TransferJobRecord {
+    let mut job = running_job(job_id);
+    job.state = TransferState::Planning;
+    job.placement_addr = placement_addr.to_string();
+    job.summary.message = "acquired for planning".to_string();
+    job.lease_expire_at = now_ms().saturating_add(60_000);
+    job
+}
+
+/// Handing a lease to a sibling must keep working: the fix must not disable
+/// placement, only make "which address is me" resolvable.
+#[tokio::test]
+async fn placement_naming_a_sibling_in_the_ring_hands_the_lease_back() {
+    let store = Arc::new(MemoryTransferStore::new());
+    let job = planning_job("placed-on-sibling", "10.9.9.9:8010");
+    store.create_or_get_by_request_id(job.clone()).unwrap();
+    let scheduler = scheduler_with_placement(
+        store.clone(),
+        &["10.9.9.9:8010", "10.9.9.10:8010"],
+        "10.9.9.10:8010",
+    );
+
+    assert!(scheduler
+        .hand_back_to_placement(&job, &lease(&job), now_ms())
+        .unwrap());
+
+    let stored = store.get_transfer(&job.job_id).unwrap().unwrap();
+    assert_eq!(stored.state, TransferState::Pending);
+    assert!(stored.owner.is_empty(), "the lease must be released");
+}
+
+/// The livelock: when `transfer.endpoints` never names this instance, a
+/// hand-back can never land anywhere and the same instance re-acquires the job
+/// on the next tick, forever (observed in production: 4.1M hand-backs, zero
+/// planning). Such a job has to be planned locally instead.
+#[tokio::test]
+async fn placement_to_an_instance_outside_the_ring_plans_locally_instead_of_looping() {
+    let store = Arc::new(MemoryTransferStore::new());
+    let job = planning_job("placement-outside-ring", "10.9.9.9:8010");
+    store.create_or_get_by_request_id(job.clone()).unwrap();
+    // This instance is not part of the configured instance list at all.
+    let scheduler = scheduler_with_placement(store.clone(), &["10.9.9.9:8010"], "10.9.9.10:8010");
+
+    assert!(
+        !scheduler
+            .hand_back_to_placement(&job, &lease(&job), now_ms())
+            .unwrap(),
+        "an unlisted instance must keep the lease instead of returning it forever"
+    );
+
+    let stored = store.get_transfer(&job.job_id).unwrap().unwrap();
+    assert_eq!(stored.state, TransferState::Planning);
+    assert_eq!(stored.owner, "test-owner");
+}

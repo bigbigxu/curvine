@@ -74,7 +74,7 @@ where
     {
         let forwarder = self.forwarder.as_ref()?;
         let addr = self.service.owner_addr(job_id)?;
-        if addr == forwarder.self_addr() {
+        if forwarder.owns_addr(&addr) {
             return None;
         }
         self.relay_to(&addr, code, req).await

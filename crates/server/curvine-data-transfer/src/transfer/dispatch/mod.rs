@@ -666,35 +666,8 @@ where
         // that instance is the only one holding its in-memory task state. If
         // this instance merely won the lease race, hand the job straight back
         // so the owner picks it up on its next tick.
-        if job.state == TransferState::Planning {
-            if let Some(forwarder) = &self.forwarder {
-                // Placement was recorded at submit; compare against it rather
-                // than a locally recomputed hash, so two instances with
-                // different views still agree on who should run this job.
-                let target = if job.placement_addr.is_empty() {
-                    forwarder.owner_of(&job.client_request_id)
-                } else {
-                    Some(job.placement_addr.clone())
-                };
-                if target
-                    .as_deref()
-                    .is_some_and(|addr| addr != forwarder.self_addr())
-                {
-                    record_metric(|metrics| metrics.inc_requeue("placed_elsewhere"));
-                    self.store.requeue_transfer(TransferRequeueUpdate {
-                        job_id: job.job_id.clone(),
-                        run_id: job.run_id,
-                        owner: lease.owner.clone(),
-                        lease_epoch: lease.lease_epoch,
-                        message: job.summary.message.clone(),
-                        next_attempt_at_ms: now_ms,
-                        mount_snapshot_attempts: None,
-                        planning_attempts: None,
-                        now_ms,
-                    })?;
-                    return Ok(true);
-                }
-            }
+        if self.hand_back_to_placement(&job, &lease, now_ms)? {
+            return Ok(true);
         }
 
         // Record the acting owner so status/watch can relay by address.
@@ -727,6 +700,63 @@ where
             | TransferState::Canceled
             | TransferState::PartialSuccess => {}
         }
+        Ok(true)
+    }
+
+    /// Returns the lease to the instance placement names, or false when this
+    /// instance should plan the job itself.
+    ///
+    /// Placement was recorded at submit; the stored address is compared rather
+    /// than a locally recomputed hash, so two instances with different views
+    /// still agree on who should run this job. Addresses are compared after
+    /// resolution (`owns_addr`), because `self_addr` comes from
+    /// `transfer.hostname` (often a bound IP) while the ring holds
+    /// `transfer.endpoints` verbatim (often DNS names); a plain string compare
+    /// between the two never matches and livelocks the job between instances.
+    ///
+    /// When this instance is not in the ring at all no hand-back can ever land,
+    /// so the job is planned here instead of being returned forever.
+    fn hand_back_to_placement(
+        &self,
+        job: &TransferJobRecord,
+        lease: &TransferLease,
+        now_ms: i64,
+    ) -> FsResult<bool> {
+        if job.state != TransferState::Planning {
+            return Ok(false);
+        }
+        let Some(forwarder) = &self.forwarder else {
+            return Ok(false);
+        };
+        let target = if job.placement_addr.is_empty() {
+            forwarder.owner_of(&job.client_request_id)
+        } else {
+            Some(job.placement_addr.clone())
+        };
+        let Some(target) = target.filter(|addr| !forwarder.owns_addr(addr)) else {
+            return Ok(false);
+        };
+        if !forwarder.in_ring() {
+            warn!(
+                "this instance {} is not listed in transfer.endpoints; planning job {} locally instead of handing it back to {}",
+                forwarder.self_addr(),
+                job.job_id,
+                target
+            );
+            return Ok(false);
+        }
+        record_metric(|metrics| metrics.inc_requeue("placed_elsewhere"));
+        self.store.requeue_transfer(TransferRequeueUpdate {
+            job_id: job.job_id.clone(),
+            run_id: job.run_id,
+            owner: lease.owner.clone(),
+            lease_epoch: lease.lease_epoch,
+            message: job.summary.message.clone(),
+            next_attempt_at_ms: now_ms,
+            mount_snapshot_attempts: None,
+            planning_attempts: None,
+            now_ms,
+        })?;
         Ok(true)
     }
 
