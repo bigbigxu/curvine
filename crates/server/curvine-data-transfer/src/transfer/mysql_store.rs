@@ -172,7 +172,7 @@ pub struct MysqlTransferStore {
 impl MysqlTransferStore {
     pub fn open(url: &str) -> FsResult<Self> {
         let opts = OptsBuilder::from_opts(
-            Opts::from_url(url).map_err(|err| mysql_url_err(err))?,
+            Opts::from_url(url).map_err(mysql_url_err)?,
         )
         .read_timeout(Some(MYSQL_SOCKET_TIMEOUT))
         .write_timeout(Some(MYSQL_SOCKET_TIMEOUT));

@@ -603,8 +603,8 @@ where
         // The per-tick hot path (cleanup/counts/acquire/get) is bridged to the
         // blocking pool here; state handlers still run their own store calls
         // inline, but each one is now bounded by the MySQL socket timeout.
-        Self::blocking(&self, move |s| s.cleanup_terminal_transfers(now_ms)).await?;
-        Self::blocking(&self, move |s| s.record_job_counts_if_due(now_ms)).await?;
+        Self::blocking(self, move |s| s.cleanup_terminal_transfers(now_ms)).await?;
+        Self::blocking(self, move |s| s.record_job_counts_if_due(now_ms)).await?;
         // Fairness: every N ticks, prefer acquiring a brand-new Pending job
         // over continuing to service this scheduler's already-held jobs.
         // Without this, a scheduler holding many long-running jobs services
