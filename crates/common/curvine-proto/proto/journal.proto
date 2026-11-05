@@ -44,7 +44,15 @@ message JournalEntryProto {
         UfsDeferredEntryProto ufs_deferred = 19;
         TrashPurgeEntryProto trash_purge = 20;
         WorkerIntentEntryProto worker_intent = 21;
+        ReleaseWriterEntryProto release_writer = 22;
     }
+}
+
+message ReleaseWriterEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required int64 ino = 3;
+    required string client = 4;
 }
 
 message MkdirEntryProto {

@@ -173,6 +173,19 @@ pub struct SetLocksEntry {
     pub(crate) locks: Vec<FileLock>,
 }
 
+/// Removes exactly one client's writer marker from one inode (#1880).
+///
+/// `client` is required: another client may be writing the same file, and clearing
+/// the whole `WriteFeature` would mark that file complete while it is still being
+/// written.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct ReleaseWriterEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) ino: i64,
+    pub(crate) client: String,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct FreeEntry {
     pub(crate) op_id: u64,
@@ -222,6 +235,15 @@ pub struct SnapshotEntry {
     pub(crate) dir: String,
 }
 
+/// One durable metadata mutation.
+///
+/// Bincode encodes the variant discriminant and fields positionally, so this
+/// schema is forward-only: new variants and fields may be appended, never
+/// inserted or reordered. A journal written by a newer master cannot be replayed
+/// by an older one once it contains a variant the binary does not know, so a
+/// rollback to a pre-`ReleaseWriter` build is only safe after the new entries have
+/// been checkpointed away (or never emitted, which is the case while no reaper is
+/// running).
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
@@ -249,6 +271,11 @@ pub enum JournalEntry {
 
     /// The single persisted source of what an operator asked a worker host to do.
     WorkerIntent(WorkerIntentEntry),
+
+    /// Drop one client's writer marker (#1880). Emitted by the session reaper when
+    /// a client that was writing a file is gone; the journal entry is what makes
+    /// "the file is complete again" durable and replayable.
+    ReleaseWriter(ReleaseWriterEntry),
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -350,6 +377,7 @@ impl JournalEntry {
             JournalEntry::TrashPurge(e) => e.op_id,
 
             JournalEntry::WorkerIntent(e) => e.op_id,
+            JournalEntry::ReleaseWriter(e) => e.op_id,
         }
     }
 
@@ -377,6 +405,7 @@ impl JournalEntry {
             JournalEntry::TrashPurge(e) => e.rpc_id,
 
             JournalEntry::WorkerIntent(e) => e.rpc_id,
+            JournalEntry::ReleaseWriter(e) => e.rpc_id,
         }
     }
 
@@ -389,6 +418,7 @@ impl JournalEntry {
             JournalEntry::CompleteFile(e) => Some(e.file.id),
             JournalEntry::Symlink(e) => Some(e.new_inode.id),
             JournalEntry::SetLocks(e) => Some(e.ino),
+            JournalEntry::ReleaseWriter(e) => Some(e.ino),
             _ => None,
         }
     }
@@ -583,6 +613,13 @@ impl JournalEntry {
                 forced_at_ms: Some(e.intent.forced_at_ms),
                 preflight_blocks: Some(e.intent.preflight_blocks),
                 preflight_single_replica: Some(e.intent.preflight_single_replica),
+            }),
+
+            JournalEntry::ReleaseWriter(e) => PbEntry::ReleaseWriter(ReleaseWriterEntryProto {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                ino: e.ino,
+                client: e.client,
             }),
         };
 
@@ -783,6 +820,13 @@ impl JournalEntry {
                     },
                 })
             }
+
+            PbEntry::ReleaseWriter(e) => JournalEntry::ReleaseWriter(ReleaseWriterEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                ino: e.ino,
+                client: e.client,
+            }),
         })
     }
 }

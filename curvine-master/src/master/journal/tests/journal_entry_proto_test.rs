@@ -333,3 +333,27 @@ fn worker_intent_entry_round_trips_through_proto() {
         other => panic!("expected worker intent, got {other:?}"),
     }
 }
+
+/// `ReleaseWriter` carries exactly one (ino, client) pair, so a round trip must
+/// preserve both fields verbatim (#1880).
+#[test]
+fn release_writer_entry_round_trips_through_proto() {
+    let entry = JournalEntry::ReleaseWriter(ReleaseWriterEntry {
+        op_id: 9,
+        rpc_id: 0,
+        ino: 42,
+        client: "client-a".to_string(),
+    });
+
+    let proto = entry.clone().into_proto().unwrap();
+    let decoded = JournalEntry::from_proto(proto).unwrap();
+
+    match decoded {
+        JournalEntry::ReleaseWriter(decoded) => {
+            assert_eq!(decoded.op_id, 9);
+            assert_eq!(decoded.ino, 42);
+            assert_eq!(decoded.client, "client-a");
+        }
+        other => panic!("expected release writer, got {other:?}"),
+    }
+}

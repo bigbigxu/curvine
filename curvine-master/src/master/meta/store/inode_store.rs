@@ -26,7 +26,7 @@ use curvine_core_error::{err_box, try_err, try_option, CommonResult};
 use curvine_model::{BlockLocation, CommitBlock, FileLock, FileStatus, MountInfo};
 use curvine_rocksdb::{DBConf, DbReadSnapshot as DBReadSnapshot, RocksIterator, RocksUtils};
 use curvine_runtime::common::{FileUtils, TimeSpent, Utils};
-use log::info;
+use log::{info, warn};
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
 use std::sync::Arc;
 
@@ -104,10 +104,39 @@ pub struct PurgeItem {
     pub name: String,
 }
 
+/// What a client owns on an inode, as recorded in the ownership index (#1880).
+///
+/// The index is derived state: it is rebuilt from the inode/lock records if it is
+/// ever lost, and every entry is verified against the inode before it is acted on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum OwnerKind {
+    /// A lock in the per-inode lock table (session-owned owners only).
+    Lock = 1,
+    /// A writer marker inside the inode (`WriteFeature`).
+    Writer = 2,
+}
+
+impl OwnerKind {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Lock),
+            2 => Some(Self::Writer),
+            _ => None,
+        }
+    }
+}
+
 pub enum PurgeTarget {
     Dir(InodeView),
     File(i64),
 }
+
+use crate::master::meta::session_owned_clients;
 
 // Currently, only RockSDB is supported.
 // Note: InodeStore is intentionally NOT Clone.
@@ -166,12 +195,84 @@ impl InodeStore {
         self.ttl_bucket_list.clone()
     }
 
+    /// Stage the client ownership index for one inode's writer markers.
+    ///
+    /// Lives in the apply path so the leader, followers and journal replay all
+    /// derive the same index from the same journaled facts, and rides in the same
+    /// batch as the inode write so the two can never diverge (#1880).
+    fn stage_writer_owners(
+        &self,
+        batch: &mut InodeWriteBatch<'_>,
+        ino: i64,
+        before: &[String],
+        after: &[String],
+    ) -> CommonResult<()> {
+        let before: HashSet<&String> = before.iter().collect();
+        let after: HashSet<&String> = after.iter().collect();
+        for client in after.difference(&before) {
+            batch.add_client_owner(client.as_str(), OwnerKind::Writer, ino)?;
+        }
+        for client in before.difference(&after) {
+            batch.remove_client_owner(client.as_str(), OwnerKind::Writer, ino)?;
+        }
+        Ok(())
+    }
+
+    /// Stage the client ownership index for one inode's session-owned locks.
+    fn stage_lock_owners(
+        &self,
+        batch: &mut InodeWriteBatch<'_>,
+        ino: i64,
+        before: &HashSet<String>,
+        after: &[FileLock],
+    ) -> CommonResult<()> {
+        let after = session_owned_clients(after);
+        for client in after.difference(before) {
+            batch.add_client_owner(client, OwnerKind::Lock, ino)?;
+        }
+        for client in before.difference(&after) {
+            batch.remove_client_owner(client, OwnerKind::Lock, ino)?;
+        }
+        Ok(())
+    }
+
+    /// Record one ownership hint. Used by the rebuild path (the lock table is the
+    /// source of truth) and by the apply paths above.
+    pub fn add_client_owner(&self, client_id: &str, kind: OwnerKind, ino: i64) -> CommonResult<()> {
+        self.store.add_client_owner(client_id, kind, ino)
+    }
+
+    /// Ownership hints held by `client_id`, for the session reaper (#1884).
+    pub fn get_client_owners(&self, client_id: &str) -> CommonResult<Vec<(OwnerKind, i64)>> {
+        self.store.get_client_owners(client_id)
+    }
+
+    /// Drop one ownership hint. The reaper calls this after acting on a hint, and
+    /// also when the hint turned out to be stale (inode or ownership already
+    /// gone), which is what keeps stale hints from accumulating.
+    pub fn remove_client_owner(
+        &self,
+        client_id: &str,
+        kind: OwnerKind,
+        ino: i64,
+    ) -> CommonResult<()> {
+        self.store.remove_client_owner(client_id, kind, ino)
+    }
+
     pub fn apply_add(&self, parent: &InodeView, child: &InodeView) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
         batch.write_inode(child)?;
         batch.write_inode(parent)?;
         batch.add_child(parent.id(), child.name(), child.id())?;
+
+        // A freshly allocated inode has no stored predecessor, so every writer
+        // marker it carries is new (#1880).
+        if child.is_file() {
+            for client in child.writer_clients() {
+                batch.add_client_owner(&client, OwnerKind::Writer, child.id())?;
+            }
+        }
 
         batch.commit()?;
 
@@ -426,6 +527,7 @@ impl InodeStore {
     pub fn apply_complete_file(
         &self,
         file: &InodeView,
+        writers_before: &[String],
         commit_blocks: &[CommitBlock],
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
@@ -436,6 +538,12 @@ impl InodeStore {
                 batch.add_location(commit.block_id, item)?;
             }
         }
+        self.stage_writer_owners(
+            &mut batch,
+            file.id(),
+            writers_before,
+            &file.writer_clients(),
+        )?;
 
         batch.commit()?;
 
@@ -446,9 +554,19 @@ impl InodeStore {
         Ok(())
     }
 
-    pub fn apply_overwrite_file(&self, file: &InodeView) -> CommonResult<()> {
+    pub fn apply_overwrite_file(
+        &self,
+        file: &InodeView,
+        writers_before: &[String],
+    ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         batch.write_inode(file)?;
+        self.stage_writer_owners(
+            &mut batch,
+            file.id(),
+            writers_before,
+            &file.writer_clients(),
+        )?;
         batch.commit()?;
 
         // Overwrite can change ttl_ms/ttl_action and the TTL-base marker;
@@ -459,9 +577,19 @@ impl InodeStore {
         Ok(())
     }
 
-    pub fn apply_reopen_file(&self, file: &InodeView) -> CommonResult<()> {
+    pub fn apply_reopen_file(
+        &self,
+        file: &InodeView,
+        writers_before: &[String],
+    ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         batch.write_inode(file)?;
+        self.stage_writer_owners(
+            &mut batch,
+            file.id(),
+            writers_before,
+            &file.writer_clients(),
+        )?;
         batch.commit()
     }
 
@@ -615,14 +743,28 @@ impl InodeStore {
     fn decrement_inode_nlink(
         &self,
         inode_id: i64,
-        _links: u32,
+        links: u32,
         ctime: i64,
         batch: &mut InodeWriteBatch<'_>,
     ) -> CommonResult<DeleteResult> {
         let mut staged = HashMap::new();
         let mut ttl_removals = Vec::new();
-        let del_res =
-            self.stage_decrement_nlink(inode_id, ctime, batch, &mut staged, &mut ttl_removals)?;
+        let mut del_res = DeleteResult::new();
+
+        // Multiple hard-link edges can point at the same inode: every removed
+        // edge decrements the persisted nlink count exactly once (#1001228155).
+        for _ in 0..links {
+            let res = self.stage_decrement_nlink(
+                inode_id,
+                ctime,
+                batch,
+                &mut staged,
+                &mut ttl_removals,
+            )?;
+            del_res.inodes += res.inodes;
+            del_res.bytes += res.bytes;
+            del_res.blocks.extend(res.blocks);
+        }
 
         for inode in &ttl_removals {
             self.ttl_bucket_list.remove(inode);
@@ -643,10 +785,25 @@ impl InodeStore {
         let mut del_res = DeleteResult::new();
         let mut inode_view = match staged.remove(&inode_id) {
             Some(Some(inode)) => inode,
-            Some(None) => return err_box!("Inode {} not found when decrementing nlink", inode_id),
+            // A stale directory entry whose inode row is already gone is
+            // treated as already deleted, so recursive delete and purge stay
+            // tolerant of missing inodes (#1001228155).
+            Some(None) => {
+                warn!(
+                    "Inode {} not found when decrementing nlink; treating the stale directory entry as already deleted",
+                    inode_id
+                );
+                return Ok(del_res);
+            }
             None => match self.get_inode(inode_id, None)? {
                 Some(inode) => inode,
-                None => return err_box!("Inode {} not found when decrementing nlink", inode_id),
+                None => {
+                    warn!(
+                        "Inode {} not found when decrementing nlink; treating the stale directory entry as already deleted",
+                        inode_id
+                    );
+                    return Ok(del_res);
+                }
             },
         };
 
@@ -669,6 +826,12 @@ impl InodeStore {
         };
 
         if last_link {
+            // The inode is about to disappear, so no client can own writer state
+            // on it any more. Staged in the same batch as the delete, which also
+            // covers recursive delete and purge (#1880).
+            for client in inode_view.writer_clients() {
+                batch.remove_client_owner(&client, OwnerKind::Writer, inode_id)?;
+            }
             batch.delete_inode(inode_id)?;
             ttl_removals.push(inode_view);
             staged.insert(inode_id, None);
@@ -1159,8 +1322,16 @@ impl InodeStore {
         self.store.get_locks(id)
     }
 
-    pub fn apply_set_locks(&self, id: i64, lock: &[FileLock]) -> CommonResult<()> {
-        self.store.set_locks(id, lock)
+    pub fn apply_set_locks(
+        &self,
+        id: i64,
+        before: &HashSet<String>,
+        locks: &[FileLock],
+    ) -> CommonResult<()> {
+        let mut batch = self.store.new_batch();
+        batch.set_locks(id, locks)?;
+        self.stage_lock_owners(&mut batch, id, before, locks)?;
+        batch.commit()
     }
 
     pub fn get_rocksdb_metrics(&self) -> CommonResult<HashMap<String, u64>> {
