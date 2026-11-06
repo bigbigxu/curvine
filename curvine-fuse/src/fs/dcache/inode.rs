@@ -103,6 +103,7 @@ pub struct Inode {
     /// Persisted with the dcache so the release-time deferred-delete identity
     /// check can compare a fresh `stat` of the recorded path against the
     /// originally unlinked file even after a FUSE restart (#1395).
+    #[serde(default)]
     pub master_id: i64,
 }
 
@@ -513,10 +514,7 @@ mod tests {
 
         // What `persist` writes and `restore` reads back.
         let json = serde_json::to_value(&inode).unwrap();
-        assert_eq!(
-            json["deferred_delete_path"],
-            serde_json::json!("/a/f")
-        );
+        assert_eq!(json["deferred_delete_path"], serde_json::json!("/a/f"));
         assert_eq!(json["master_id"], serde_json::json!(603));
 
         let restored: Inode = serde_json::from_value(json).unwrap();
