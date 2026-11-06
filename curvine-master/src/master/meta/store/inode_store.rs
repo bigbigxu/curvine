@@ -247,6 +247,27 @@ impl InodeStore {
         self.store.get_client_owners(client_id)
     }
 
+    /// At most `limit` hints of `client_id`, optionally of one `kind` (#1884).
+    pub fn get_client_owners_limited(
+        &self,
+        client_id: &str,
+        kind: Option<OwnerKind>,
+        limit: usize,
+    ) -> CommonResult<Vec<(OwnerKind, i64)>> {
+        self.store.get_client_owners_limited(client_id, kind, limit)
+    }
+
+    /// Resumable scan over the lock hints of every client (#1884). See
+    /// [`RocksInodeStore::scan_lock_owners`].
+    #[allow(clippy::type_complexity)]
+    pub fn scan_lock_owners(
+        &self,
+        cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> CommonResult<(Vec<(String, i64, Vec<u8>)>, Option<Vec<u8>>)> {
+        self.store.scan_lock_owners(cursor, limit)
+    }
+
     /// Drop one ownership hint. The reaper calls this after acting on a hint, and
     /// also when the hint turned out to be stale (inode or ownership already
     /// gone), which is what keeps stale hints from accumulating.
@@ -754,13 +775,8 @@ impl InodeStore {
         // Multiple hard-link edges can point at the same inode: every removed
         // edge decrements the persisted nlink count exactly once (#1001228155).
         for _ in 0..links {
-            let res = self.stage_decrement_nlink(
-                inode_id,
-                ctime,
-                batch,
-                &mut staged,
-                &mut ttl_removals,
-            )?;
+            let res =
+                self.stage_decrement_nlink(inode_id, ctime, batch, &mut staged, &mut ttl_removals)?;
             del_res.inodes += res.inodes;
             del_res.bytes += res.bytes;
             del_res.blocks.extend(res.blocks);
