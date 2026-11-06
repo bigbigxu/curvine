@@ -341,7 +341,7 @@ impl NodeState {
         // lookup ref so n_lookup stays balanced with FORGET (community #1275).
         let inode = dir.lookup(parent, name, status, true)?;
         inode.mark_dirty()?;
-        Ok(inode.status.clone())
+        Ok(inode.clone_status())
     }
 
     pub async fn lookup_common(&self, parent: u64, name: &str) -> FuseResult<fuse_attr> {
@@ -407,7 +407,7 @@ impl NodeState {
                 return Ok(());
             };
             let needs = dir.canonical_matches(ino, removed_parent, removed_name);
-            (inode.status.id, needs)
+            (inode.ino as i64, needs)
         };
         if !needs_repoint || master_id <= 0 {
             return Ok(());
@@ -427,8 +427,8 @@ impl NodeState {
                 if status.id == master_id
                     && !(dir_ino == removed_parent && status.name == removed_name)
                 {
-                    let name = status.name.clone();
-                    self.dir_write().repoint_canonical(ino, dir_ino, name)?;
+                    self.dir_write()
+                        .repoint_canonical(ino, dir_ino, status.name.clone())?;
                     return Ok(());
                 }
             }
@@ -1221,7 +1221,7 @@ impl NodeState {
             } else {
                 dir.get_valid_inode(ino, name, self.meta_cache_ttl)
             };
-            inode.map(|inode| inode.status.clone())
+            inode.map(|inode| inode.clone_status())
         };
 
         // Hit/miss recorded the moment the cache read resolves (before any backend
@@ -1255,14 +1255,14 @@ impl NodeState {
         let (ino, cow_name) = if name == FUSE_CURRENT_DIR {
             let dir = self.dir_read();
             let inode = dir.get_inode_check(ino, None)?;
-            (inode.parent, Cow::Owned(inode.name.to_owned()))
+            (inode.parent, Cow::Owned(inode.name.to_string()))
         } else if name == FUSE_PARENT_DIR {
             let dir = self.dir_read();
             let inode = dir.get_inode_check(ino, None)?;
             let parent_inode = dir.get_inode_check(inode.parent, None)?;
             (
                 parent_inode.parent,
-                Cow::Owned(parent_inode.name.to_owned()),
+                Cow::Owned(parent_inode.name.to_string()),
             )
         } else {
             (ino, Cow::Borrowed(name))
@@ -1358,7 +1358,7 @@ impl NodeState {
             dir.check_deleted_child(ino, name)?;
             let cached = if self.enable_meta_cache {
                 dir.get_valid_inode(ino, name, self.meta_cache_ttl)
-                    .map(|inode| inode.status.clone())
+                    .map(|inode| inode.clone_status())
             } else {
                 None
             };
