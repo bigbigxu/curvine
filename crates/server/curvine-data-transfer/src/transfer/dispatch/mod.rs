@@ -227,14 +227,16 @@ impl WorkerBlacklist {
     }
 
     fn is_blocked(&self, worker_id: u32, now_ms: i64) -> bool {
-        match self.until_ms.get(&worker_id) {
-            Some(until) if *until > now_ms => true,
-            Some(_) => {
-                // Expired entry: forget it. The guard is already released, so
-                // this cannot deadlock against a concurrent block().
-                self.until_ms.remove(&worker_id);
-                false
-            }
+        match self.until_ms.get(&worker_id).map(|until| *until) {
+            Some(until) if until > now_ms => true,
+            Some(_) => match self.until_ms.entry(worker_id) {
+                dashmap::mapref::entry::Entry::Occupied(entry) if *entry.get() > now_ms => true,
+                dashmap::mapref::entry::Entry::Occupied(entry) => {
+                    entry.remove();
+                    false
+                }
+                dashmap::mapref::entry::Entry::Vacant(_) => false,
+            },
             None => false,
         }
     }
@@ -617,7 +619,10 @@ where
                     }
                 });
             if let Err(err) = spawn_result {
-                error!("failed to start transfer scheduler worker {}: {}", index, err);
+                error!(
+                    "failed to start transfer scheduler worker {}: {}",
+                    index, err
+                );
             }
         }
     }
@@ -640,8 +645,13 @@ where
         let lease_timeout = duration_ms(self.conf.lease_timeout);
         let max_executing = self.conf.max_executing_transfers();
         let acquired = Self::blocking(self, move |s| {
-            s.store
-                .acquire_runnable_transfer(&s.owner, lease_timeout, now_ms, max_executing, prefer_pending)
+            s.store.acquire_runnable_transfer(
+                &s.owner,
+                lease_timeout,
+                now_ms,
+                max_executing,
+                prefer_pending,
+            )
         })
         .await?;
         let Some(lease) = acquired else {
@@ -3480,4 +3490,6 @@ mod tests {
 
     #[path = "dispatch_recovery_test.rs"]
     mod dispatch_recovery_test;
+    #[path = "worker_blacklist_test.rs"]
+    mod worker_blacklist_test;
 }
