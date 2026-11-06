@@ -445,12 +445,23 @@ async fn placement_that_never_claims_the_lease_is_planned_locally() {
             attempt
         );
     }
+    // The hand-backs above really requeued the row, so it is Pending now. A
+    // real tick re-acquires it as Planning first; what matters here is that the
+    // takeover does not write the row again.
+    let before = store.get_transfer(&job.job_id).unwrap().unwrap();
+    assert_eq!(before.state, TransferState::Pending);
     assert!(
         !scheduler
             .hand_back_to_placement(&job, &lease(&job), now_ms())
             .unwrap(),
         "an unclaimed placement must not keep the job Pending forever"
     );
+    let after = store.get_transfer(&job.job_id).unwrap().unwrap();
+    assert_eq!(
+        after.state, before.state,
+        "a takeover must keep the lease, not requeue the row"
+    );
+    assert_eq!(after.lease_epoch, before.lease_epoch);
     // The takeover has to stick: a job that failed to plan and came back must
     // not spend another five ticks handing the lease to the same dead address.
     assert!(

@@ -321,7 +321,7 @@ where
     fn record_submit_accepted(&self, job: &TransferJobRecord) {
         record_submit_metric(job.kind, "accepted");
         info!(
-            "transfer submit accepted job_id={} run_id={} kind={:?} tenant={} submitter={} source={} target={} state={:?}",
+            "transfer submit accepted job_id={} run_id={} kind={:?} tenant={} submitter={} source={} target={} placement={} state={:?}",
             job.job_id,
             job.run_id,
             job.kind,
@@ -329,6 +329,7 @@ where
             job.submitter,
             job.source_path,
             job.target_path,
+            job.placement_addr,
             job.state
         );
     }

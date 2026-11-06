@@ -486,8 +486,11 @@ const SCHEDULER_MIN_IDLE_INTERVAL: Duration = Duration::from_millis(1);
 /// Every N scheduler ticks, prefer acquiring a new Pending job over
 /// continuing to service already-held jobs (anti-starvation fairness).
 const ACQUIRE_PENDING_EVERY_N_TICKS: u64 = 4;
-/// Consecutive hand-backs of one job tolerated before this instance keeps the
-/// lease and plans locally.
+/// Hand-backs tolerated before this instance keeps the lease and plans locally.
+///
+/// The count accumulates per run and is not reset by a successful claim: a job
+/// that is really claimed stops being Planning, so it never comes back here.
+/// Keeping the count monotonic is what makes the takeover decision stick.
 ///
 /// A hand-back only lands when the recorded placement names an instance that is
 /// alive and recognises itself. That does not hold for a job whose placement
@@ -788,7 +791,9 @@ where
                 attempts.saturating_sub(1),
                 forwarder.self_addr()
             );
-            record_metric(|metrics| metrics.inc_requeue("placement_unclaimed"));
+            record_metric(|metrics| {
+                metrics.inc_planning(transfer_kind_label(job.kind), "takeover")
+            });
             return Ok(false);
         }
         record_metric(|metrics| metrics.inc_requeue("placed_elsewhere"));
