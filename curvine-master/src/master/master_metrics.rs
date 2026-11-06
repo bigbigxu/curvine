@@ -254,6 +254,16 @@ pub struct MasterMetrics {
     pub(crate) dir_space_scan_inodes: GaugeVec,
     pub(crate) dir_space_scan_edges: GaugeVec,
     pub(crate) dir_space_scan_anomalies: GaugeVec,
+
+    // Client session lease (#1885). `active_sessions` is a gauge because sessions
+    // are leader-local: after a failover it drops to zero and climbs back as
+    // clients re-register, which is exactly what an operator needs to see. The
+    // counters make a crash storm visible as reclamation work.
+    pub(crate) active_sessions: Gauge,
+    pub(crate) expired_sessions_total: Counter,
+    pub(crate) reaped_locks_total: Counter,
+    pub(crate) reaped_writers_total: Counter,
+    pub(crate) reaped_stale_hints_total: Counter,
 }
 
 impl MasterMetrics {
@@ -567,6 +577,27 @@ impl MasterMetrics {
                 "dir_space_scan_anomalies",
                 "Anomalies recorded by the last successful dir-space scan round, labelled by scope",
                 &["scope"],
+
+
+            active_sessions: m::new_gauge(
+                "master_active_sessions",
+                "Client sessions currently holding a lease with this master",
+            )?,
+            expired_sessions_total: m::new_counter(
+                "master_expired_sessions_total",
+                "Client sessions reclaimed after their lease expired",
+            )?,
+            reaped_locks_total: m::new_counter(
+                "master_reaped_locks_total",
+                "Inode lock sets released because their owning session expired",
+            )?,
+            reaped_writers_total: m::new_counter(
+                "master_reaped_writers_total",
+                "Writer markers released because their owning session expired",
+            )?,
+            reaped_stale_hints_total: m::new_counter(
+                "master_reaped_stale_hints_total",
+                "Ownership hints dropped because the inode or ownership was already gone",
             )?,
         };
 
