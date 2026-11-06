@@ -1,4 +1,4 @@
-use super::super::{now_ms, TransferScheduler};
+use super::super::{now_ms, TransferScheduler, MAX_PLACEMENT_HAND_BACKS};
 use crate::common::UfsFactory;
 use crate::transfer::memory_store::MemoryTransferStore;
 use crate::transfer::plan::TransferPlanner;
@@ -418,4 +418,45 @@ async fn placement_to_an_instance_outside_the_ring_plans_locally_instead_of_loop
     let stored = store.get_transfer(&job.job_id).unwrap().unwrap();
     assert_eq!(stored.state, TransferState::Planning);
     assert_eq!(stored.owner, "test-owner");
+}
+
+/// The other livelock: placement names a live sibling in the ring, but that
+/// sibling never claims the lease (dead endpoint behind a static list, a drifted
+/// endpoint list, or a rerun whose fresh request id hashes outside the ring).
+/// Retrying the hand-back forever keeps the job Pending, so this instance has to
+/// keep the lease after a bounded number of attempts.
+#[tokio::test]
+async fn placement_that_never_claims_the_lease_is_planned_locally() {
+    let store = Arc::new(MemoryTransferStore::new());
+    let job = planning_job("placement-never-claimed", "10.9.9.9:8010");
+    store.create_or_get_by_request_id(job.clone()).unwrap();
+    let scheduler = scheduler_with_placement(
+        store.clone(),
+        &["10.9.9.9:8010", "10.9.9.10:8010"],
+        "10.9.9.10:8010",
+    );
+
+    for attempt in 1..=MAX_PLACEMENT_HAND_BACKS {
+        assert!(
+            scheduler
+                .hand_back_to_placement(&job, &lease(&job), now_ms())
+                .unwrap(),
+            "hand-back {} must still give the placement owner a chance",
+            attempt
+        );
+    }
+    assert!(
+        !scheduler
+            .hand_back_to_placement(&job, &lease(&job), now_ms())
+            .unwrap(),
+        "an unclaimed placement must not keep the job Pending forever"
+    );
+    // The takeover has to stick: a job that failed to plan and came back must
+    // not spend another five ticks handing the lease to the same dead address.
+    assert!(
+        !scheduler
+            .hand_back_to_placement(&job, &lease(&job), now_ms())
+            .unwrap(),
+        "the takeover must survive the job being re-acquired"
+    );
 }

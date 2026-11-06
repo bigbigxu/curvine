@@ -486,6 +486,21 @@ const SCHEDULER_MIN_IDLE_INTERVAL: Duration = Duration::from_millis(1);
 /// Every N scheduler ticks, prefer acquiring a new Pending job over
 /// continuing to service already-held jobs (anti-starvation fairness).
 const ACQUIRE_PENDING_EVERY_N_TICKS: u64 = 4;
+/// Consecutive hand-backs of one job tolerated before this instance keeps the
+/// lease and plans locally.
+///
+/// A hand-back only lands when the recorded placement names an instance that is
+/// alive and recognises itself. That does not hold for a job whose placement
+/// names a decommissioned endpoint, a drifted endpoint list, or a rerun whose
+/// fresh request id hashes outside the ring: the lease holder is then the only
+/// instance with the row, `owns_addr` never answers yes for it, and the job
+/// cycles Pending -> Planning -> Pending forever (observed in production: tens
+/// of thousands of acquires and zero planning attempts). Planning here is safe
+/// because the lease, not the placement, is what fences concurrent runs.
+const MAX_PLACEMENT_HAND_BACKS: u32 = 5;
+/// Upper bound on the hand-back ledger so a long-lived process cannot grow it
+/// without limit.
+const HAND_BACK_LEDGER_MAX_ENTRIES: usize = 4096;
 
 pub struct TransferScheduler<S> {
     store: Arc<S>,
@@ -523,6 +538,9 @@ pub struct TransferScheduler<S> {
     /// instance its submit was relayed to, so that instance is the one holding
     /// the job's in-memory task state.
     forwarder: Option<Arc<crate::transfer::Forwarder>>,
+    /// `job_id:run_id` -> consecutive hand-backs, see
+    /// [`MAX_PLACEMENT_HAND_BACKS`].
+    placement_hand_backs: Arc<DashMap<String, u32>>,
 }
 
 impl<S> Clone for TransferScheduler<S> {
@@ -546,6 +564,7 @@ impl<S> Clone for TransferScheduler<S> {
             worker_blacklist: self.worker_blacklist.clone(),
             task_cache: self.task_cache.clone(),
             forwarder: self.forwarder.clone(),
+            placement_hand_backs: self.placement_hand_backs.clone(),
         }
     }
 }
@@ -589,6 +608,7 @@ where
             worker_blacklist: Arc::new(WorkerBlacklist::new()),
             task_cache,
             forwarder,
+            placement_hand_backs: Arc::new(DashMap::new()),
         }
     }
 
@@ -725,7 +745,11 @@ where
     /// between the two never matches and livelocks the job between instances.
     ///
     /// When this instance is not in the ring at all no hand-back can ever land,
-    /// so the job is planned here instead of being returned forever.
+    /// so the job is planned here instead of being returned forever. The same
+    /// applies once the placement target has ignored
+    /// [`MAX_PLACEMENT_HAND_BACKS`] consecutive hand-backs: the address may be
+    /// dead, decommissioned, or simply not this instance's business any more,
+    /// and a job must never be parked in Pending because of it.
     fn hand_back_to_placement(
         &self,
         job: &TransferJobRecord,
@@ -755,6 +779,18 @@ where
             );
             return Ok(false);
         }
+        let attempts = self.note_placement_hand_back(job);
+        if attempts > MAX_PLACEMENT_HAND_BACKS {
+            warn!(
+                "placement {} did not claim job {} after {} hand-backs; planning it on {} instead",
+                target,
+                job.job_id,
+                attempts.saturating_sub(1),
+                forwarder.self_addr()
+            );
+            record_metric(|metrics| metrics.inc_requeue("placement_unclaimed"));
+            return Ok(false);
+        }
         record_metric(|metrics| metrics.inc_requeue("placed_elsewhere"));
         self.store.requeue_transfer(TransferRequeueUpdate {
             job_id: job.job_id.clone(),
@@ -768,6 +804,25 @@ where
             now_ms,
         })?;
         Ok(true)
+    }
+
+    /// Counts consecutive hand-backs for one job. The counter is kept above the
+    /// limit once reached (see [`MAX_PLACEMENT_HAND_BACKS`]) so the decision
+    /// stays made: dropping it would restart the count on the next acquire and
+    /// leak five more hand-backs before every local attempt.
+    ///
+    /// Reruns get a fresh `run_id` and therefore a fresh count, which is correct
+    /// because the rerun row carries a new placement.
+    fn note_placement_hand_back(&self, job: &TransferJobRecord) -> u32 {
+        if self.placement_hand_backs.len() > HAND_BACK_LEDGER_MAX_ENTRIES {
+            self.placement_hand_backs.clear();
+        }
+        let mut attempts = self
+            .placement_hand_backs
+            .entry(placement_hand_back_key(job))
+            .or_insert(0);
+        *attempts = attempts.saturating_add(1);
+        *attempts
     }
 
     fn idle_interval(&self) -> Duration {
@@ -2912,6 +2967,12 @@ fn scheduler_idle_interval(lease_timeout: Duration) -> Duration {
     SCHEDULER_IDLE_INTERVAL
         .min(lease_timeout / 2)
         .max(SCHEDULER_MIN_IDLE_INTERVAL)
+}
+
+/// Ledger key for [`MAX_PLACEMENT_HAND_BACKS`]: a rerun has a new request id but
+/// keeps the job id, so the run id has to be part of the key.
+fn placement_hand_back_key(job: &TransferJobRecord) -> String {
+    format!("{}:{}", job.job_id, job.run_id)
 }
 
 pub(crate) fn lease_renew_interval(lease_timeout: Duration) -> Duration {

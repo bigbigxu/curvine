@@ -52,6 +52,19 @@ where
         self
     }
 
+    /// This instance's own rpc address, or None when placement is disabled.
+    ///
+    /// Every path that reaches a local accept (this instance owns the key, the
+    /// relay was skipped, or it failed) leaves the job record here, so placement
+    /// must name this instance. Recording a remote address the submit never
+    /// reached strands the job: the scheduler hands the lease to an address that
+    /// holds nothing to plan, and the lease holder hands it back forever.
+    fn self_placement(&self) -> Option<String> {
+        self.forwarder
+            .as_ref()
+            .map(|forwarder| forwarder.self_addr().to_string())
+    }
+
     /// Relays a submit to the placement owner of `key`, if that is another
     /// instance. Returns None when this instance should serve it.
     async fn relay<T, R>(&self, key: &str, code: RpcCode, req: T) -> Option<R>
@@ -149,7 +162,13 @@ where
 
     fn retry_transfer(&self, msg: &Message) -> FsResult<Message> {
         let req: RetryTransferRequest = msg.parse_header()?;
-        let job = self.service.retry_transfer(&req.job_id)?;
+        // The rerun row is created here (retry is never relayed), so placement
+        // has to name this instance. An empty placement makes the scheduler
+        // hash the *new* request id, which can name an instance that never
+        // receives the row and therefore never plans it.
+        let job = self
+            .service
+            .retry_transfer_placed(&req.job_id, self.self_placement())?;
         let response = SubmitTransferResponse {
             job_id: job.job_id,
             run_id: job.run_id,
@@ -278,14 +297,11 @@ where
                         return Ok(Builder::success(&msg).proto_header(response).build());
                     }
                 }
-                // Record where placement put this job. Later decisions read
-                // this instead of recomputing a hash.
-                let placement = self
-                    .forwarder
-                    .as_ref()
-                    .and_then(|forwarder| forwarder.owner_of(&req.client_request_id));
-                // No owner, or the relay failed: accept the job here so a
-                // submit never fails just because placement could not run.
+                // Accept locally: this instance holds the row now, so it is
+                // also the instance that must plan it. Naming the ring owner of
+                // the request id here would point at an instance that never saw
+                // the submit (the relay just failed), leaving the job Pending.
+                let placement = self.self_placement();
                 let job = self.service.submit_transfer_placed(req, placement)?;
                 let response = SubmitTransferResponse {
                     job_id: job.job_id,

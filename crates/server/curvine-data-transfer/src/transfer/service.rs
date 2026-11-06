@@ -290,7 +290,7 @@ where
             mount_snapshot_attempts: 0,
             planning_attempts: 0,
             takeover_count: 0,
-            placement_addr: placement_addr.unwrap_or_default(),
+            placement_addr: placement_addr.clone().unwrap_or_default(),
             owner_addr: String::new(),
             terminal_summary: None,
             terminal_counts: None,
@@ -312,7 +312,7 @@ where
         };
         let job = self.store.create_or_get_by_request_id_checked(job)?;
         if allow_auto_repair {
-            self.maybe_auto_repair_terminal_load(job)
+            self.maybe_auto_repair_terminal_load(job, placement_addr)
         } else {
             Ok(job)
         }
@@ -343,6 +343,7 @@ where
     fn maybe_auto_repair_terminal_load(
         &self,
         job: TransferJobRecord,
+        placement_addr: Option<String>,
     ) -> FsResult<TransferJobRecord> {
         if !auto_repair_eligible(job.kind, job.state) {
             return Ok(job);
@@ -453,7 +454,9 @@ where
             "auto-repair completed load job_id={} state={:?} target={} still invalid; retrying",
             job.job_id, job.state, job.target_path
         );
-        match self.retry_transfer_inner(&job.job_id) {
+        // The replacement row is created by this instance, so it inherits this
+        // instance's placement instead of hashing the new request id.
+        match self.retry_transfer_inner(&job.job_id, placement_addr) {
             Ok(repaired) => Ok(repaired),
             Err(err) => {
                 // Concurrent submit may have won the race after our active-job check.
@@ -538,12 +541,31 @@ where
     }
 
     pub fn retry_transfer(&self, job_id: &str) -> FsResult<TransferJobRecord> {
-        let job = self.retry_transfer_inner(job_id)?;
+        self.retry_transfer_placed(job_id, None)
+    }
+
+    /// `placement_addr` must name the instance that will hold the new record.
+    ///
+    /// A rerun is created locally (retry is a synchronous handler, never
+    /// relayed), so the caller passes its own address. Leaving it empty makes
+    /// the scheduler recompute a hash from the *new* request id, which can name
+    /// an instance that never receives the row and therefore can never plan it;
+    /// the job then cycles Pending forever.
+    pub fn retry_transfer_placed(
+        &self,
+        job_id: &str,
+        placement_addr: Option<String>,
+    ) -> FsResult<TransferJobRecord> {
+        let job = self.retry_transfer_inner(job_id, placement_addr)?;
         self.record_submit_accepted(&job);
         Ok(job)
     }
 
-    fn retry_transfer_inner(&self, job_id: &str) -> FsResult<TransferJobRecord> {
+    fn retry_transfer_inner(
+        &self,
+        job_id: &str,
+        placement_addr: Option<String>,
+    ) -> FsResult<TransferJobRecord> {
         let job = self.get_transfer(job_id)?;
         if !matches!(
             job.state,
@@ -579,7 +601,7 @@ where
                 forwarded: None,
             },
             false,
-            None,
+            placement_addr,
         )
     }
 
@@ -1917,7 +1939,83 @@ fn decode_transfer_command(bytes: &[u8]) -> FsResult<TransferCommand> {
 
 #[cfg(test)]
 mod tests {
-    use super::JobSummaryDirtySet;
+    use super::{encode_transfer_command, JobSummaryDirtySet, TransferCommand, TransferService};
+    use crate::transfer::memory_store::MemoryTransferStore;
+    use crate::transfer::store::TransferStore;
+    use curvine_model::{TransferJobRecord, TransferKind, TransferProgress, TransferState};
+    use std::sync::Arc;
+
+    fn terminated_load(job_id: &str) -> TransferJobRecord {
+        let command = TransferCommand {
+            kind: TransferKind::Load,
+            source_path: "oss://bucket/dir/".to_string(),
+            target_path: "/data".to_string(),
+            client_request_id: format!("request-{job_id}"),
+            submitter: "tester".to_string(),
+            tenant: String::new(),
+            options: Default::default(),
+            fs_mode_files: Vec::new(),
+        };
+        TransferJobRecord {
+            job_key: command.job_key(),
+            job_id: job_id.to_string(),
+            run_id: 1,
+            kind: command.kind,
+            source_path: command.source_path.clone(),
+            target_path: command.target_path.clone(),
+            command_json: String::from_utf8(encode_transfer_command(&command).unwrap()).unwrap(),
+            mount_snapshot_json: "{}".to_string(),
+            secret_ref_json: "{}".to_string(),
+            cluster_snapshot_version: 0,
+            mount_snapshot_attempts: 0,
+            planning_attempts: 0,
+            takeover_count: 0,
+            placement_addr: String::new(),
+            owner_addr: String::new(),
+            terminal_summary: None,
+            terminal_counts: None,
+            cv_metadata_epoch: None,
+            state: TransferState::Completed,
+            owner: String::new(),
+            lease_epoch: 0,
+            lease_expire_at: 0,
+            cancel_requested: false,
+            summary: TransferProgress::default(),
+            client_request_id: command.client_request_id.clone(),
+            submitter: command.submitter.clone(),
+            tenant: command.tenant.clone(),
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    /// A rerun row is created by the instance that serves the retry (retry is a
+    /// synchronous handler, never relayed), so placement has to name that
+    /// instance. An empty placement made the scheduler hash the new request id
+    /// and hand the lease to an instance that never received the row.
+    #[test]
+    fn rerun_records_the_serving_instance_as_placement() {
+        let store = Arc::new(MemoryTransferStore::new());
+        let job = terminated_load("job-rerun-placed");
+        store.create_or_get_by_request_id(job.clone()).unwrap();
+        let service = TransferService::new(store.clone());
+
+        let rerun = service
+            .retry_transfer_placed(&job.job_id, Some("10.9.9.10:8010".to_string()))
+            .unwrap();
+
+        assert_ne!(rerun.job_id, job.job_id);
+        assert_eq!(rerun.state, TransferState::Pending);
+        assert_eq!(rerun.placement_addr, "10.9.9.10:8010");
+        assert_eq!(
+            store
+                .get_transfer(&rerun.job_id)
+                .unwrap()
+                .unwrap()
+                .placement_addr,
+            "10.9.9.10:8010"
+        );
+    }
 
     #[test]
     fn dirty_set_keeps_job_when_progress_is_followed_by_terminal_mark() {
