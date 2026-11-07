@@ -12,24 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::handler::stream_handler::dispatch_with_guard;
 use crate::handler::{
     Frame, GlobalLimit, LimitConf, LimitPermit, MessageHandler, ReadFrame, WriteFrame,
 };
-use crate::message::{Builder, Message};
+use crate::message::Message;
 use crate::ServerConf;
+use curvine_core_error::CommonErrorExt;
 use curvine_io::{IOError, IOResult};
 use curvine_metrics::{Gauge, Metrics};
-use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_runtime::runtime::Runtime;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use log::debug;
 use once_cell::sync::Lazy;
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::TryAcquireError;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 static BLOCKED_REQUESTS: Lazy<Gauge> = Lazy::new(|| {
     Metrics::new_gauge(
@@ -89,41 +90,25 @@ impl<F: Frame, M: MessageHandler> BufferHandler<F, M> {
     }
 
     async fn process_request(
-        rt: &Runtime,
+        rt: &Arc<Runtime>,
         handler: &Arc<M>,
         global_limit: &Arc<GlobalLimit>,
+        permit_timeout: Duration,
         request: Message,
     ) -> IOResult<Message> {
-        let permit = Self::acquire_limit(global_limit).await?;
-
-        let response = if handler.is_sync(&request) {
-            let exec_rt = handler.get_rt(&request).unwrap_or(rt);
-            let handler = handler.clone();
-            exec_rt
-                .spawn_blocking(move || {
-                    let _permit = permit;
-                    match handler.handle(&request) {
-                        Err(e) => {
-                            debug!("handler request {} error: {}", request.req_id(), e);
-                            request.error_ext(&e)
-                        }
-                        Ok(v) => v,
-                    }
-                })
-                .await?
-        } else {
-            let _permit = permit;
-            let protocol = request.protocol;
-            match handler.async_handle(request).await {
-                Ok(v) => v,
-                Err(e) => {
-                    debug!("handler request {} error: {}", protocol.req_id, e);
-                    Builder::protocol(protocol).build().error_ext(&e)
-                }
+        let permit = match timeout(permit_timeout, Self::acquire_limit(global_limit)).await {
+            Ok(permit) => permit?,
+            Err(_) => {
+                // The in-flight slot is what keeps the reactor polling the
+                // socket, so it must not be parked for as long as an unrelated
+                // connection holds the permit. Answer this request instead.
+                let err =
+                    CommonErrorExt::from(format!("no global permit within {:?}", permit_timeout));
+                return Ok(request.error_ext(&err));
             }
         };
 
-        Ok(response)
+        dispatch_with_guard(rt, handler, request, permit).await
     }
 
     async fn acquire_limit(global_limit: &Arc<GlobalLimit>) -> IOResult<LimitPermit> {
@@ -143,10 +128,17 @@ impl<F: Frame, M: MessageHandler> BufferHandler<F, M> {
         }
     }
 
-    async fn send_response(writer: &mut WriteFrame, response: IOResult<Message>) -> IOResult<()> {
+    async fn send_response(
+        writer: &mut WriteFrame,
+        response: IOResult<Message>,
+        timeout: Duration,
+    ) -> IOResult<()> {
         let response = response?;
         if response.not_empty() {
-            writer.send(&response).await?;
+            // Without a deadline a peer that stops reading freezes the reactor,
+            // and the in-flight futures (with their global permits) are never
+            // polled again.
+            writer.send_timeout(&response, timeout).await?;
         }
         Ok(())
     }
@@ -157,7 +149,7 @@ impl<F: Frame, M: MessageHandler> BufferHandler<F, M> {
         inflight: &mut FuturesUnordered<R>,
         conn_limit: &AtomicUsize,
         close_idle: bool,
-        idle_timeout: Duration,
+        timeout: Duration,
     ) -> IOResult<Message>
     where
         R: Future<Output = IOResult<Message>>,
@@ -172,13 +164,13 @@ impl<F: Frame, M: MessageHandler> BufferHandler<F, M> {
             tokio::select! {
                 response = inflight.next(), if !inflight.is_empty() => {
                     if let Some(response) = response {
-                        Self::send_response(writer, response).await?;
+                        Self::send_response(writer, response, timeout).await?;
                     }
                 }
 
                 received = &mut receive, if inflight.len() < conn_limit => return received,
 
-                _ = sleep(idle_timeout), if close_idle && inflight.is_empty() => {
+                _ = sleep(timeout), if close_idle && inflight.is_empty() => {
                     return Ok(Message::empty());
                 }
             }
@@ -191,7 +183,7 @@ impl<F: Frame, M: MessageHandler> BufferHandler<F, M> {
             frame,
             handler,
             close_idle,
-            timeout: idle_timeout,
+            timeout,
             limit,
         } = self;
 
@@ -209,15 +201,27 @@ impl<F: Frame, M: MessageHandler> BufferHandler<F, M> {
                 &mut inflight,
                 &conn_limit,
                 close_idle,
-                idle_timeout,
+                timeout,
             )
             .await?;
 
             if request.is_empty() {
+                // A clean read-side EOF only means the peer closed its sending
+                // half: it can still be waiting for the replies of requests it
+                // already pipelined, so finish those before closing.
+                while let Some(response) = inflight.next().await {
+                    Self::send_response(&mut writer, response, timeout).await?;
+                }
                 return Ok(());
             }
 
-            inflight.push(Self::process_request(&rt, &handler, &global_limit, request));
+            inflight.push(Self::process_request(
+                &rt,
+                &handler,
+                &global_limit,
+                timeout,
+                request,
+            ));
         }
     }
 }
@@ -226,7 +230,7 @@ impl<F: Frame, M: MessageHandler> BufferHandler<F, M> {
 mod tests {
     use super::{BlockedRequestGuard, BufferHandler, BLOCKED_REQUESTS};
     use crate::handler::{GlobalLimit, MessageHandler, RpcFrame, TestMessageHandler};
-    use crate::message::Message;
+    use crate::message::{Message, ResponseStatus};
     use curvine_core_error::CommonErrorExt;
     use curvine_runtime::runtime::{RpcRuntime, Runtime};
     use std::sync::{mpsc, Arc, Mutex};
@@ -294,6 +298,29 @@ mod tests {
     }
 
     #[test]
+    fn permit_wait_timeout_answers_with_an_error_instead_of_parking() {
+        let runtime = Arc::new(Runtime::current_thread("permit-wait-timeout-test"));
+        let limit = GlobalLimit::new(1);
+        let held = limit.semaphore().clone().try_acquire_owned().unwrap();
+        let handler = Arc::new(TestMessageHandler);
+
+        runtime.clone().block_on(async {
+            let response = BufferHandler::<RpcFrame, TestMessageHandler>::process_request(
+                &runtime,
+                &handler,
+                &limit,
+                Duration::from_millis(50),
+                Message::empty(),
+            )
+            .await
+            .expect("a permit-wait timeout must produce an error response");
+            assert_ne!(response.response_status(), ResponseStatus::Success);
+        });
+
+        drop(held);
+    }
+
+    #[test]
     fn sync_task_keeps_permit_after_outer_future_is_cancelled() {
         let runtime = Arc::new(Runtime::current_thread("sync-permit-cancellation-test"));
         let limit = GlobalLimit::new(1);
@@ -312,6 +339,7 @@ mod tests {
                     &task_runtime,
                     &handler,
                     &task_limit,
+                    Duration::from_secs(60),
                     Message::empty(),
                 )
                 .await
@@ -379,7 +407,7 @@ mod tests {
 
     #[test]
     fn sync_request_uses_handler_runtime() {
-        let runtime = Runtime::current_thread("buffer-handler-default-runtime");
+        let runtime = Arc::new(Runtime::current_thread("buffer-handler-default-runtime"));
         let (executed_on_tx, executed_on_rx) = mpsc::channel();
         let handler = Arc::new(RuntimeRoutingHandler {
             rt: Runtime::new("buffer-handler-selected-runtime", 1, 1),
@@ -392,6 +420,7 @@ mod tests {
                 &runtime,
                 &handler,
                 &limit,
+                Duration::from_secs(60),
                 Message::empty(),
             )
             .await

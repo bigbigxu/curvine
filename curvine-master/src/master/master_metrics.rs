@@ -577,7 +577,7 @@ impl MasterMetrics {
                 "dir_space_scan_anomalies",
                 "Anomalies recorded by the last successful dir-space scan round, labelled by scope",
                 &["scope"],
-
+            )?,
 
             active_sessions: m::new_gauge(
                 "master_active_sessions",
