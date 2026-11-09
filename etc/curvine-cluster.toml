@@ -353,6 +353,17 @@ subnqn = "nqn.2024-01.io.curvine:subsystem2"
 enabled = false
 rpc_port = 9010
 web_port = 9011
+# Whether this instance accepts new transfer submissions. Distinct from
+# `enabled` above: `enabled` decides whether the service starts, `accept_jobs`
+# is the runtime brake applied to a running service. Hot-updatable through the
+# `accept_jobs` runtime key (`cv transfer config set accept_jobs false --yes`),
+# so an instance can be closed to new work and reopened without a restart;
+# in-flight jobs keep running either way.
+accept_jobs = true
+# Per-instance ceiling on concurrently executing transfers. Hot-updatable
+# through the `max_running_transfers` key; lowering it never aborts a running
+# job, the excess drains as jobs finish.
+# max_running_transfers = 64
 # Maximum distinct auto-cache requests waiting for client-side submission.
 # When full, new cache requests are skipped and foreground reads continue from UFS.
 client_pending_queue_size = 1024

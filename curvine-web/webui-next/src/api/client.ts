@@ -37,6 +37,8 @@ import type {
   OverviewData,
   RangeSeries,
   TargetHealth,
+  TransferConfigData,
+  TransferConfigPushResult,
   TransferServicesData,
   WorkerAction,
   WorkerDetailData,
@@ -121,6 +123,13 @@ export interface ApiClient {
   cancelTransfer(jobId: string): Promise<unknown>
   retryTransfer(jobId: string): Promise<unknown>
   fetchTransferServices(): Promise<TransferServicesData>
+  fetchTransferConfig(): Promise<TransferConfigData>
+  updateTransferConfig(body: {
+    key: string
+    value?: string
+    reset?: boolean
+    apply_to_reachable_only?: boolean
+  }): Promise<TransferConfigPushResult>
 
   fetchObservabilityHealth(): Promise<ObservabilityHealth>
   fetchObservabilitySettings(): Promise<ObservabilitySettings>
@@ -336,6 +345,30 @@ export function createApiClient(options: HttpClientOptions = {}): ApiClient {
       }
     },
 
+
+    /**
+     * Live knobs of every transfer instance. Overrides are per process, so this
+     * is a fan-out: each instance answers for itself.
+     */
+    fetchTransferConfig: async () => {
+      const data = await get<TransferConfigData>('/v1/transfers/config')
+      return {
+        items: Array.isArray(data?.items) ? data.items : [],
+        configured: Array.isArray(data?.configured) ? data.configured : []
+      }
+    },
+    /**
+     * Push one knob to every instance.
+     *
+     * Called twice by the settings sheet: once without
+     * `apply_to_reachable_only`, which answers `needs_confirmation` and writes
+     * nothing when an instance is down, and once with it after the operator
+     * confirms.
+     */
+    updateTransferConfig: async (body) => {
+      const data = await post<TransferConfigPushResult>('/v1/transfers/config', body)
+      return data
+    },
 
     fetchObservabilityHealth: () => get<ObservabilityHealth>('/v1/observability/health'),
     fetchObservabilitySettings: () => get<ObservabilitySettings>('/v1/observability/settings'),

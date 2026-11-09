@@ -69,6 +69,20 @@ export default {
     detail: {
       title: 'Transfer Diagnostics',
       overview: 'Transfer Overview',
+      placement: 'Placement & Retries',
+      placementAddr: 'Assigned to',
+      ownerAddr: 'Running on',
+      clientRequestId: 'Request ID',
+      takeoverCount: 'Takeovers',
+      planningAttempts: 'Planning retries',
+      mountSnapshotAttempts: 'Snapshot retries',
+      overwrite: 'Overwrite',
+      replicas: 'Replicas',
+      notSet: 'not set',
+      takeoverHint:
+        'Non-zero means the job was interrupted and continued on another instance.',
+      retryHint:
+        'Retries are job-level: planning retries and mount-snapshot retries have their own bounded budgets.',
       taskCounters: 'Task Counters',
       kind: 'Kind',
       state: 'State',

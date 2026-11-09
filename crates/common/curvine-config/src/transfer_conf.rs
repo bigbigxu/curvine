@@ -53,6 +53,15 @@ pub struct TransferConf {
     #[serde(skip)]
     pub allow_submit_with_stale_snapshot: bool,
     pub max_running_transfers: usize,
+    /// Whether this instance accepts new transfer submissions.
+    ///
+    /// Deliberately **not** the same thing as `enabled`: `enabled` decides
+    /// whether the service starts at all, `accept_jobs` is the brake applied to a
+    /// running service. Turning it off keeps the process, its scheduler and its
+    /// in-flight jobs alive and only rejects new submissions, so an instance can
+    /// be put into maintenance and back without a restart. Hot-updatable through
+    /// the `accept_jobs` runtime key.
+    pub accept_jobs: bool,
     /// Maximum number of distinct auto-cache requests waiting for or performing submission.
     /// This includes requests waiting for a `client_submit_concurrency` permit.
     pub client_pending_queue_size: usize,
@@ -166,6 +175,7 @@ impl TransferConf {
     pub const DEFAULT_WEB_PORT: u16 = 9011;
     pub const DEFAULT_IO_THREADS: usize = 4;
     pub const DEFAULT_WORKER_THREADS: usize = 8;
+    pub const DEFAULT_MAX_RUNNING_TRANSFERS: usize = 64;
     pub const DEFAULT_MAX_TASKS_PER_TRANSFER: usize = 500_000;
     pub const DEFAULT_MAX_PLAN_ENTRIES: usize = 500_000;
     pub const DEFAULT_UFS_MAX_CONCURRENCY_PER_ENDPOINT: usize = 32;
@@ -409,6 +419,11 @@ impl TransferConf {
         self.max_running_transfers as u64
     }
 
+    /// The configured (file) value for the submit brake.
+    pub fn accepts_jobs(&self) -> bool {
+        self.accept_jobs
+    }
+
     fn default_io_threads() -> usize {
         Self::DEFAULT_IO_THREADS
     }
@@ -527,7 +542,8 @@ impl Default for TransferConf {
             sqlite_path: "data/transfer/transfer.db".to_string(),
             mysql_url: String::new(),
             allow_submit_with_stale_snapshot: false,
-            max_running_transfers: 64,
+            max_running_transfers: Self::DEFAULT_MAX_RUNNING_TRANSFERS,
+            accept_jobs: true,
             client_pending_queue_size: Self::DEFAULT_CLIENT_PENDING_QUEUE_SIZE,
             client_submit_concurrency: Self::DEFAULT_CLIENT_SUBMIT_CONCURRENCY,
             max_tasks_per_transfer: Self::DEFAULT_MAX_TASKS_PER_TRANSFER,

@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest'
 
 import type { TransferServiceInstance } from '@/api/types'
 import {
+  aggregatedConfigValue,
   formatDurationMs,
+  isTransferClosedError,
   instanceState,
   ringDrift,
   serviceStateTone,
@@ -126,5 +128,43 @@ describe('summarizeInstances', () => {
       unreachable: 1,
       ownedJobs: 5
     })
+  })
+})
+describe('aggregatedConfigValue', () => {
+  it('reports one value when every instance agrees', () => {
+    const entries = [
+      { key: 'max_running_transfers', effective_value_json: '32' },
+      { key: 'max_running_transfers', effective_value_json: '32' }
+    ]
+    expect(aggregatedConfigValue(entries, 'max_running_transfers')).toEqual({
+      value: '32',
+      mixed: false
+    })
+  })
+
+  it('reports mixed after a partially applied push instead of picking one', () => {
+    const entries = [
+      { key: 'max_running_transfers', effective_value_json: '32' },
+      { key: 'max_running_transfers', effective_value_json: '64' }
+    ]
+    expect(aggregatedConfigValue(entries, 'max_running_transfers')).toEqual({
+      value: undefined,
+      mixed: true
+    })
+  })
+
+  it('reports nothing when no instance answered', () => {
+    expect(aggregatedConfigValue([], 'accept_jobs')).toEqual({ mixed: false })
+  })
+})
+
+describe('isTransferClosedError', () => {
+  it('recognises the backend brake message', () => {
+    expect(
+      isTransferClosedError(
+        'transfer service temporarily closed: new submissions are rejected (accept_jobs=false); retry later'
+      )
+    ).toBe(true)
+    expect(isTransferClosedError('source path is required')).toBe(false)
   })
 })

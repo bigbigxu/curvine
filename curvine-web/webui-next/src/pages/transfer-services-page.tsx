@@ -23,6 +23,7 @@ import {
   type TransferInstanceState
 } from '@/lib/transfer-services'
 import { useAsync } from '@/lib/use-async'
+import { TransferSettingsSheet } from './transfer-services/settings-sheet'
 import { useSlidingSheet } from '@/lib/use-sliding-sheet'
 import { useRefreshSignal } from '@/refresh/refresh-context'
 
@@ -62,9 +63,16 @@ export function TransferServicesPage() {
   const configured = useMemo(() => data?.configured ?? [], [data])
 
   const summary = useMemo(() => summarizeInstances(items), [items])
+  // Instances that are up but closed to new work: worth a banner, because a
+  // submit will fail even though every instance is healthy.
+  const closedCount = useMemo(
+    () => items.filter((item) => item.info?.accepts_jobs === false).length,
+    [items]
+  )
   const rows = useMemo(() => sortInstances(items), [items])
 
   const [selected, setSelected] = useState<string | null>(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const detail = useSlidingSheet(Boolean(selected), rows.find((row) => row.addr === selected))
 
   const stateLabel = (state: TransferInstanceState) =>
@@ -76,9 +84,19 @@ export function TransferServicesPage() {
         title={t('transferServices.title')}
         description={t('transferServices.subtitle')}
         actions={
-          <Button variant="outline" size="sm" onClick={() => void reload()} disabled={loading}>
-            {t('transferServices.refresh')}
-          </Button>
+          <>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void reload()}
+              disabled={loading}
+            >
+              {t('transferServices.refresh')}
+            </Button>
+            <Button size="sm" onClick={() => setSettingsOpen(true)} data-testid="transfer-settings-open">
+              {t('transferServices.settings.title')}
+            </Button>
+          </>
         }
       />
 
@@ -142,6 +160,18 @@ export function TransferServicesPage() {
           />
         </>
       )}
+
+      {closedCount > 0 && (
+        <p className="text-sm text-warning" data-testid="transfer-closed-banner">
+          {t('transferServices.settings.closedBanner', { count: closedCount })}
+        </p>
+      )}
+
+      <TransferSettingsSheet
+        open={settingsOpen}
+        onOpenChange={setSettingsOpen}
+        onApplied={() => void reload()}
+      />
 
       <Sheet open={detail.open} onOpenChange={(open) => !open && setSelected(null)}>
         <SheetContent className="w-full sm:max-w-xl">

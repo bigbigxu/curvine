@@ -378,7 +378,30 @@ export interface JobInfo {
   [key: string]: unknown
 }
 
+/**
+ * Where a job ran, why it ran there, and how often it had to be retried.
+ *
+ * All three retry counters are job-level and answer different questions:
+ * `takeover_count` is the previous owner dying, `planning_attempts` a failed
+ * planning pass, `mount_snapshot_attempts` a missing mount snapshot. Task-level
+ * retries are not part of this object.
+ */
+export interface TransferOwnership {
+  /** Instance the placement ring assigned the job to. */
+  placement_addr?: string | null
+  /** Instance currently holding the lease, i.e. running it. */
+  owner_addr?: string | null
+  /** Idempotency key and placement hash key chosen by the submitter. */
+  client_request_id?: string | null
+  takeover_count?: number | null
+  mount_snapshot_attempts?: number | null
+  planning_attempts?: number | null
+  overwrite?: boolean | null
+  replicas?: number | null
+}
+
 export interface TransferInfo extends JobInfo {
+  ownership?: TransferOwnership | null
   /** 'load' (UFS → Curvine) or 'export' (Curvine → UFS). */
   kind?: string | null
   tenant?: string | null
@@ -413,6 +436,8 @@ export interface TransferServiceInfo {
   state_reason?: string
   store_backend?: string
   max_running_transfers?: number
+  /** False means the service is up but closed to new submissions. */
+  accepts_jobs?: boolean | null
   worker_task_limit?: number
   max_tasks_per_transfer?: number
   max_plan_entries?: number
@@ -441,6 +466,49 @@ export interface TransferServiceInstance {
   reachable: boolean
   error?: string | null
   info?: TransferServiceInfo | null
+}
+
+/** One writable knob's value on one instance. */
+export interface TransferConfigEntry {
+  key: string
+  file_value_json: string
+  override_value?: string | null
+  effective_value_json: string
+}
+
+/** One instance's answer to "what are your live knobs". */
+export interface TransferConfigSnapshot {
+  addr: string
+  reachable: boolean
+  error?: string | null
+  entries?: TransferConfigEntry[]
+}
+
+export interface TransferConfigData {
+  items?: TransferConfigSnapshot[]
+  configured?: string[]
+}
+
+/** Result of pushing one knob to one instance. */
+export interface TransferConfigPushItem {
+  addr: string
+  reachable: boolean
+  applied: boolean
+  error?: string | null
+  previous_value_json?: string | null
+  effective_value_json?: string | null
+}
+
+export interface TransferConfigPushResult {
+  /** `applied` | `partial` | `needs_confirmation`. */
+  status: 'applied' | 'partial' | 'needs_confirmation'
+  key: string
+  applied?: number
+  total?: number
+  items?: TransferConfigPushItem[]
+  /** Present on `needs_confirmation`: instances that did not answer. */
+  unreachable?: string[]
+  configured?: string[]
 }
 
 export interface TransferServicesData {

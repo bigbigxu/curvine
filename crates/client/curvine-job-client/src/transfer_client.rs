@@ -23,13 +23,15 @@ use curvine_model::{
 };
 use curvine_net::net::NodeAddr;
 use curvine_proto::{
-    CancelTransferRequest, CancelTransferResponse, GetTransferServiceInfoRequest,
-    GetTransferStatusRequest, GetTransferStatusResponse, ListTransferTenantsRequest,
-    ListTransferTenantsResponse, ListTransfersRequest, ListTransfersResponse, RetryTransferRequest,
-    SubmitTransferRequest, SubmitTransferResponse, TaskBlockLocationProto, TransferProgressProto,
+    CancelTransferRequest, CancelTransferResponse, GetRuntimeConfigRequest,
+    GetRuntimeConfigResponse, GetTransferServiceInfoRequest, GetTransferStatusRequest,
+    GetTransferStatusResponse, ListTransferTenantsRequest, ListTransferTenantsResponse,
+    ListTransfersRequest, ListTransfersResponse, ResetRuntimeConfigRequest,
+    ResetRuntimeConfigResponse, RetryTransferRequest, SubmitTransferRequest,
+    SubmitTransferResponse, TaskBlockLocationProto, TransferProgressProto,
     TransferServiceInfoResponse, TransferTaskReportBatchRequest, TransferTaskReportBatchResponse,
-    TransferTaskReportRequest, TransferTaskReportResponse, WatchTransferRequest,
-    WatchTransferResponse,
+    TransferTaskReportRequest, TransferTaskReportResponse, UpdateRuntimeConfigRequest,
+    UpdateRuntimeConfigResponse, WatchTransferRequest, WatchTransferResponse,
 };
 use curvine_rpc::client::ClusterConnector;
 use curvine_runtime::runtime::Runtime;
@@ -114,6 +116,52 @@ impl TransferClient {
             context.clone_runtime(),
             vec![endpoint.into()],
         )
+    }
+
+    /// Reads one instance's live configuration knobs (`None` = every key).
+    pub async fn get_runtime_config(
+        &self,
+        key: Option<&str>,
+    ) -> FsResult<GetRuntimeConfigResponse> {
+        self.connector
+            .proto_rpc::<_, GetRuntimeConfigResponse, FsError>(
+                RpcCode::GetRuntimeConfig,
+                GetRuntimeConfigRequest {
+                    key: key.map(str::to_string),
+                },
+            )
+            .await
+    }
+
+    /// Applies one runtime override on this instance. Non-persistent.
+    pub async fn update_runtime_config(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> FsResult<UpdateRuntimeConfigResponse> {
+        self.connector
+            .proto_rpc::<_, UpdateRuntimeConfigResponse, FsError>(
+                RpcCode::UpdateRuntimeConfig,
+                UpdateRuntimeConfigRequest {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                    client_context: None,
+                },
+            )
+            .await
+    }
+
+    /// Clears one runtime override on this instance, restoring the file value.
+    pub async fn reset_runtime_config(&self, key: &str) -> FsResult<ResetRuntimeConfigResponse> {
+        self.connector
+            .proto_rpc::<_, ResetRuntimeConfigResponse, FsError>(
+                RpcCode::ResetRuntimeConfig,
+                ResetRuntimeConfigRequest {
+                    key: key.to_string(),
+                    client_context: None,
+                },
+            )
+            .await
     }
 
     /// Asks this instance for its own status.

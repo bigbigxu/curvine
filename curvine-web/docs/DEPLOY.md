@@ -57,6 +57,8 @@
 | `task_timeout` | `job.task_timeout` | Worker 任务超时 |
 | `task_report_interval` | `job.task_report_interval` | Worker 任务上报间隔 |
 | `transfer_inflight_budget_bytes` | —（无配置文件入口） | Worker 在途字节预算；可改但不出现在视图中 |
+| `accept_jobs` | `transfer.accept_jobs` | Transfer 是否接受**新提交**；`false` 时进程/调度/在跑任务都不受影响，只在提交入口报“功能临时关闭” |
+| `max_running_transfers` | `transfer.max_running_transfers` | 每个 Transfer 实例并发执行 job 的上限；调低不打断在跑 job，多余的在 job 结束后自然收敛 |
 
 表中 key 与配置路径不同名是历史原因：`master.dir_space_*` 与 worker 的四个扁平
 key 是已对外承诺的运维接口（`cv admin config` 脚本在用），因此保留原名，由
@@ -90,6 +92,15 @@ Transfer 可以有多个实例，但**没有注册中心、没有心跳**：每�
 `state` 的判定与 `/readyz` 一致（启动中、元数据 store 不可用、集群快照不可用 →
 `not_ready`）；唯一差别是允许使用过期快照（`allow_submit_with_stale_snapshot`）时
 报 `degraded` 而不是 `not_ready`——此时仍接收任务，只是新规划可能失败。
+
+运行时配置同样按实例取值、按实例推送（override 只存在于进程内，不同实例可以不同）：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| RPC | `GetRuntimeConfig` / `UpdateRuntimeConfig` / `ResetRuntimeConfig`（62/63/64） | Transfer 进程实现了与 master 相同的三个 code，`cv admin config` 的语义在 Transfer 上一致 |
+| `GET` | `/api/v1/transfers/config` | 控制台：按 `endpoints` 逐个读取，返回每实例的 `file` / `override` / `effective` |
+| `POST` | `/api/v1/transfers/config` | 控制台：`{key, value?, reset?, apply_to_reachable_only?}`。**两段式**：默认在存在不可达实例时**不写任何东西**并返回 `status=needs_confirmation` + `unreachable`，由前端弹窗确认后带 `apply_to_reachable_only=true` 重发 |
+| CLI | `cv transfer config get|set|reset` | 默认 fan-out 全部 `endpoints`；`--endpoint host:port` 指定单实例；存在不可达实例时默认不写、需要 `--yes` |
 
 `ring_members` 用于发现**配置漂移**：某个进程的 `endpoints` 与其它实例不一致时，
 哈希环会分裂，同一个 job 的归属在不同进程里算出不同结果。控制台把这个列表与

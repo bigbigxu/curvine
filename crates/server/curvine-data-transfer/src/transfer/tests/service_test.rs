@@ -244,6 +244,48 @@ fn dispatch_result_message_prefers_capacity_reasons() {
 }
 
 #[test]
+fn submit_and_retry_are_rejected_while_the_brake_is_on() {
+    use crate::transfer::build_transfer_runtime_registry;
+    use crate::transfer::runtime_config::{TransferRuntimeConfig, ACCEPT_JOBS_CONFIG};
+    use curvine_config::ClusterConf;
+
+    let store = Arc::new(MemoryTransferStore::new());
+    let conf = ClusterConf::default();
+    let state = Arc::new(TransferRuntimeConfig::from_conf(&conf));
+    let registry = build_transfer_runtime_registry(state.clone(), &conf);
+    let service = TransferService::new(store.clone()).with_runtime_config(state.clone());
+
+    let job = service
+        .submit_transfer(load_submit_request("brake-open"))
+        .unwrap();
+    store.set_job_state(&job.job_id, TransferState::Failed);
+
+    registry.set(ACCEPT_JOBS_CONFIG, "false", None).unwrap();
+
+    // A new submission is refused, and no row is created for it.
+    let rejected = service
+        .submit_transfer(load_submit_request("brake-closed"))
+        .unwrap_err();
+    assert!(rejected.to_string().contains("temporarily closed"));
+    assert_eq!(store.job_count(), 1);
+
+    // Retrying an already accepted job is new work too, so it is refused as well.
+    let retry = service.retry_transfer(&job.job_id).unwrap_err();
+    assert!(retry.to_string().contains("temporarily closed"));
+
+    // Reopening restores both paths without a restart.
+    registry.set(ACCEPT_JOBS_CONFIG, "true", None).unwrap();
+    assert_eq!(
+        service
+            .submit_transfer(load_submit_request("brake-reopened"))
+            .unwrap()
+            .state,
+        TransferState::Pending
+    );
+    service.retry_transfer(&job.job_id).unwrap();
+}
+
+#[test]
 fn list_transfers_pages_at_the_source_and_counts_by_state() {
     let store = Arc::new(MemoryTransferStore::new());
     let service = TransferService::new(store.clone());

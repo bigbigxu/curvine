@@ -77,6 +77,35 @@ export default {
         '本实例的哈希环与控制台配置的 endpoint 列表不一致。环漂移会让 job 落到与控制台预期不同的实例上。',
       error: '未响应的原因'
     },
+    settings: {
+      title: 'Transfer 热改配置',
+      subtitle:
+        '推送到全部已配置实例的运行时开关。立即生效、不落盘：重启后恢复为配置文件里的值。',
+      instances: '{reachable}/{total} 个实例有响应',
+      unreachable: '无响应（{count} 个）：{addrs}。集群部分可达时默认不做任何修改，需你确认后才会推送。',
+      key: '配置项',
+      effective: '当前生效值',
+      actions: '调整',
+      apply: '应用',
+      reset: '还原',
+      mixed: '不一致',
+      hint: '值会推送到 transfer.endpoints 里的每个实例；还原即回到配置文件的值。',
+      acceptJobsHint:
+        'accept_jobs=false 表示关闭新任务提交（提示"功能临时关闭，请稍后重试"），进程、调度器和已在跑的任务都不受影响。',
+      closedBanner: '{count} 个实例已关闭新任务提交（`accept_jobs=false`），已在跑的任务不受影响。',
+      closedSubmit: '功能临时关闭，请稍后重试。',
+      result: '推送{status}：{applied}/{total} 个实例已生效。',
+      status: {
+        applied: '成功',
+        partial: '部分成功',
+        needs_confirmation: '待确认'
+      },
+      confirmTitle: '部分实例无响应',
+      confirmDescription:
+        '{total} 个实例中有 {unreachable} 个无法连接：{addrs}。是否仍然把修改应用到可达的实例？',
+      confirmWarning: '未应用的实例会保留旧值，直到下一次推送。该操作无法回滚。',
+      confirmApply: '仅应用到可达实例'
+    },
     empty: {
       title: '未配置 transfer 实例',
       description:

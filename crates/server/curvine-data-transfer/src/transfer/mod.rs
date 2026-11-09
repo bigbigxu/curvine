@@ -95,7 +95,10 @@ mod group_recovery_test;
 mod terminal_summary_test;
 
 mod service;
-pub use self::service::{progress_to_proto, task_summary_to_proto, TransferService};
+pub use self::service::{
+    job_to_proto, progress_to_proto, task_summary_to_proto, transfer_command_options,
+    TransferService,
+};
 
 #[cfg(test)]
 #[path = "tests/finalize_test.rs"]

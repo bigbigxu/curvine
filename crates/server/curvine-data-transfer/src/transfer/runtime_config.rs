@@ -27,7 +27,7 @@ use curvine_config::{ClusterConf, RuntimeConfigRegistry, TransferConf};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::{FsError, FsResult};
 use serde_json::Value;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Runtime key for the per-worker concurrency ceiling.
@@ -51,6 +51,20 @@ pub const MAX_TASKS_PER_TRANSFER_CONFIG: &str = "max_tasks_per_transfer";
 /// walk before failing with "entries exceeds N during listing".
 pub const MAX_PLAN_ENTRIES_CONFIG: &str = "max_plan_entries";
 
+/// Runtime key for the submit brake.
+///
+/// Backed by `transfer.accept_jobs`. It is not the startup switch
+/// (`transfer.enabled`): this one only decides whether the already running
+/// service accepts *new* work.
+pub const ACCEPT_JOBS_CONFIG: &str = "accept_jobs";
+
+/// Runtime key for the per-instance ceiling on concurrently executing transfers.
+///
+/// Backed by `transfer.max_running_transfers`. Lowering it never aborts a running
+/// job: the scheduler reads the value on every acquire, so the excess drains as
+/// jobs finish.
+pub const MAX_RUNNING_TRANSFERS_CONFIG: &str = "max_running_transfers";
+
 /// Transfer-role knobs that are adjustable without a restart.
 ///
 /// Cloning is not implemented on purpose: the state is shared by `Arc` so that
@@ -69,16 +83,29 @@ pub struct TransferRuntimeConfig {
     file_max_plan_entries: usize,
     /// Effective collected-entry cap. Read when a planning pass starts.
     max_plan_entries: AtomicUsize,
+    /// Value from the configuration file, restored by `reset_accept_jobs`.
+    file_accept_jobs: bool,
+    /// Effective submit brake. Read on every submission, never cached.
+    accept_jobs: AtomicBool,
+    /// Value from the configuration file, restored by `reset_max_running_transfers`.
+    file_max_running_transfers: usize,
+    /// Effective executing-transfer ceiling. Read on every scheduler acquire.
+    max_running_transfers: AtomicUsize,
 }
 
 impl TransferRuntimeConfig {
     /// Captures the configuration file's value as the reset target.
     pub fn from_conf(conf: &ClusterConf) -> Self {
-        Self::with_limits(
+        let mut state = Self::with_limits(
             conf.job.worker_max_concurrent_tasks,
             conf.transfer.max_tasks_per_transfer,
             conf.transfer.max_plan_entries,
-        )
+        );
+        state.file_accept_jobs = conf.transfer.accepts_jobs();
+        state.accept_jobs = AtomicBool::new(conf.transfer.accepts_jobs());
+        state.file_max_running_transfers = conf.transfer.max_running_transfers.max(1);
+        state.max_running_transfers = AtomicUsize::new(conf.transfer.max_running_transfers.max(1));
+        state
     }
 
     /// Builds the state from a bare limit, for callers that do not hold a
@@ -105,6 +132,10 @@ impl TransferRuntimeConfig {
             max_tasks_per_transfer: AtomicUsize::new(max_tasks_per_transfer.max(1)),
             file_max_plan_entries: max_plan_entries,
             max_plan_entries: AtomicUsize::new(max_plan_entries.max(1)),
+            file_accept_jobs: true,
+            accept_jobs: AtomicBool::new(true),
+            file_max_running_transfers: TransferConf::DEFAULT_MAX_RUNNING_TRANSFERS,
+            max_running_transfers: AtomicUsize::new(TransferConf::DEFAULT_MAX_RUNNING_TRANSFERS),
         }
     }
 
@@ -184,6 +215,49 @@ impl TransferRuntimeConfig {
     }
 }
 
+impl TransferRuntimeConfig {
+    /// True while this instance accepts new submissions.
+    pub fn accepts_jobs(&self) -> bool {
+        self.accept_jobs.load(Ordering::Acquire)
+    }
+
+    /// Applies the submit brake and returns the previous value.
+    pub fn update_accept_jobs(&self, target: bool) -> bool {
+        self.accept_jobs.swap(target, Ordering::AcqRel)
+    }
+
+    /// Restores the configuration file's brake state.
+    pub fn reset_accept_jobs(&self) -> bool {
+        self.accept_jobs
+            .store(self.file_accept_jobs, Ordering::Release);
+        self.file_accept_jobs
+    }
+
+    /// Effective ceiling on concurrently executing transfers.
+    pub fn max_running_transfers(&self) -> usize {
+        self.max_running_transfers.load(Ordering::Acquire)
+    }
+
+    /// Applies a new executing-transfer ceiling and returns the previous one.
+    pub fn update_max_running_transfers(&self, target: usize) -> FsResult<usize> {
+        if target == 0 {
+            return Err(FsError::common(format!(
+                "{} must be greater than zero",
+                MAX_RUNNING_TRANSFERS_CONFIG
+            )));
+        }
+        Ok(self.max_running_transfers.swap(target, Ordering::AcqRel))
+    }
+
+    /// Restores the configuration file's executing-transfer ceiling.
+    pub fn reset_max_running_transfers(&self) -> usize {
+        let restored = self.file_max_running_transfers.max(1);
+        self.max_running_transfers
+            .store(restored, Ordering::Release);
+        restored
+    }
+}
+
 /// Registry of the transfer role's runtime-writable knobs.
 ///
 /// Matches the worker registry's shape (`register_at` with the dotted config
@@ -195,6 +269,8 @@ pub fn build_transfer_runtime_registry(
     let file_worker_task_limit = conf.job.worker_max_concurrent_tasks;
     let file_max_tasks_per_transfer = conf.transfer.max_tasks_per_transfer;
     let file_max_plan_entries = conf.transfer.max_plan_entries;
+    let file_accept_jobs = conf.transfer.accepts_jobs();
+    let file_max_running_transfers = conf.transfer.max_running_transfers;
 
     RuntimeConfigRegistry::builder()
         .register_at(
@@ -274,7 +350,66 @@ pub fn build_transfer_runtime_registry(
                 move || Ok(Value::from(state.reset_max_plan_entries()))
             },
         )
+        .register_at(
+            ACCEPT_JOBS_CONFIG,
+            // Backed by `TransferConf::accept_jobs`, i.e. `[transfer].*`.
+            Some("transfer.accept_jobs"),
+            move || Value::from(file_accept_jobs),
+            {
+                let state = state.clone();
+                move || Value::from(state.accepts_jobs())
+            },
+            {
+                let state = state.clone();
+                move |raw| {
+                    let target = parse_bool(ACCEPT_JOBS_CONFIG, raw)?;
+                    let previous = state.update_accept_jobs(target);
+                    Ok((Value::from(previous), Value::from(target)))
+                }
+            },
+            {
+                let state = state.clone();
+                move || Ok(Value::from(state.reset_accept_jobs()))
+            },
+        )
+        .register_at(
+            MAX_RUNNING_TRANSFERS_CONFIG,
+            // Backed by `TransferConf::max_running_transfers`, i.e. `[transfer].*`.
+            Some("transfer.max_running_transfers"),
+            move || Value::from(file_max_running_transfers),
+            {
+                let state = state.clone();
+                move || Value::from(state.max_running_transfers())
+            },
+            {
+                let state = state.clone();
+                move |raw| {
+                    let target = parse_usize(MAX_RUNNING_TRANSFERS_CONFIG, raw)?;
+                    let previous = match state.update_max_running_transfers(target) {
+                        Ok(v) => v,
+                        Err(e) => return err_box!(e.to_string()),
+                    };
+                    Ok((Value::from(previous), Value::from(target)))
+                }
+            },
+            {
+                let state = state.clone();
+                move || Ok(Value::from(state.reset_max_running_transfers()))
+            },
+        )
         .build()
+}
+
+fn parse_bool(config: &str, value: &str) -> CommonResult<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "on" | "yes" => Ok(true),
+        "false" | "0" | "off" | "no" => Ok(false),
+        _ => err_box!(
+            "invalid {} value {:?}: must be true or false",
+            config,
+            value
+        ),
+    }
 }
 
 fn parse_usize(config: &str, value: &str) -> CommonResult<usize> {
@@ -297,6 +432,72 @@ fn parse_usize(config: &str, value: &str) -> CommonResult<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accept_jobs_is_a_live_brake_that_resets_to_the_file_value() {
+        let mut conf = ClusterConf::default();
+        conf.transfer.accept_jobs = true;
+        let state = Arc::new(TransferRuntimeConfig::from_conf(&conf));
+        let registry = build_transfer_runtime_registry(state.clone(), &conf);
+        assert!(state.accepts_jobs());
+
+        let closed = registry.set(ACCEPT_JOBS_CONFIG, "false", None).unwrap();
+        assert_eq!(closed.previous_value, Value::from(true));
+        assert_eq!(closed.value, Value::from(false));
+        assert!(!state.accepts_jobs());
+
+        // Anything outside the accepted spellings is refused instead of guessed:
+        // a typo must not silently reopen submissions.
+        assert!(registry.set(ACCEPT_JOBS_CONFIG, "maybe", None).is_err());
+        assert!(!state.accepts_jobs());
+
+        registry.reset(ACCEPT_JOBS_CONFIG, None).unwrap();
+        assert!(state.accepts_jobs());
+    }
+
+    #[test]
+    fn accept_jobs_starts_from_the_file_value() {
+        // An instance booted with submissions closed stays closed until an
+        // operator opens it, and reset returns to that file value.
+        let mut conf = ClusterConf::default();
+        conf.transfer.accept_jobs = false;
+        let state = Arc::new(TransferRuntimeConfig::from_conf(&conf));
+        let registry = build_transfer_runtime_registry(state.clone(), &conf);
+        assert!(!state.accepts_jobs());
+
+        registry.set(ACCEPT_JOBS_CONFIG, "true", None).unwrap();
+        assert!(state.accepts_jobs());
+        registry.reset(ACCEPT_JOBS_CONFIG, None).unwrap();
+        assert!(!state.accepts_jobs());
+    }
+
+    #[test]
+    fn max_running_transfers_is_live_and_cannot_be_zero() {
+        let conf = ClusterConf::default();
+        let state = Arc::new(TransferRuntimeConfig::from_conf(&conf));
+        let registry = build_transfer_runtime_registry(state.clone(), &conf);
+        assert_eq!(
+            state.max_running_transfers(),
+            conf.transfer.max_running_transfers
+        );
+
+        registry
+            .set(MAX_RUNNING_TRANSFERS_CONFIG, "2", None)
+            .unwrap();
+        assert_eq!(state.max_running_transfers(), 2);
+        // Zero would park every job forever; lowering below the running count is
+        // allowed and simply drains as jobs finish.
+        assert!(registry
+            .set(MAX_RUNNING_TRANSFERS_CONFIG, "0", None)
+            .is_err());
+        assert_eq!(state.max_running_transfers(), 2);
+
+        registry.reset(MAX_RUNNING_TRANSFERS_CONFIG, None).unwrap();
+        assert_eq!(
+            state.max_running_transfers(),
+            conf.transfer.max_running_transfers
+        );
+    }
 
     #[test]
     fn registry_set_and_reset_move_the_live_value() {

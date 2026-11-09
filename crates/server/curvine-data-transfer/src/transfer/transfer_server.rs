@@ -83,7 +83,9 @@ impl HandlerService for TransferRpcService {
     type Item = TransferHandler<TransferStoreBackend>;
 
     fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
-        let handler = TransferHandler::new(self.service.clone()).with_probe(self.probe.clone());
+        let handler = TransferHandler::new(self.service.clone())
+            .with_probe(self.probe.clone())
+            .with_runtime_config(self.runtime_config.clone());
         match &self.forwarder {
             Some(forwarder) => handler.with_forwarder(forwarder.clone()),
             None => handler,
@@ -236,7 +238,10 @@ impl TransferServer {
             conf.transfer.task_report_queue_size(),
             conf.transfer.worker_threads,
         )?
-        .with_task_cache(task_cache.clone());
+        .with_task_cache(task_cache.clone())
+        // The submit brake and the executing ceiling live here, so the service
+        // must read the same object the config registry writes.
+        .with_runtime_config(runtime_state.clone());
         // One probe, two transports: the RPC handler and the web router both
         // answer `GetTransferServiceInfo` / `GET /api/v1/transfer/info` from it,
         // so the two surfaces cannot drift apart. It clones the service, which

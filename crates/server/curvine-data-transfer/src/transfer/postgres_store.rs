@@ -1380,7 +1380,7 @@ impl TransferStore for PostgresTransferStore {
         let where_sql = where_sql_of(&clauses);
         let sql = format!(
             "select record_json from transfer_jobs {where_sql}
-             order by updated_at desc, created_at desc, job_id desc
+             order by created_at desc, job_id desc
              limit ${} offset ${}",
             params.len() + 1,
             params.len() + 2

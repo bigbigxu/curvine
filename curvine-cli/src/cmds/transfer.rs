@@ -12,18 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::{presets::ASCII_MARKDOWN, Table};
+use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
-use curvine_job_client::TransferClient;
+use curvine_job_client::{configured_transfer_endpoints, TransferClient};
 use curvine_model::{TransferKind, TransferState};
 use curvine_proto::{
     CancelTransferResponse, GetTransferStatusResponse, ListTransferTenantsResponse,
     ListTransfersResponse, SubmitTransferResponse, TransferJobStatusProto, TransferTaskStatusProto,
     TransferTaskSummaryProto, TransferTenantSummaryProto,
 };
+use curvine_runtime::runtime::Runtime;
 
 use crate::util::{bytes_to_string, handle_rpc_result, parse_duration};
 
@@ -52,6 +55,9 @@ enum TransferSubCommand {
 
     /// Summarize transfer jobs by tenant
     Tenants(TransferTenantsCommand),
+
+    /// Read or change the transfer service's runtime knobs on every instance
+    Config(TransferConfigCommand),
 }
 
 #[derive(Parser, Debug)]
@@ -199,7 +205,15 @@ pub enum OutputFormat {
 }
 
 impl TransferCommand {
-    pub async fn execute(&self, client: TransferClient) -> CommonResult<()> {
+    /// `conf`/`rt` are only needed by `config`, which addresses each instance
+    /// individually: shared settings are a per-process fact, so a fan-out needs
+    /// one client per configured endpoint rather than the shared connector.
+    pub async fn execute(
+        &self,
+        client: TransferClient,
+        conf: &ClusterConf,
+        rt: Arc<Runtime>,
+    ) -> CommonResult<()> {
         match &self.command {
             TransferSubCommand::List(cmd) => cmd.execute(client).await,
             TransferSubCommand::Status(cmd) => cmd.execute(client).await,
@@ -207,8 +221,212 @@ impl TransferCommand {
             TransferSubCommand::Cancel(cmd) => cmd.execute(client).await,
             TransferSubCommand::Retry(cmd) => cmd.execute(client).await,
             TransferSubCommand::Tenants(cmd) => cmd.execute(client).await,
+            TransferSubCommand::Config(cmd) => cmd.execute(conf, rt).await,
         }
     }
+}
+
+/// Runtime knob management across every configured transfer instance.
+#[derive(Parser, Debug)]
+pub struct TransferConfigCommand {
+    #[command(subcommand)]
+    action: TransferConfigSubCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum TransferConfigSubCommand {
+    /// Show every writable knob on every instance
+    Get {
+        /// Only this key
+        key: Option<String>,
+    },
+    /// Set a knob on every instance (non-persistent, applies immediately)
+    Set {
+        key: String,
+        value: String,
+        /// Only this instance (host:port), instead of the whole list
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Apply even when some instances do not answer
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Restore the configuration file value on every instance
+    Reset {
+        key: String,
+        /// Only this instance (host:port), instead of the whole list
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Apply even when some instances do not answer
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+impl TransferConfigCommand {
+    async fn execute(&self, conf: &ClusterConf, rt: Arc<Runtime>) -> CommonResult<()> {
+        match &self.action {
+            TransferConfigSubCommand::Get { key } => {
+                let targets = config_targets(conf, None);
+                let mut table =
+                    new_config_table(vec!["instance", "key", "file", "override", "effective"]);
+                let mut failures = Vec::new();
+                for addr in targets {
+                    let client =
+                        TransferClient::with_single_endpoint(conf, rt.clone(), addr.clone())?;
+                    match client.get_runtime_config(key.as_deref()).await {
+                        Ok(response) => {
+                            for entry in response.entries {
+                                table.add_row(vec![
+                                    addr.clone(),
+                                    entry.key,
+                                    entry.file_value_json,
+                                    entry.override_value.unwrap_or_else(|| "-".to_string()),
+                                    entry.effective_value_json,
+                                ]);
+                            }
+                        }
+                        Err(err) => failures.push(format!("{}: {}", addr, err)),
+                    }
+                }
+                println!("{table}");
+                report_failures(&failures)?;
+                Ok(())
+            }
+            TransferConfigSubCommand::Set {
+                key,
+                value,
+                endpoint,
+                yes,
+            } => apply(conf, rt, endpoint.as_deref(), key, Some(value), *yes).await,
+            TransferConfigSubCommand::Reset { key, endpoint, yes } => {
+                apply(conf, rt, endpoint.as_deref(), key, None, *yes).await
+            }
+        }
+    }
+}
+
+/// Per-instance budget for the config commands.
+///
+/// Without an explicit bound the client's own retry policy applies, which turned
+/// "one instance is down" into a 240s wait before the user learned anything. The
+/// console uses the same 3s budget for the same reason.
+const INSTANCE_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Runs one per-instance call under the budget above, mapping a timeout to a
+/// sentence the operator can act on instead of an RPC retry storm.
+async fn instance_call<T, E>(
+    addr: &str,
+    fut: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E>
+where
+    E: std::fmt::Display + From<String>,
+{
+    match tokio::time::timeout(INSTANCE_CALL_TIMEOUT, fut).await {
+        Ok(result) => result,
+        Err(_) => {
+            let message = format!(
+                "{}: no answer within {}s",
+                addr,
+                INSTANCE_CALL_TIMEOUT.as_secs()
+            );
+            Err(<E as From<String>>::from(message))
+        }
+    }
+}
+
+/// `endpoint` narrows the fan-out to one instance; otherwise the configured list.
+fn config_targets(conf: &ClusterConf, endpoint: Option<&str>) -> Vec<String> {
+    match endpoint {
+        Some(addr) => vec![addr.to_string()],
+        None => configured_transfer_endpoints(conf),
+    }
+}
+
+fn new_config_table(headers: Vec<&str>) -> Table {
+    let mut table = Table::new();
+    table.load_preset(ASCII_MARKDOWN);
+    table.set_header(headers);
+    table
+}
+
+fn report_failures(failures: &[String]) -> CommonResult<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    for failure in failures {
+        eprintln!("failed: {}", failure);
+    }
+    err_box!("{} transfer instance(s) did not answer", failures.len())
+}
+
+/// Probe first, then apply: the same two-phase contract the console dialog uses.
+async fn apply(
+    conf: &ClusterConf,
+    rt: Arc<Runtime>,
+    endpoint: Option<&str>,
+    key: &str,
+    value: Option<&str>,
+    yes: bool,
+) -> CommonResult<()> {
+    let targets = config_targets(conf, endpoint);
+
+    // Phase 1 — probe. Writing to a subset of a cluster is a decision, not a
+    // side effect of one instance being down, so it needs `--yes`.
+    let mut unreachable = Vec::new();
+    for addr in &targets {
+        let client = TransferClient::with_single_endpoint(conf, rt.clone(), addr.clone())?;
+        if let Err(err) = instance_call(addr, client.get_runtime_config(Some(key))).await {
+            unreachable.push(format!("{}: {}", addr, err));
+        }
+    }
+    if !unreachable.is_empty() && !yes {
+        for failure in &unreachable {
+            eprintln!("unreachable: {}", failure);
+        }
+        return err_box!(
+            "{} of {} instance(s) cannot be reached; nothing was applied. Re-run with --yes to apply to the reachable ones",
+            unreachable.len(),
+            targets.len()
+        );
+    }
+
+    // Phase 2 — apply, reporting each instance separately: there is no rollback.
+    let mut table = new_config_table(vec!["instance", "result", "previous", "effective"]);
+    let mut failures = Vec::new();
+    for addr in targets {
+        let client = TransferClient::with_single_endpoint(conf, rt.clone(), addr.clone())?;
+        let call = async {
+            match value {
+                Some(value) => client
+                    .update_runtime_config(key, value)
+                    .await
+                    .map(|response| (response.previous_value_json, response.value_json)),
+                None => client
+                    .reset_runtime_config(key)
+                    .await
+                    .map(|response| ("-".to_string(), response.effective_value_json)),
+            }
+        };
+        let result = instance_call(&addr, call).await;
+        match result {
+            Ok((previous, effective)) => {
+                table.add_row(vec![addr, "applied".to_string(), previous, effective]);
+            }
+            Err(err) => {
+                table.add_row(vec![
+                    addr.clone(),
+                    "failed".to_string(),
+                    "-".to_string(),
+                    err.to_string(),
+                ]);
+                failures.push(format!("{}: {}", addr, err));
+            }
+        }
+    }
+    println!("{table}");
+    report_failures(&failures)?;
+    Ok(())
 }
 
 impl TransferListCommand {
@@ -476,6 +694,13 @@ fn status_to_job(response: &GetTransferStatusResponse) -> TransferJobStatusProto
         lease_expire_at: response.lease_expire_at,
         takeover_count: response.takeover_count,
         cv_metadata_epoch: response.cv_metadata_epoch,
+        placement_addr: response.placement_addr.clone(),
+        owner_addr: response.owner_addr.clone(),
+        client_request_id: response.client_request_id.clone(),
+        mount_snapshot_attempts: response.mount_snapshot_attempts,
+        planning_attempts: response.planning_attempts,
+        overwrite: response.overwrite,
+        replicas: response.replicas,
     }
 }
 
@@ -644,6 +869,33 @@ fn print_status_summary(
         table.add_row(["Takeovers".to_string(), count.to_string()]);
     }
     if verbose {
+        // Placement and retry counters: "assigned to A, running on B" is one
+        // fact (a takeover), and each retry counter has its own reason.
+        if let Some(addr) = job.placement_addr.clone().filter(|addr| !addr.is_empty()) {
+            table.add_row(["Assigned To".to_string(), addr]);
+        }
+        if let Some(addr) = job.owner_addr.clone().filter(|addr| !addr.is_empty()) {
+            table.add_row(["Running On".to_string(), addr]);
+        }
+        if let Some(request_id) = job
+            .client_request_id
+            .clone()
+            .filter(|request_id| !request_id.is_empty())
+        {
+            table.add_row(["Request ID".to_string(), request_id]);
+        }
+        if let Some(attempts) = job.planning_attempts.filter(|attempts| *attempts > 0) {
+            table.add_row(["Planning Retries".to_string(), attempts.to_string()]);
+        }
+        if let Some(attempts) = job.mount_snapshot_attempts.filter(|attempts| *attempts > 0) {
+            table.add_row(["Snapshot Retries".to_string(), attempts.to_string()]);
+        }
+        if let Some(overwrite) = job.overwrite {
+            table.add_row(["Overwrite".to_string(), overwrite.to_string()]);
+        }
+        if let Some(replicas) = job.replicas {
+            table.add_row(["Replicas".to_string(), replicas.to_string()]);
+        }
         if !job.submitter.is_empty() {
             table.add_row(["Submitter".to_string(), job.submitter.clone()]);
         }
@@ -900,5 +1152,55 @@ mod takeover_display_tests {
             "Completed (takeover x2)",
             "a taken-over job keeps its state but shows the interruption"
         );
+    }
+}
+
+#[cfg(test)]
+mod config_command_tests {
+    use super::*;
+
+    #[test]
+    fn config_set_parses_flags() {
+        let cmd = TransferConfigCommand::try_parse_from([
+            "config",
+            "set",
+            "accept_jobs",
+            "false",
+            "--yes",
+        ])
+        .expect("parse");
+        match cmd.action {
+            TransferConfigSubCommand::Set {
+                key,
+                value,
+                endpoint,
+                yes,
+            } => {
+                assert_eq!(key, "accept_jobs");
+                assert_eq!(value, "false");
+                assert_eq!(endpoint, None);
+                assert!(yes);
+            }
+            _ => panic!("expected set"),
+        }
+    }
+
+    #[test]
+    fn config_reset_can_target_one_instance() {
+        let cmd = TransferConfigCommand::try_parse_from([
+            "config",
+            "reset",
+            "max_running_transfers",
+            "--endpoint",
+            "cv-transfer-0:9010",
+        ])
+        .expect("parse");
+        match cmd.action {
+            TransferConfigSubCommand::Reset { key, endpoint, .. } => {
+                assert_eq!(key, "max_running_transfers");
+                assert_eq!(endpoint.as_deref(), Some("cv-transfer-0:9010"));
+            }
+            _ => panic!("expected reset"),
+        }
     }
 }

@@ -195,7 +195,8 @@ fn run() -> CommonResult<()> {
         None
     };
 
-    rt.block_on(async move {
+    let block_rt = rt.clone();
+    block_rt.block_on(async move {
         match args.command {
             Some(Commands::Bench(cmd)) => cmd.execute(curvine_fs, conf_source.clone()).await,
             Some(Commands::Fs(cmd)) => cmd.execute(curvine_fs).await,
@@ -243,7 +244,7 @@ fn run() -> CommonResult<()> {
                         "transfer requires transfer.enabled=true and a running transfer service"
                     );
                 };
-                cmd.execute(transfer_client).await
+                cmd.execute(transfer_client, &conf, rt.clone()).await
             }
             Some(Commands::Mount(cmd)) => cmd.execute(curvine_fs).await,
             Some(Commands::UnMount(cmd)) => cmd.execute(fs_client).await,

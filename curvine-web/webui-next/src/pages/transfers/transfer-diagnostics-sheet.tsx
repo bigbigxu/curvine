@@ -77,6 +77,9 @@ export function TransferDiagnosticsSheet({
   const tasks = transferTasks(transfer)
   const selectedTasks = failedOnly ? tasks.filter((task) => isFailedTask(task)) : tasks
   const failureCount = failedTaskCount(transfer)
+  // Ownership/retry fields are absent on records written by an older instance:
+  // the section then renders dashes instead of pretending zeroes are facts.
+  const overview = transfer.ownership || {}
   const canLoadMore = taskPageSize < TASK_PAGE_MAX && Boolean(taskNextPageToken)
   const truncated = taskPageSize >= TASK_PAGE_MAX && Boolean(taskNextPageToken)
 
@@ -204,6 +207,48 @@ export function TransferDiagnosticsSheet({
                 {transfer.message}
               </p>
             )}
+          </section>
+
+          <section className="flex flex-col gap-2 border-t border-border pt-3">
+            <h3 className="text-[13px] font-medium">{t('transfers.detail.placement')}</h3>
+            <DetailList>
+              <DetailRow label={t('transfers.detail.placementAddr')}>
+                <span className="font-mono text-xs">{overview.placement_addr || '—'}</span>
+              </DetailRow>
+              <DetailRow label={t('transfers.detail.ownerAddr')}>
+                <span className="font-mono text-xs">{overview.owner_addr || '—'}</span>
+              </DetailRow>
+              <DetailRow label={t('transfers.detail.clientRequestId')}>
+                <span className="font-mono text-xs break-all">
+                  {overview.client_request_id || '—'}
+                </span>
+              </DetailRow>
+              <DetailRow label={t('transfers.detail.takeoverCount')}>
+                <span
+                  className={overview.takeover_count ? 'text-warning' : undefined}
+                  title={overview.takeover_count ? t('transfers.detail.takeoverHint') : undefined}
+                >
+                  {String(overview.takeover_count ?? 0)}
+                </span>
+              </DetailRow>
+              <DetailRow label={t('transfers.detail.planningAttempts')}>
+                {String(overview.planning_attempts ?? 0)}
+              </DetailRow>
+              <DetailRow label={t('transfers.detail.mountSnapshotAttempts')}>
+                {String(overview.mount_snapshot_attempts ?? 0)}
+              </DetailRow>
+              <DetailRow label={t('transfers.detail.overwrite')}>
+                {overview.overwrite == null
+                  ? t('transfers.detail.notSet')
+                  : overview.overwrite
+                    ? t('transfers.form.trueValue')
+                    : t('transfers.form.falseValue')}
+              </DetailRow>
+              <DetailRow label={t('transfers.detail.replicas')}>
+                {overview.replicas == null ? t('transfers.detail.notSet') : String(overview.replicas)}
+              </DetailRow>
+            </DetailList>
+            <p className="text-xs text-muted-foreground">{t('transfers.detail.retryHint')}</p>
           </section>
 
           <section className="flex flex-col gap-2 border-t border-border pt-3">

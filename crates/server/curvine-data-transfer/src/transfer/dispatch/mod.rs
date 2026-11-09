@@ -339,10 +339,7 @@ impl InflightLedger {
     }
 
     fn account(&self, worker_id: u32, count: u64, bytes: i64) {
-        let mut entries = self
-            .entries
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
         let entry = entries.entry(worker_id).or_insert((0u64, 0i64));
         entry.0 = entry.0.saturating_add(count);
         entry.1 = entry.1.saturating_add(bytes);
@@ -666,7 +663,9 @@ where
         let tick = self.acquire_tick.fetch_add(1, Ordering::Relaxed);
         let prefer_pending = tick.is_multiple_of(ACQUIRE_PENDING_EVERY_N_TICKS);
         let lease_timeout = duration_ms(self.conf.lease_timeout);
-        let max_executing = self.conf.max_executing_transfers();
+        // Read the live ceiling, not the file value: lowering `max_running_transfers`
+        // must affect the very next acquire, and it must never abort a running job.
+        let max_executing = self.runtime_config.max_running_transfers() as u64;
         let acquired = Self::blocking(self, move |s| {
             s.store.acquire_runnable_transfer(
                 &s.owner,
@@ -711,6 +710,11 @@ where
             .map(|forwarder| forwarder.self_addr().to_string());
         if let Some(addr) = self_addr {
             if job.owner_addr != addr {
+                // Persist, don't just mutate: the status relay and the console's
+                // "running on" both read the stored row, not this tick's copy.
+                // Without the write those backends kept an empty `owner_addr`
+                // forever, which made every SQL-backed job look unowned.
+                self.store.set_owner_addr(&job.job_id, job.run_id, &addr)?;
                 job.owner_addr = addr;
             }
         }
@@ -3417,10 +3421,8 @@ mod tests {
         let ledger = InflightLedger::new(Duration::from_secs(15));
         ledger.account(1, 5, 5000);
         // Simulate a store snapshot where worker 1 has less in flight.
-        *ledger
-            .entries
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = [(1, (1, 1000))].into_iter().collect();
+        *ledger.entries.write().unwrap_or_else(|e| e.into_inner()) =
+            [(1, (1, 1000))].into_iter().collect();
         ledger
             .refreshed_at_ms
             .store(1, std::sync::atomic::Ordering::Relaxed);

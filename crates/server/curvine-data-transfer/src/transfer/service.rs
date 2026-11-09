@@ -38,6 +38,7 @@ use log::{info, warn};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+use crate::transfer::TransferRuntimeConfig;
 use crate::transfer::{
     merge_summaries, ClusterMetadataCache, TaskCache, TransferMetrics, TransferStore,
 };
@@ -61,6 +62,15 @@ const MAX_LIST_PAGE_SIZE: usize = 1000;
 /// Minimum interval between auto-repair retries for the same load job_key.
 /// Prevents submit storms when a broken CV target keeps failing to load.
 pub(crate) const AUTO_REPAIR_COOLDOWN_MS: i64 = 60 * 1000;
+
+/// Error text for a submission rejected by the `accept_jobs` brake.
+///
+/// Stable and English on purpose: the CLI prints it verbatim, and the console
+/// maps it to `transferServices.closed.*` so operators see a localized sentence
+/// ("功能临时关闭，请稍后重试"). Machine-readable prefix first so both sides can
+/// match on it without parsing the rest.
+pub const TRANSFER_CLOSED_MESSAGE: &str =
+    "transfer service temporarily closed: new submissions are rejected (accept_jobs=false); retry later";
 
 type TransferStatusPage = (
     TransferJobRecord,
@@ -88,6 +98,10 @@ pub struct TransferService<S> {
     auto_repair_last_attempt_ms: Arc<Mutex<HashMap<String, i64>>>,
     /// File-level task state (None = every task lives in the store).
     task_cache: Option<Arc<TaskCache>>,
+    /// Live knobs shared with the config registry (None = no runtime overrides,
+    /// i.e. the file values apply). Only the submit brake and the executing
+    /// ceiling are read here; the planner and scheduler read the rest.
+    runtime_config: Option<Arc<TransferRuntimeConfig>>,
 }
 
 impl<S> Clone for TransferService<S> {
@@ -99,6 +113,7 @@ impl<S> Clone for TransferService<S> {
             report_dispatcher: self.report_dispatcher.clone(),
             auto_repair_last_attempt_ms: self.auto_repair_last_attempt_ms.clone(),
             task_cache: self.task_cache.clone(),
+            runtime_config: self.runtime_config.clone(),
         }
     }
 }
@@ -115,6 +130,7 @@ where
             report_dispatcher: None,
             auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
             task_cache: None,
+            runtime_config: None,
         }
     }
 
@@ -127,6 +143,7 @@ where
             report_dispatcher: None,
             auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
             task_cache: None,
+            runtime_config: None,
         }
     }
 
@@ -150,6 +167,7 @@ where
             )?),
             auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
             task_cache: None,
+            runtime_config: None,
         })
     }
 
@@ -166,6 +184,7 @@ where
             report_dispatcher: None,
             auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
             task_cache: None,
+            runtime_config: None,
         }
     }
 
@@ -190,6 +209,7 @@ where
             )?),
             auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
             task_cache: None,
+            runtime_config: None,
         })
     }
 
@@ -205,6 +225,7 @@ where
         req: SubmitTransferRequest,
         placement_addr: Option<String>,
     ) -> FsResult<TransferJobRecord> {
+        self.ensure_accepting_jobs()?;
         let job = self.submit_transfer_inner(req, true, placement_addr)?;
         self.record_submit_accepted(&job);
         Ok(job)
@@ -480,6 +501,25 @@ where
         self
     }
 
+    /// Attaches the live knobs. Without it the file values always apply, which
+    /// is what the tests that build a bare service expect.
+    pub fn with_runtime_config(mut self, runtime_config: Arc<TransferRuntimeConfig>) -> Self {
+        self.runtime_config = Some(runtime_config);
+        self
+    }
+
+    /// Rejects new work while the submit brake is on.
+    ///
+    /// Applied to the two operator-facing entry points (submit and retry) and
+    /// not to internal auto-repair-driven submits: those are repairs of already
+    /// accepted jobs, and silencing them would strand cache targets.
+    fn ensure_accepting_jobs(&self) -> FsResult<()> {
+        match &self.runtime_config {
+            Some(state) if !state.accepts_jobs() => Err(FsError::common(TRANSFER_CLOSED_MESSAGE)),
+            _ => Ok(()),
+        }
+    }
+
     /// Writes the merged (store + cache) job summary back periodically.
     ///
     /// File-level tasks have no rows, so nothing else refreshes the job row:
@@ -555,6 +595,7 @@ where
     }
 
     pub fn retry_transfer(&self, job_id: &str) -> FsResult<TransferJobRecord> {
+        self.ensure_accepting_jobs()?;
         self.retry_transfer_placed(job_id, None)
     }
 
@@ -570,6 +611,7 @@ where
         job_id: &str,
         placement_addr: Option<String>,
     ) -> FsResult<TransferJobRecord> {
+        self.ensure_accepting_jobs()?;
         let job = self.retry_transfer_inner(job_id, placement_addr)?;
         self.record_submit_accepted(&job);
         Ok(job)
@@ -1874,7 +1916,23 @@ pub fn task_status_to_proto(task: TransferTaskStatus) -> TransferTaskStatusProto
     }
 }
 
+/// Submit options recorded with the command, decoded for display.
+///
+/// `command_json` is the authoritative record but is not something a UI should
+/// render, and it is absent for records written before it was populated. A
+/// decode failure therefore yields `None` instead of failing the whole status.
+pub fn transfer_command_options(job: &TransferJobRecord) -> (Option<bool>, Option<i32>) {
+    if job.command_json.trim().is_empty() {
+        return (None, None);
+    }
+    match decode_transfer_command(job.command_json.as_bytes()) {
+        Ok(command) => (Some(command.overwrite()), command.replicas().ok().flatten()),
+        Err(_) => (None, None),
+    }
+}
+
 pub fn job_to_proto(job: TransferJobRecord) -> TransferJobStatusProto {
+    let (overwrite, replicas) = transfer_command_options(&job);
     TransferJobStatusProto {
         job_id: job.job_id,
         run_id: job.run_id,
@@ -1892,6 +1950,13 @@ pub fn job_to_proto(job: TransferJobRecord) -> TransferJobStatusProto {
         lease_expire_at: Some(job.lease_expire_at),
         cv_metadata_epoch: job.cv_metadata_epoch,
         takeover_count: Some(job.takeover_count),
+        placement_addr: Some(job.placement_addr),
+        owner_addr: Some(job.owner_addr),
+        client_request_id: Some(job.client_request_id),
+        mount_snapshot_attempts: Some(job.mount_snapshot_attempts),
+        planning_attempts: Some(job.planning_attempts),
+        overwrite,
+        replicas,
     }
 }
 

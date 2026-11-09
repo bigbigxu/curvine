@@ -1594,7 +1594,54 @@ fn transfer_task_payload(task: TransferTaskStatusProto) -> Value {
     })
 }
 
+/// Where a job runs, why it ran there, and how often it had to be retried.
+///
+/// Grouped into one object because these fields only make sense together: an
+/// operator reads "assigned to A, running on B" as one fact (a takeover), and
+/// the three job-level retry counters each answer a different question —
+/// `takeover_count` is process death, `planning_attempts` is a failed planning
+/// pass, `mount_snapshot_attempts` is a missing mount snapshot. Task-level
+/// retries are deliberately absent: they are per task, not per job, and the
+/// detail page is about the job.
+#[allow(clippy::too_many_arguments)]
+fn transfer_ownership_payload_of(
+    placement_addr: Option<&str>,
+    owner_addr: Option<&str>,
+    client_request_id: Option<&str>,
+    takeover_count: Option<u32>,
+    mount_snapshot_attempts: Option<u32>,
+    planning_attempts: Option<u32>,
+    overwrite: Option<bool>,
+    replicas: Option<i32>,
+) -> Value {
+    json!({
+        "placement_addr": placement_addr.unwrap_or_default(),
+        "owner_addr": owner_addr.unwrap_or_default(),
+        "client_request_id": client_request_id.unwrap_or_default(),
+        "takeover_count": takeover_count.unwrap_or(0),
+        "mount_snapshot_attempts": mount_snapshot_attempts.unwrap_or(0),
+        "planning_attempts": planning_attempts.unwrap_or(0),
+        "overwrite": overwrite,
+        "replicas": replicas,
+    })
+}
+
+fn transfer_ownership_payload(status: &TransferJobStatusProto) -> Value {
+    transfer_ownership_payload_of(
+        status.placement_addr.as_deref(),
+        status.owner_addr.as_deref(),
+        status.client_request_id.as_deref(),
+        status.takeover_count,
+        status.mount_snapshot_attempts,
+        status.planning_attempts,
+        status.overwrite,
+        status.replicas,
+    )
+}
+
 fn transfer_job_status_payload(status: TransferJobStatusProto) -> Value {
+    // Read the ownership group before the fields below move out of `status`.
+    let ownership = transfer_ownership_payload(&status);
     let kind = TransferKind::from(status.kind);
     let state = TransferState::from(status.state);
     let source_path = status.source_path;
@@ -1619,6 +1666,7 @@ fn transfer_job_status_payload(status: TransferJobStatusProto) -> Value {
         "submitter": submitter,
         "tenant": tenant,
         "owner": status.owner.unwrap_or_default(),
+        "ownership": ownership,
         "total_size": progress.total_size,
         "loaded_size": progress.loaded_size,
         "progress": transfer_progress_percent(state, progress.total_size, progress.loaded_size),
@@ -1660,6 +1708,16 @@ fn transfer_status_payload(status: GetTransferStatusResponse) -> Value {
         "submitter": submitter,
         "tenant": tenant,
         "owner": status.owner.unwrap_or_default(),
+        "ownership": transfer_ownership_payload_of(
+            status.placement_addr.as_deref(),
+            status.owner_addr.as_deref(),
+            status.client_request_id.as_deref(),
+            status.takeover_count,
+            status.mount_snapshot_attempts,
+            status.planning_attempts,
+            status.overwrite,
+            status.replicas,
+        ),
         "lease_epoch": status.lease_epoch.unwrap_or(0),
         "lease_expire_at": status.lease_expire_at.unwrap_or(0),
         "cv_metadata_epoch": status.cv_metadata_epoch.unwrap_or(0),
@@ -4666,6 +4724,89 @@ async fn transfer_instances_v1(
     })))
 }
 
+/// Live configuration knobs of every transfer instance.
+async fn transfer_config_v1(
+    Extension(instance): Extension<Arc<AdminRouterHandler>>,
+) -> FsResult<Json<Value>> {
+    let items = crate::transfer_services::read_transfer_config(
+        &instance.conf,
+        instance.unified_fs.fs_context(),
+    )
+    .await;
+    Ok(api_success(json!({
+        "items": items,
+        "configured": crate::transfer_services::instance_addrs(&instance.conf)
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct TransferConfigUpdateBody {
+    key: String,
+    /// Omitted together with `reset`.
+    value: Option<String>,
+    /// Restore the file value instead of writing one.
+    #[serde(default)]
+    reset: bool,
+    /// Second phase of the console's confirmation dialog: apply even though some
+    /// instances did not answer. Without it a partial fleet is reported back and
+    /// nothing is written.
+    #[serde(default)]
+    apply_to_reachable_only: bool,
+}
+
+/// Pushes one runtime knob to every transfer instance.
+///
+/// Two-phase on purpose: the first request refuses to write anything when an
+/// instance is unreachable and answers `needs_confirmation`, so the console can
+/// ask the operator before half-applying a cluster it cannot roll back.
+async fn transfer_config_update_v1(
+    Extension(instance): Extension<Arc<AdminRouterHandler>>,
+    Json(body): Json<TransferConfigUpdateBody>,
+) -> FsResult<Json<Value>> {
+    let key = body.key.trim();
+    if key.is_empty() {
+        return err_box!("key is required");
+    }
+    if !body.reset && body.value.is_none() {
+        return err_box!("value is required unless reset is true");
+    }
+
+    let (results, unreachable) = crate::transfer_services::push_transfer_config(
+        &instance.conf,
+        instance.unified_fs.fs_context(),
+        key,
+        if body.reset {
+            None
+        } else {
+            body.value.as_deref()
+        },
+        body.apply_to_reachable_only,
+    )
+    .await;
+
+    if !unreachable.is_empty() {
+        // Nothing was written: report the unreachable instances so the dialog can
+        // name them, and let the operator decide.
+        return Ok(api_success(json!({
+            "status": "needs_confirmation",
+            "key": key,
+            "unreachable": unreachable,
+            "configured": crate::transfer_services::instance_addrs(&instance.conf),
+        })));
+    }
+
+    let applied = results.iter().filter(|result| result.applied).count();
+    let failed: Vec<&crate::transfer_services::TransferConfigPushResult> =
+        results.iter().filter(|result| !result.applied).collect();
+    Ok(api_success(json!({
+        "status": if failed.is_empty() { "applied" } else { "partial" },
+        "key": key,
+        "applied": applied,
+        "total": results.len(),
+        "items": results,
+    })))
+}
+
 async fn transfers_v1(
     Extension(instance): Extension<Arc<AdminRouterHandler>>,
     Query(query): Query<TransferListQuery>,
@@ -5068,6 +5209,10 @@ impl RouterHandler for AdminRouterHandler {
             )
             .route("/api/v1/transfers/instances", get(transfer_instances_v1))
             .route(
+                "/api/v1/transfers/config",
+                get(transfer_config_v1).post(transfer_config_update_v1),
+            )
+            .route(
                 "/api/v1/transfers/:job_id",
                 get(transfer_status_v1).delete(transfer_cancel_v1),
             )
@@ -5455,8 +5600,23 @@ mod transfer_tests {
             }),
             task_details_expired: None,
             takeover_count: None,
+            placement_addr: Some("cv-transfer-0:9010".to_string()),
+            owner_addr: Some("cv-transfer-1:9010".to_string()),
+            client_request_id: Some("req-1".to_string()),
+            mount_snapshot_attempts: Some(0),
+            planning_attempts: Some(2),
+            overwrite: Some(true),
+            replicas: Some(3),
         };
         let value = transfer_status_payload(status);
+        // Ownership travels as one object: an operator reads "assigned to A,
+        // running on B" as a single takeover fact.
+        assert_eq!(value["ownership"]["placement_addr"], "cv-transfer-0:9010");
+        assert_eq!(value["ownership"]["owner_addr"], "cv-transfer-1:9010");
+        assert_eq!(value["ownership"]["client_request_id"], "req-1");
+        assert_eq!(value["ownership"]["planning_attempts"], 2);
+        assert_eq!(value["ownership"]["overwrite"], true);
+        assert_eq!(value["ownership"]["replicas"], 3);
         assert_eq!(value["total_files"], 10);
         assert_eq!(value["completed_size"], 2048);
         assert_eq!(value["next_page_token"], "100");

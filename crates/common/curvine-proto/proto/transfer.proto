@@ -79,6 +79,20 @@ message TransferJobStatusProto {
   // Takeovers from a dead owner; non-zero means the job was interrupted.
   optional uint32 takeover_count = 20 [default = 0];
   optional uint64 cv_metadata_epoch = 15;
+  // The instance the placement ring assigned this job to, decided once at
+  // submit from `hash(client_request_id)` over the configured endpoints.
+  optional string placement_addr = 21;
+  // The instance currently holding the lease, i.e. actually running it. It
+  // differs from `placement_addr` only after a takeover.
+  optional string owner_addr = 22;
+  // Idempotency key chosen by the submitter; also the placement hash key.
+  optional string client_request_id = 23;
+  // Bounded job-level retry counters, each with its own reason.
+  optional uint32 mount_snapshot_attempts = 24;
+  optional uint32 planning_attempts = 25;
+  // Submit options recorded with the command.
+  optional bool overwrite = 26;
+  optional int32 replicas = 27;
 }
 
 message SubmitTransferRequest {
@@ -133,6 +147,13 @@ message GetTransferStatusResponse {
   // How many times this job was taken over from a dead owner. Non-zero
   // means the job was interrupted and continued on another instance.
   optional uint32 takeover_count = 20 [default = 0];
+  optional string placement_addr = 21;
+  optional string owner_addr = 22;
+  optional string client_request_id = 23;
+  optional uint32 mount_snapshot_attempts = 24;
+  optional uint32 planning_attempts = 25;
+  optional bool overwrite = 26;
+  optional int32 replicas = 27;
 }
 
 message ListTransfersRequest {
@@ -335,4 +356,7 @@ message TransferServiceInfoResponse {
   // The placement ring this instance is using, so a drifted config is visible.
   optional string ring_self = 26;
   repeated string ring_members = 27;
+  // Whether this instance accepts new submissions (`accept_jobs`). False means
+  // the service is up but closing to new work: in-flight jobs keep running.
+  optional bool accepts_jobs = 28;
 }

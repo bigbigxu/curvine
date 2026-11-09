@@ -9,6 +9,7 @@ import { FieldGroup } from '@/components/ui/field'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { UnsavedChangesDialog } from '@/components/unsaved-changes-dialog'
 import { useT } from '@/i18n'
+import { isTransferClosedError } from '@/lib/transfer-services'
 import { hasUnsavedChanges } from '@/lib/form-dirty'
 
 interface TransferFormState {
@@ -75,10 +76,14 @@ export function SubmitTransferSheet({
       })) as TransferInfo
       onSubmitted(transfer)
     } catch (nextError) {
+      const raw = nextError instanceof Error ? nextError.message : String(nextError)
+      // The service being closed for new work is an operator action, not a
+      // failure: say so in the operator's language instead of echoing the
+      // backend's English sentence.
       setError(
-        t('transfers.alerts.submitFailed', {
-          error: nextError instanceof Error ? nextError.message : String(nextError)
-        })
+        isTransferClosedError(raw)
+          ? t('transferServices.settings.closedSubmit')
+          : t('transfers.alerts.submitFailed', { error: raw })
       )
     } finally {
       setSubmitting(false)

@@ -104,6 +104,177 @@ pub fn instance_addrs(conf: &ClusterConf) -> Vec<String> {
     addrs
 }
 
+/// One instance's runtime-config answer, for the settings surface.
+#[derive(Clone, Debug, Serialize)]
+pub struct TransferConfigSnapshot {
+    pub addr: String,
+    pub reachable: bool,
+    pub error: Option<String>,
+    pub entries: Vec<curvine_proto::RuntimeConfigEntryProto>,
+}
+
+/// Reads the writable knobs from every configured instance.
+///
+/// Each instance is asked individually because overrides are **not** shared:
+/// the registry lives in the process, so "what is the current value" is a
+/// per-instance question even though the file value is the same everywhere.
+pub async fn read_transfer_config(
+    conf: &ClusterConf,
+    context: &Arc<FsContext>,
+) -> Vec<TransferConfigSnapshot> {
+    if !conf.transfer.enabled {
+        return Vec::new();
+    }
+    let queries = instance_addrs(conf).into_iter().map(|addr| {
+        let context = context.clone();
+        async move {
+            let client = match TransferClient::with_context_single_endpoint(&context, addr.clone())
+            {
+                Ok(client) => client,
+                Err(err) => {
+                    return TransferConfigSnapshot {
+                        addr,
+                        reachable: false,
+                        error: Some(err.to_string()),
+                        entries: Vec::new(),
+                    }
+                }
+            };
+            match timeout(INSTANCE_STATUS_TIMEOUT, client.get_runtime_config(None)).await {
+                Ok(Ok(response)) => TransferConfigSnapshot {
+                    addr,
+                    reachable: true,
+                    error: None,
+                    entries: response.entries,
+                },
+                Ok(Err(err)) => TransferConfigSnapshot {
+                    addr,
+                    reachable: false,
+                    error: Some(err.to_string()),
+                    entries: Vec::new(),
+                },
+                Err(_) => TransferConfigSnapshot {
+                    addr,
+                    reachable: false,
+                    error: Some(format!(
+                        "no answer within {}s",
+                        INSTANCE_STATUS_TIMEOUT.as_secs()
+                    )),
+                    entries: Vec::new(),
+                },
+            }
+        }
+    });
+    join_all(queries).await
+}
+
+/// What one instance did with a pushed value.
+#[derive(Clone, Debug, Serialize)]
+pub struct TransferConfigPushResult {
+    pub addr: String,
+    pub reachable: bool,
+    pub applied: bool,
+    pub error: Option<String>,
+    pub previous_value_json: Option<String>,
+    pub effective_value_json: Option<String>,
+}
+
+/// Applies one knob to every configured instance.
+///
+/// `apply_to_reachable_only` is the two-phase contract the console's dialog
+/// depends on: with `false` (the default) a partially reachable fleet is
+/// reported back untouched, so a half-applied cluster needs an explicit second
+/// request. There is no rollback — instances are independent processes — so the
+/// only honest guarantee is "nothing was written unless you said so".
+pub async fn push_transfer_config(
+    conf: &ClusterConf,
+    context: &Arc<FsContext>,
+    key: &str,
+    value: Option<&str>,
+    apply_to_reachable_only: bool,
+) -> (Vec<TransferConfigPushResult>, Vec<String>) {
+    let addrs = instance_addrs(conf);
+    let unreachable = if apply_to_reachable_only {
+        Vec::new()
+    } else {
+        let snapshots = read_transfer_config(conf, context).await;
+        let unreachable: Vec<String> = snapshots
+            .into_iter()
+            .filter(|snapshot| !snapshot.reachable)
+            .map(|snapshot| snapshot.addr)
+            .collect();
+        if !unreachable.is_empty() {
+            return (Vec::new(), unreachable);
+        }
+        Vec::new()
+    };
+
+    let pushes = addrs.into_iter().map(|addr| {
+        let context = context.clone();
+        let value = value.map(str::to_string);
+        let key = key.to_string();
+        async move {
+            let client = match TransferClient::with_context_single_endpoint(&context, addr.clone())
+            {
+                Ok(client) => client,
+                Err(err) => {
+                    return TransferConfigPushResult {
+                        addr,
+                        reachable: false,
+                        applied: false,
+                        error: Some(err.to_string()),
+                        previous_value_json: None,
+                        effective_value_json: None,
+                    }
+                }
+            };
+            let call = async {
+                match value {
+                    Some(value) => client
+                        .update_runtime_config(&key, &value)
+                        .await
+                        .map(|response| (Some(response.previous_value_json), response.value_json)),
+                    None => client
+                        .reset_runtime_config(&key)
+                        .await
+                        .map(|response| (None, response.effective_value_json)),
+                }
+            };
+            match timeout(INSTANCE_STATUS_TIMEOUT, call).await {
+                Ok(Ok((previous, effective))) => TransferConfigPushResult {
+                    addr,
+                    reachable: true,
+                    applied: true,
+                    error: None,
+                    previous_value_json: previous,
+                    effective_value_json: Some(effective),
+                },
+                Ok(Err(err)) => TransferConfigPushResult {
+                    addr,
+                    reachable: true,
+                    applied: false,
+                    error: Some(err.to_string()),
+                    previous_value_json: None,
+                    effective_value_json: None,
+                },
+                Err(_) => TransferConfigPushResult {
+                    addr,
+                    reachable: true,
+                    applied: false,
+                    error: Some(format!(
+                        "no answer within {}s",
+                        INSTANCE_STATUS_TIMEOUT.as_secs()
+                    )),
+                    previous_value_json: None,
+                    effective_value_json: None,
+                },
+            }
+        }
+    });
+
+    (join_all(pushes).await, unreachable)
+}
+
 /// Asks every configured instance for its status, concurrently.
 ///
 /// Failures are per row: one dead instance never hides the others, and it keeps

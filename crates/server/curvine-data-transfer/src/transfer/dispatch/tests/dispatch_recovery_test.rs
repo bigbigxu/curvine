@@ -374,6 +374,56 @@ fn planning_job(job_id: &str, placement_addr: &str) -> TransferJobRecord {
     job
 }
 
+/// The acting owner has to reach the store, not just this tick's copy.
+///
+/// `owner_addr` is what status/watch relay on and what the console shows as
+/// "running on". Mutating the in-memory record only meant every SQL-backed job
+/// kept an empty owner, so a job looked unowned for its whole life.
+#[tokio::test]
+async fn acquiring_a_job_persists_the_acting_owner_address() {
+    let store = Arc::new(MemoryTransferStore::new());
+    // Placement names this instance, so the tick keeps the lease and records
+    // itself as the owner. Planning then fails (no mount table in this test),
+    // which is irrelevant: the owner write happens first.
+    let mut job = running_job("owner-addr-persisted");
+    job.state = TransferState::Pending;
+    job.placement_addr = "10.9.9.10:8010".to_string();
+    job.lease_expire_at = 0;
+    store.create_or_get_by_request_id(job.clone()).unwrap();
+    let scheduler = scheduler_with_placement(
+        store.clone(),
+        &["10.9.9.9:8010", "10.9.9.10:8010"],
+        "10.9.9.10:8010",
+    );
+
+    // A Pending job is only preferred every Nth tick, so run a few ticks: the
+    // owner write has to happen the first time the lease is actually taken.
+    for _ in 0..40 {
+        let _ = scheduler.run_once().await;
+        if !store
+            .get_transfer(&job.job_id)
+            .unwrap()
+            .unwrap()
+            .owner_addr
+            .is_empty()
+        {
+            break;
+        }
+    }
+
+    let stored = store.get_transfer(&job.job_id).unwrap().unwrap();
+    assert_eq!(
+        stored.owner_addr, "10.9.9.10:8010",
+        "the owner address must be persisted, not only held in memory"
+    );
+    // The relay path reads it back through the service.
+    let service = crate::transfer::TransferService::new(store.clone());
+    assert_eq!(
+        service.owner_addr(&job.job_id).as_deref(),
+        Some("10.9.9.10:8010")
+    );
+}
+
 /// Handing a lease to a sibling must keep working: the fix must not disable
 /// placement, only make "which address is me" resolvable.
 #[tokio::test]

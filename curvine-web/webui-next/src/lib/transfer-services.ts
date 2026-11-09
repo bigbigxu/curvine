@@ -83,6 +83,67 @@ export function ringDrift(info: TransferServiceInfo | null | undefined, configur
   return left.length !== right.length || left.some((member, index) => member !== right[index])
 }
 
+/**
+ * The knobs the console can edit.
+ *
+ * Kept client-side rather than fetched: the list is what the UI knows how to
+ * edit (a boolean switch reads differently from a number), and an instance
+ * registry key the console does not know still shows up through the API.
+ */
+export const TRANSFER_KNOBS = [
+  { key: 'accept_jobs', kind: 'boolean' },
+  { key: 'max_running_transfers', kind: 'number' },
+  { key: 'worker_max_concurrent_tasks', kind: 'number' },
+  { key: 'max_tasks_per_transfer', kind: 'number' },
+  { key: 'max_plan_entries', kind: 'number' }
+] as const
+
+export type TransferKnobKind = (typeof TRANSFER_KNOBS)[number]['kind']
+
+export function knobKind(key: string): TransferKnobKind {
+  const found = TRANSFER_KNOBS.find((knob) => knob.key === key)
+  return found ? found.kind : 'number'
+}
+
+/** Parses the JSON-encoded value the registry stores, without throwing. */
+export function parseConfigValue(raw: string | null | undefined): unknown {
+  const text = String(raw ?? '').trim()
+  if (!text) return undefined
+  try {
+    return JSON.parse(text)
+  } catch {
+    return text
+  }
+}
+
+/**
+ * One effective value across a fleet, or `mixed` when instances disagree.
+ *
+ * Overrides live in each process, so disagreement is normal after a partially
+ * failed push — showing the first answer instead would hide exactly that.
+ */
+export function aggregatedConfigValue(
+  entries: Array<{ key: string; effective_value_json: string }>,
+  key: string
+): { value?: string; mixed: boolean } {
+  const values = entries
+    .filter((entry) => entry.key === key)
+    .map((entry) => entry.effective_value_json)
+  if (values.length === 0) return { mixed: false }
+  const unique = [...new Set(values)]
+  return unique.length === 1 ? { value: unique[0], mixed: false } : { mixed: true }
+}
+
+/**
+ * True when a submit failed because the service is closed for new work.
+ *
+ * The backend sends a stable English sentence (`accept_jobs=false`); the UI is
+ * where it becomes the localized "temporarily closed, retry later".
+ */
+export function isTransferClosedError(message: string): boolean {
+  return /temporarily closed/i.test(message)
+}
+
 export interface TransferServicesSummary {
   total: number
   reachable: number

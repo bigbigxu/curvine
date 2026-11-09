@@ -495,6 +495,24 @@ impl TransferStore for TransferStoreBackend {
         })
     }
 
+    /// Must forward, not inherit the trait's no-op default.
+    ///
+    /// The default exists for stores that persist the whole record, but this
+    /// enum *is* the store the server uses: without the delegation every backend
+    /// silently kept an empty `owner_addr`, so status relay fell back to local
+    /// reads and the console could never show which instance was running a job.
+    fn set_owner_addr(&self, job_id: &str, run_id: u64, owner_addr: &str) -> FsResult<()> {
+        self.record_store_operation("set_owner_addr", || match self {
+            Self::Memory(store) => store.set_owner_addr(job_id, run_id, owner_addr),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.set_owner_addr(job_id, run_id, owner_addr),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.set_owner_addr(job_id, run_id, owner_addr),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.set_owner_addr(job_id, run_id, owner_addr),
+        })
+    }
+
     fn update_transfer_state(&self, update: TransferStateUpdate) -> FsResult<bool> {
         self.record_store_operation("update_transfer_state", || match self {
             Self::Memory(store) => store.update_transfer_state(update),
@@ -930,4 +948,63 @@ pub(crate) fn is_store_unavailable_error(err: &FsError) -> bool {
         || message.contains("Connection refused")
         || message.contains("Lost connection")
         || message.contains("server has gone away")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transfer::MemoryTransferStore;
+    use curvine_model::{TransferJobRecord, TransferKind, TransferProgress, TransferState};
+
+    fn job(job_id: &str) -> TransferJobRecord {
+        TransferJobRecord {
+            job_key: format!("key-{job_id}"),
+            job_id: job_id.to_string(),
+            run_id: 1,
+            kind: TransferKind::Load,
+            source_path: "file:///src".to_string(),
+            target_path: format!("/dst/{job_id}"),
+            command_json: "{}".to_string(),
+            mount_snapshot_json: "{}".to_string(),
+            secret_ref_json: "{}".to_string(),
+            cluster_snapshot_version: 1,
+            mount_snapshot_attempts: 0,
+            planning_attempts: 0,
+            takeover_count: 0,
+            placement_addr: "cv-transfer-0:9010".to_string(),
+            owner_addr: String::new(),
+            terminal_summary: None,
+            terminal_counts: None,
+            cv_metadata_epoch: None,
+            state: TransferState::Pending,
+            owner: String::new(),
+            lease_epoch: 0,
+            lease_expire_at: 0,
+            cancel_requested: false,
+            summary: TransferProgress::default(),
+            client_request_id: format!("req-{job_id}"),
+            submitter: "test".to_string(),
+            tenant: "test".to_string(),
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    /// The enum is the store the server actually holds, so every method it fails
+    /// to forward silently falls back to the trait default. `set_owner_addr`'s
+    /// default is a no-op, which is how every job kept an empty owner address.
+    #[test]
+    fn backend_forwards_set_owner_addr_to_the_inner_store() {
+        let backend = TransferStoreBackend::Memory(MemoryTransferStore::new());
+        backend
+            .create_or_get_by_request_id_checked(job("forwarded"))
+            .unwrap();
+
+        backend
+            .set_owner_addr("forwarded", 1, "cv-transfer-1:9010")
+            .unwrap();
+
+        let stored = backend.get_transfer("forwarded").unwrap().unwrap();
+        assert_eq!(stored.owner_addr, "cv-transfer-1:9010");
+    }
 }

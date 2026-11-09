@@ -17,17 +17,21 @@ use curvine_error::FsResult;
 use curvine_fs_api::RpcCode;
 use curvine_model::TransferState;
 use curvine_proto::{
-    CancelTransferRequest, CancelTransferResponse, GetTransferStatusRequest,
-    GetTransferStatusResponse, ListTransferTenantsRequest, ListTransfersRequest,
-    RetryTransferRequest, SubmitTransferRequest, SubmitTransferResponse,
-    TransferTaskReportBatchRequest, TransferTaskReportBatchResponse, TransferTaskReportRequest,
-    TransferTaskReportResponse, WatchTransferRequest, WatchTransferResponse,
+    CancelTransferRequest, CancelTransferResponse, GetRuntimeConfigRequest,
+    GetRuntimeConfigResponse, GetTransferStatusRequest, GetTransferStatusResponse,
+    ListTransferTenantsRequest, ListTransfersRequest, ResetRuntimeConfigRequest,
+    ResetRuntimeConfigResponse, RetryTransferRequest, RuntimeConfigEntryProto,
+    SubmitTransferRequest, SubmitTransferResponse, TransferTaskReportBatchRequest,
+    TransferTaskReportBatchResponse, TransferTaskReportRequest, TransferTaskReportResponse,
+    UpdateRuntimeConfigRequest, UpdateRuntimeConfigResponse, WatchTransferRequest,
+    WatchTransferResponse,
 };
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::{Builder, Message};
 
 use crate::transfer::{
-    progress_to_proto, task_summary_to_proto, TransferMetrics, TransferService, TransferStore,
+    progress_to_proto, task_summary_to_proto, transfer_command_options, TransferMetrics,
+    TransferService, TransferStore,
 };
 
 pub struct TransferHandler<S> {
@@ -37,6 +41,9 @@ pub struct TransferHandler<S> {
     /// Answers `GetTransferServiceInfo`; `None` in tests that build a handler
     /// from a bare service, which then reject the call instead of inventing one.
     probe: Option<std::sync::Arc<crate::transfer::TransferServiceProbe>>,
+    /// Backs the three runtime-config RPCs (`62/63/64`, the codes the master and
+    /// `cv admin config` already use). `None` in bare-service tests.
+    runtime_config: Option<std::sync::Arc<curvine_config::RuntimeConfigRegistry>>,
 }
 
 impl<S> TransferHandler<S>
@@ -48,7 +55,19 @@ where
             service,
             forwarder: None,
             probe: None,
+            runtime_config: None,
         }
+    }
+
+    /// Attaches the live config registry shared with the HTTP config surface, so
+    /// a push through RPC and a push through `/api/update_config` land in the
+    /// same registry and both are visible in `/api/v1/transfer/config`.
+    pub fn with_runtime_config(
+        mut self,
+        runtime_config: std::sync::Arc<curvine_config::RuntimeConfigRegistry>,
+    ) -> Self {
+        self.runtime_config = Some(runtime_config);
+        self
     }
 
     /// Attaches the per-instance status source shared with the HTTP surface.
@@ -58,6 +77,62 @@ where
     ) -> Self {
         self.probe = Some(probe);
         self
+    }
+
+    fn runtime_registry(&self) -> FsResult<&std::sync::Arc<curvine_config::RuntimeConfigRegistry>> {
+        self.runtime_config.as_ref().ok_or_else(|| {
+            FsError::common("runtime configuration is not available on this handler")
+        })
+    }
+
+    /// One writable knob: previous and effective value, non-persistent.
+    fn update_runtime_config(&self, msg: &Message) -> FsResult<Message> {
+        let req: UpdateRuntimeConfigRequest = msg.parse_header()?;
+        let result =
+            self.runtime_registry()?
+                .set(&req.key, &req.value, Some("rpc:UpdateRuntimeConfig"))?;
+        let response = UpdateRuntimeConfigResponse {
+            key: result.config,
+            previous_value_json: result.previous_value.to_string(),
+            value_json: result.value.to_string(),
+            persistent: result.persistent,
+        };
+        Ok(Builder::success(msg).proto_header(response).build())
+    }
+
+    /// Every registered knob, or just `key`.
+    fn get_runtime_config(&self, msg: &Message) -> FsResult<Message> {
+        let req: GetRuntimeConfigRequest = msg.parse_header()?;
+        let registry = self.runtime_registry()?;
+        let views = match req.key.filter(|key| !key.is_empty()) {
+            Some(key) => vec![registry.get(&key)?],
+            None => registry.list(),
+        };
+        let entries = views
+            .into_iter()
+            .map(|view| RuntimeConfigEntryProto {
+                key: view.key,
+                file_value_json: view.file_value.to_string(),
+                override_value: view.override_value,
+                effective_value_json: view.effective_value.to_string(),
+            })
+            .collect();
+        Ok(Builder::success(msg)
+            .proto_header(GetRuntimeConfigResponse { entries })
+            .build())
+    }
+
+    /// Clears one override, restoring the file value.
+    fn reset_runtime_config(&self, msg: &Message) -> FsResult<Message> {
+        let req: ResetRuntimeConfigRequest = msg.parse_header()?;
+        let effective = self
+            .runtime_registry()?
+            .reset(&req.key, Some("rpc:ResetRuntimeConfig"))?;
+        let response = ResetRuntimeConfigResponse {
+            key: req.key,
+            effective_value_json: effective.to_string(),
+        };
+        Ok(Builder::success(msg).proto_header(response).build())
     }
 
     /// Answers "what are you doing"; the web router calls the same probe.
@@ -158,6 +233,7 @@ where
         let (job, task_summary, tasks, next_page_token, task_details_expired) = self
             .service
             .get_transfer_status(&req.job_id, req.page_size, req.page_token.clone())?;
+        let (overwrite, replicas) = transfer_command_options(&job);
         Ok(GetTransferStatusResponse {
             job_id: job.job_id,
             run_id: job.run_id,
@@ -179,6 +255,13 @@ where
             task_summary: Some(task_summary_to_proto(task_summary)),
             task_details_expired: Some(task_details_expired),
             takeover_count: Some(job.takeover_count),
+            placement_addr: Some(job.placement_addr),
+            owner_addr: Some(job.owner_addr),
+            client_request_id: Some(job.client_request_id),
+            mount_snapshot_attempts: Some(job.mount_snapshot_attempts),
+            planning_attempts: Some(job.planning_attempts),
+            overwrite,
+            replicas,
         })
     }
 
@@ -395,6 +478,9 @@ where
             RpcCode::ReportTransferTaskBatch => self.report_task_batch(msg),
             RpcCode::ListTransferTenants => self.list_transfer_tenants(msg),
             RpcCode::GetTransferServiceInfo => self.service_info(msg),
+            RpcCode::UpdateRuntimeConfig => self.update_runtime_config(msg),
+            RpcCode::GetRuntimeConfig => self.get_runtime_config(msg),
+            RpcCode::ResetRuntimeConfig => self.reset_runtime_config(msg),
             code => Err(FsError::common(format!(
                 "Unsupported transfer rpc code {}",
                 code

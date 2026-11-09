@@ -77,6 +77,36 @@ export default {
         'This instance\'s ring differs from the configured endpoints list. A drifted ring places jobs on different instances than the console expects.',
       error: 'Why it did not answer'
     },
+    settings: {
+      title: 'Transfer settings',
+      subtitle:
+        'Runtime knobs, pushed to every configured instance. Values apply immediately and are not persisted: a restart restores the file value.',
+      instances: '{reachable} of {total} instance(s) answering',
+      unreachable: 'Not answering ({count}): {addrs}. Nothing is applied to a partially reachable cluster unless you confirm.',
+      key: 'Key',
+      effective: 'Effective value',
+      actions: 'Change',
+      apply: 'Apply',
+      reset: 'Reset',
+      mixed: 'Mixed',
+      hint: 'Values are pushed to every instance in transfer.endpoints; the file value is what a reset returns to.',
+      acceptJobsHint:
+        'accept_jobs=false closes the service to new submissions with "temporarily closed, retry later". The process, its scheduler and running jobs are untouched.',
+      closedBanner: '{count} instance(s) are closed to new submissions (`accept_jobs=false`). In-flight jobs keep running.',
+      closedSubmit: 'The transfer service is temporarily closed; please retry later.',
+      result: 'Push {status}: {applied}/{total} instance(s) applied.',
+      status: {
+        applied: 'applied',
+        partial: 'partially applied',
+        needs_confirmation: 'needs confirmation'
+      },
+      confirmTitle: 'Some instances did not answer',
+      confirmDescription:
+        '{unreachable} of {total} instance(s) cannot be reached: {addrs}. Apply the change to the reachable instances anyway?',
+      confirmWarning:
+        'Instances that are not applied keep their previous value until the next push. There is no rollback.',
+      confirmApply: 'Apply to reachable instances'
+    },
     empty: {
       title: 'No transfer instances configured',
       description:

@@ -23,7 +23,7 @@ use curvine_model::{
     WorkerInflight,
 };
 use mysql::prelude::*;
-use mysql::{params, Opts, OptsBuilder, IsolationLevel, Params, Pool, PooledConn, TxOpts};
+use mysql::{params, IsolationLevel, Opts, OptsBuilder, Params, Pool, PooledConn, TxOpts};
 use std::collections::{BTreeMap, BTreeSet};
 use std::thread;
 use std::time::Duration;
@@ -171,11 +171,9 @@ pub struct MysqlTransferStore {
 
 impl MysqlTransferStore {
     pub fn open(url: &str) -> FsResult<Self> {
-        let opts = OptsBuilder::from_opts(
-            Opts::from_url(url).map_err(mysql_url_err)?,
-        )
-        .read_timeout(Some(MYSQL_SOCKET_TIMEOUT))
-        .write_timeout(Some(MYSQL_SOCKET_TIMEOUT));
+        let opts = OptsBuilder::from_opts(Opts::from_url(url).map_err(mysql_url_err)?)
+            .read_timeout(Some(MYSQL_SOCKET_TIMEOUT))
+            .write_timeout(Some(MYSQL_SOCKET_TIMEOUT));
         let pool = Pool::new(opts).map_err(mysql_err)?;
         let mut conn = pool.get_conn().map_err(mysql_err)?;
         if !mysql_schema_ready(&mut conn)? {
@@ -317,7 +315,7 @@ impl TransferStore for MysqlTransferStore {
         );
         let sql = format!(
             "select record_json from transfer_jobs {where_sql}
-             order by updated_at desc, created_at desc, job_id desc
+             order by created_at desc, job_id desc
              limit ? offset ?"
         );
         values.push(mysql::Value::from(filter.limit as u64));

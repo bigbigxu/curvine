@@ -232,11 +232,12 @@ impl TransferStore for MemoryTransferStore {
             })
             .cloned()
             .collect();
+        // Newest submission first, matching the SQL stores: `updated_at` would
+        // let a long-running job keep jumping to the top of the list.
         jobs.sort_by(|left, right| {
             right
-                .updated_at
-                .cmp(&left.updated_at)
-                .then_with(|| right.created_at.cmp(&left.created_at))
+                .created_at
+                .cmp(&left.created_at)
                 .then_with(|| right.job_id.cmp(&left.job_id))
         });
         Ok(jobs
@@ -1397,6 +1398,58 @@ mod tests {
             block_locations: Vec::new(),
             replace_target: false,
         }
+    }
+
+    #[test]
+    fn list_orders_by_submission_time_not_last_update() {
+        let store = MemoryTransferStore::new();
+        // `a` is the oldest submission but the most recently updated job: the
+        // list must still put it last, because the order is submission time.
+        let mut records = Vec::new();
+        for (job_id, created_at, updated_at) in [("a", 100, 900), ("b", 300, 300), ("c", 200, 200)]
+        {
+            let mut job = sample_job(job_id);
+            job.created_at = created_at;
+            job.updated_at = updated_at;
+            records.push(store.create_or_get_by_request_id_checked(job).unwrap());
+        }
+        assert_eq!(records.len(), 3);
+
+        let listed = store
+            .list_transfers(curvine_model::TransferListFilter {
+                kind: None,
+                states: Vec::new(),
+                submitter: None,
+                tenant: None,
+                limit: 10,
+                offset: 0,
+            })
+            .unwrap();
+        let ids: Vec<&str> = listed.iter().map(|job| job.job_id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "c", "a"]);
+    }
+
+    #[test]
+    fn list_breaks_creation_ties_by_job_id_so_paging_is_stable() {
+        let store = MemoryTransferStore::new();
+        for job_id in ["t1", "t2", "t3"] {
+            let mut job = sample_job(job_id);
+            job.created_at = 500;
+            job.updated_at = 500;
+            store.create_or_get_by_request_id_checked(job).unwrap();
+        }
+        let listed = store
+            .list_transfers(curvine_model::TransferListFilter {
+                kind: None,
+                states: Vec::new(),
+                submitter: None,
+                tenant: None,
+                limit: 10,
+                offset: 0,
+            })
+            .unwrap();
+        let ids: Vec<&str> = listed.iter().map(|job| job.job_id.as_str()).collect();
+        assert_eq!(ids, vec!["t3", "t2", "t1"]);
     }
 
     fn running_store(task_state: TransferTaskState) -> (MemoryTransferStore, TransferJobRecord) {

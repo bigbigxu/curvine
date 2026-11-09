@@ -162,9 +162,13 @@ impl TransferStore for SqliteTransferStore {
     fn list_transfers(&self, filter: TransferListFilter) -> FsResult<Vec<TransferJobRecord>> {
         let conn = self.conn.lock();
         let (where_sql, values) = list_filter_sqlite_params(&filter);
+        // Newest submission first. `updated_at` is deliberately not the key: a
+        // long-running job would keep jumping to the top, and an operator
+        // reading the list wants the order they submitted in. `job_id` breaks
+        // ties so paging stays stable for jobs created in the same millisecond.
         let sql = job_select_sql(&format!(
             "{where_sql}
-             order by updated_at desc, created_at desc, job_id desc
+             order by created_at desc, job_id desc
              limit ? offset ?"
         ));
         let mut values = values;
@@ -2239,7 +2243,8 @@ fn job_select_sql(where_sql: &str) -> String {
                 planning_attempts,
                 cv_metadata_epoch, state, owner, lease_epoch, lease_expire_at, cancel_requested,
                 summary_json, client_request_id, submitter, tenant, created_at, updated_at,
-                terminal_summary_json, terminal_counts_json
+                terminal_summary_json, terminal_counts_json,
+                takeover_count, placement_addr, owner_addr
          from transfer_jobs {where_sql}"
     )
 }
