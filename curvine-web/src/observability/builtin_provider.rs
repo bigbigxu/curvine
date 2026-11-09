@@ -65,6 +65,10 @@ pub struct BuiltinProvider {
     max_concurrent_scrapes: usize,
     max_samples_per_series: usize,
     collect_lock: Mutex<()>,
+    /// Shared with the console's Runtime page: one fan-out over
+    /// `transfer.endpoints` answers both the scrape targets and the UI, so the
+    /// instances are asked the same question at most once per TTL.
+    transfer_services: Arc<crate::transfer_services::TransferServicesCache>,
 }
 
 impl BuiltinProvider {
@@ -112,7 +116,13 @@ impl BuiltinProvider {
             max_concurrent_scrapes: observability.max_concurrent_scrapes.max(1),
             max_samples_per_series,
             collect_lock: Mutex::new(()),
+            transfer_services: Arc::new(crate::transfer_services::TransferServicesCache::default()),
         }
+    }
+
+    /// The per-cluster transfer status cache, shared with the Runtime page.
+    pub fn transfer_services(&self) -> &Arc<crate::transfer_services::TransferServicesCache> {
+        &self.transfer_services
     }
 
     pub fn start_collector(self: &Arc<Self>, rt: Arc<Runtime>) {

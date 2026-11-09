@@ -74,6 +74,33 @@ registry 条目单独声明它背后的配置路径。`sources` / `values` 一�
 > 要求登录）。S3 网关的 `access_key` / `secret_key` 已在序列化层
 > （`#[serde(skip_serializing)]`）屏蔽，不会出现在任何视图响应中。
 
+### Transfer 实例状态
+
+Transfer 可以有多个实例，但**没有注册中心、没有心跳**：每个进程配置里的
+`[transfer] endpoints`（`host:rpc_port` 列表）就是唯一的实例清单。因此实例状态
+按"逐个实例自报"的方式获取，而不是从共享的 `/metrics` 或共享 store 推断——
+"这台实例承载了几个 job""跑的是哪个版本""它的集群快照是否过期"都是进程内事实。
+
+| 方法 | 路径 | 端口 | 说明 |
+|------|------|------|------|
+| `GET` | `/api/v1/transfer/info` | Transfer web 端口（默认 9011） | 本实例自报状态：`instance_id`、`addr`/`web_addr`、`version`/`version_commit`、`start_time_ms`/`uptime_ms`、`state`（`normal` / `degraded` / `not_ready`）+ `state_reason`、`store_backend`、调度上限、job/task 计数、集群快照健康度、哈希环成员 |
+| RPC | `GetTransferServiceInfo`（code 75） | Transfer RPC 端口（默认 9010） | 与上表同一份数据；控制台走 RPC，因为 `endpoints` 里只有 RPC 端口 |
+| `GET` | `/api/v1/transfers/instances` | 控制台 9000 | 按 `endpoints` 并行 fan-out 上述 RPC，返回 `{items:[{addr, reachable, error, info}], configured:[...]}`；无响应的实例保留为 `reachable:false` 并带上原因，不会从列表消失。结果按集群缓存 2s，一个刷新周期只侦测一轮 |
+
+`state` 的判定与 `/readyz` 一致（启动中、元数据 store 不可用、集群快照不可用 →
+`not_ready`）；唯一差别是允许使用过期快照（`allow_submit_with_stale_snapshot`）时
+报 `degraded` 而不是 `not_ready`——此时仍接收任务，只是新规划可能失败。
+
+`ring_members` 用于发现**配置漂移**：某个进程的 `endpoints` 与其它实例不一致时，
+哈希环会分裂，同一个 job 的归属在不同进程里算出不同结果。控制台把这个列表与
+自己配置的 `endpoints` 对比，不一致即在页面上标出。
+
+内置采集器同样按 `endpoints` 逐个生成 transfer 的 `/metrics` 抓取目标（`Observability`
+页面里能看到全部实例，而不是只看主机本地那一个）。`endpoints` 里只有 RPC 端口，
+所以 web 端口取自各实例自报的 `web_addr`；实例自报 `hostname=0.0.0.0` 时用
+endpoint 的主机名替换（监听地址不可抓），实例无响应时退回本机
+`transfer.web_port`，于是它在采集侧表现为 `up=0` 而不是凭空消失。
+
 ---
 
 ## 2. 环境要求

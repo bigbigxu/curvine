@@ -98,6 +98,9 @@ export default {
     browseSubtitle: 'Browse paths, inspect status and block placement',
     workers: 'Workers',
     workersSubtitle: 'Worker state, heartbeat and capacity usage',
+    transferServices: 'Transfer Services',
+    transferServicesSubtitle:
+      'Per-instance transfer service state, version and current load',
     observability: 'Observability',
     observabilitySubtitle: 'Built-in metrics collector, targets and charts',
     operations: 'Platform Health',

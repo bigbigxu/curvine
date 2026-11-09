@@ -6,6 +6,7 @@ import {
   LayersIcon,
   LayoutDashboardIcon,
   ListChecksIcon,
+  NetworkIcon,
   RefreshCwIcon,
   ServerIcon,
   SettingsIcon,
@@ -68,6 +69,12 @@ export const navigationGroups: NavigationGroup[] = [
     titleKey: 'nav.groupRuntime',
     items: [
       { to: '/workers', labelKey: 'nav.workers', subtitleKey: 'nav.workersSubtitle', icon: ServerIcon },
+      {
+        to: '/transfer-services',
+        labelKey: 'nav.transferServices',
+        subtitleKey: 'nav.transferServicesSubtitle',
+        icon: NetworkIcon
+      },
       { to: '/config', labelKey: 'nav.config', subtitleKey: 'nav.configSubtitle', icon: SettingsIcon }
     ]
   },

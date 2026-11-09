@@ -391,6 +391,69 @@ export interface TransferInfo extends JobInfo {
 }
 
 /**
+ * One transfer instance's answer to "how are you".
+ *
+ * Field names mirror the RPC `TransferServiceInfoResponse` and the instance's own
+ * `GET /api/v1/transfer/info` verbatim: the console serializes the RPC message
+ * as-is, so there is exactly one shape to keep in sync.
+ */
+export interface TransferServiceInfo {
+  role?: string
+  /** Process-unique lease owner id; changes on restart, unlike `addr`. */
+  instance_id?: string
+  addr?: string
+  web_addr?: string
+  version?: string
+  version_commit?: string
+  start_time_ms?: number
+  uptime_ms?: number
+  ready?: boolean
+  /** `normal` | `degraded` | `not_ready`. */
+  state?: string
+  state_reason?: string
+  store_backend?: string
+  max_running_transfers?: number
+  worker_task_limit?: number
+  max_tasks_per_transfer?: number
+  max_plan_entries?: number
+  /** Store-wide, identical on every instance sharing the store. */
+  active_jobs?: number
+  executing_jobs?: number
+  /** Jobs whose file-level task state lives in this process. */
+  in_memory_jobs?: number
+  in_memory_running_tasks?: number
+  snapshot_version?: number
+  snapshot_updated_at?: number
+  snapshot_staleness_ms?: number
+  snapshot_live_workers?: number
+  snapshot_capable_workers?: number
+  ring_self?: string
+  ring_members?: string[]
+}
+
+/**
+ * One row per configured `transfer.endpoints` address. `info` is null when the
+ * instance did not answer; `error` then says why. The row stays visible so a dead
+ * HA member cannot hide behind the ones that are up.
+ */
+export interface TransferServiceInstance {
+  addr: string
+  reachable: boolean
+  error?: string | null
+  info?: TransferServiceInfo | null
+}
+
+export interface TransferServicesData {
+  items?: TransferServiceInstance[]
+  /**
+   * This console's own `transfer.endpoints`. Comparing it with each instance's
+   * `ring_members` is what turns a silent placement-config drift into a visible
+   * warning: transfer has no registry to reconcile the two.
+   */
+  configured?: string[]
+}
+
+/**
  * Per-bucket job counts over the whole store, so the tabs and the summary cards
  * stay accurate while the table itself is paged.
  */

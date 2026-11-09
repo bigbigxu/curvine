@@ -27,7 +27,9 @@ use curvine_web::router::{get_config_view, post_update_config, RuntimeConfigHttp
 use log::warn;
 use serde_json::Value;
 
-use crate::transfer::{ClusterMetadataCache, TransferService, TransferStoreBackend};
+use crate::transfer::{
+    ClusterMetadataCache, TransferService, TransferServiceProbe, TransferStoreBackend,
+};
 
 #[derive(Clone)]
 pub struct TransferRouterHandler {
@@ -38,9 +40,12 @@ pub struct TransferRouterHandler {
     runtime_config: Arc<RuntimeConfigRegistry>,
     /// Snapshot plus live registry behind `GET /api/v1/transfer/config`.
     config_view: Arc<ConfigViewState>,
+    /// Same source as the RPC `GetTransferServiceInfo` answer.
+    probe: Arc<TransferServiceProbe>,
 }
 
 impl TransferRouterHandler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ready: Arc<AtomicBool>,
         store_backend: &'static str,
@@ -49,6 +54,7 @@ impl TransferRouterHandler {
         runtime_config: Arc<RuntimeConfigRegistry>,
         conf: &ClusterConf,
         config_sources: ConfigSourceMap,
+        probe: Arc<TransferServiceProbe>,
     ) -> Self {
         let config_view = Arc::new(ConfigViewState::new(
             "transfer",
@@ -67,6 +73,7 @@ impl TransferRouterHandler {
             cluster_cache,
             runtime_config,
             config_view,
+            probe,
         }
     }
 }
@@ -120,6 +127,12 @@ async fn readyz(
     (StatusCode::OK, "ok\n".to_string())
 }
 
+/// The same per-instance status the RPC answers, over HTTP for `curl` and
+/// dashboards. Field names match `TransferServiceInfoResponse` exactly.
+async fn service_info(Extension(handler): Extension<Arc<TransferRouterHandler>>) -> Json<Value> {
+    Json(handler.probe.snapshot().to_json())
+}
+
 async fn runtime_config(
     Extension(handler): Extension<Arc<TransferRouterHandler>>,
 ) -> RuntimeConfigHttpResult<Json<Value>> {
@@ -155,6 +168,7 @@ impl RouterHandler for TransferRouterHandler {
             )
             .route("/metrics", get(metrics))
             .route("/api/v1/transfer/config", get(runtime_config))
+            .route("/api/v1/transfer/info", get(service_info))
             .route("/api/update_config", post(update_runtime_config))
             .layer(Extension(instance))
     }

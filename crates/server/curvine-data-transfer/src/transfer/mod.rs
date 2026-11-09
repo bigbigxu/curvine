@@ -58,6 +58,12 @@ pub use self::runtime_config::{
     MAX_TASKS_PER_TRANSFER_CONFIG, WORKER_MAX_CONCURRENT_TASKS_CONFIG,
 };
 
+mod service_info;
+pub use self::service_info::{
+    workload_from_counts, TransferServiceProbe, TransferServiceState, TransferWorkload,
+    STATE_DEGRADED, STATE_NORMAL, STATE_NOT_READY,
+};
+
 mod dispatch;
 mod plan;
 pub use self::plan::{

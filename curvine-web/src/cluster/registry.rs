@@ -49,6 +49,7 @@ use curvine_unified_fs::UnifiedFileSystem;
 
 use crate::observability::ObservabilityService;
 use crate::router::admin_handler::{sanitize_error_text, ResyncTaskState};
+use crate::transfer_services::TransferServicesCache;
 use crate::util::addr::configured_master_addrs;
 
 /// Longest accepted cluster id (the file name, minus `.toml`).
@@ -255,6 +256,9 @@ pub struct ClusterCtx {
     pub load_job_cache: Arc<Mutex<HashMap<String, Value>>>,
     /// Result of the most recent explicit probe (see the `.../probe` endpoint).
     pub last_probe: Arc<Mutex<Option<ProbeResult>>>,
+    /// Last per-instance transfer status fan-out. Per cluster, because each
+    /// cluster has its own `transfer.endpoints` list.
+    pub transfer_services: Arc<TransferServicesCache>,
 }
 
 impl ClusterCtx {
@@ -271,6 +275,9 @@ impl ClusterCtx {
         // metric set; per-cluster observability lives in `observability` below.
         let unified_fs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
         let observability = Arc::new(ObservabilityService::new(conf.clone(), unified_fs.clone()));
+        // Read before `observability` moves into the struct below: this is the
+        // same cache the collector's discovery loop fills.
+        let transfer_services = Arc::clone(observability.transfer_services_cache());
         observability.start(rt);
 
         Ok(Self {
@@ -284,6 +291,9 @@ impl ClusterCtx {
             load_jobs: Arc::new(Mutex::new(VecDeque::new())),
             load_job_cache: Arc::new(Mutex::new(HashMap::new())),
             last_probe: Arc::new(Mutex::new(None)),
+            // Same cache the collector's discovery loop uses: one fan-out over
+            // `transfer.endpoints` answers both the scrape targets and the page.
+            transfer_services,
         })
     }
 

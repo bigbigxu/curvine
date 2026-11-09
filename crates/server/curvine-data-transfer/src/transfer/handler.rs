@@ -34,6 +34,9 @@ pub struct TransferHandler<S> {
     service: TransferService<S>,
     /// Present in discovery mode; relays submit/status/watch to the owner.
     forwarder: Option<std::sync::Arc<crate::transfer::Forwarder>>,
+    /// Answers `GetTransferServiceInfo`; `None` in tests that build a handler
+    /// from a bare service, which then reject the call instead of inventing one.
+    probe: Option<std::sync::Arc<crate::transfer::TransferServiceProbe>>,
 }
 
 impl<S> TransferHandler<S>
@@ -44,7 +47,26 @@ where
         Self {
             service,
             forwarder: None,
+            probe: None,
         }
+    }
+
+    /// Attaches the per-instance status source shared with the HTTP surface.
+    pub fn with_probe(
+        mut self,
+        probe: std::sync::Arc<crate::transfer::TransferServiceProbe>,
+    ) -> Self {
+        self.probe = Some(probe);
+        self
+    }
+
+    /// Answers "what are you doing"; the web router calls the same probe.
+    fn service_info(&self, msg: &Message) -> FsResult<Message> {
+        let probe = self.probe.as_ref().ok_or_else(|| {
+            FsError::common("transfer service info is not available on this handler")
+        })?;
+        let response = probe.snapshot().to_proto();
+        Ok(Builder::success(msg).proto_header(response).build())
     }
 
     pub fn with_forwarder(mut self, forwarder: std::sync::Arc<crate::transfer::Forwarder>) -> Self {
@@ -372,6 +394,7 @@ where
             RpcCode::ReportTransferTask => self.report_task(msg),
             RpcCode::ReportTransferTaskBatch => self.report_task_batch(msg),
             RpcCode::ListTransferTenants => self.list_transfer_tenants(msg),
+            RpcCode::GetTransferServiceInfo => self.service_info(msg),
             code => Err(FsError::common(format!(
                 "Unsupported transfer rpc code {}",
                 code

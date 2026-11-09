@@ -30,6 +30,11 @@ const MountsPage = lazy(() =>
 const WorkersPage = lazy(() =>
   import('@/pages/workers-page').then((module) => ({ default: module.WorkersPage }))
 )
+const TransferServicesPage = lazy(() =>
+  import('@/pages/transfer-services-page').then((module) => ({
+    default: module.TransferServicesPage
+  }))
+)
 const JobsPage = lazy(() =>
   import('@/pages/jobs-page').then((module) => ({ default: module.JobsPage }))
 )
@@ -77,6 +82,7 @@ export function App() {
         <Route path="browse" element={<BrowsePage />} />
         <Route path="mounts" element={<MountsPage />} />
         <Route path="workers/:id?" element={<WorkersPage />} />
+        <Route path="transfer-services" element={<TransferServicesPage />} />
         <Route path="jobs" element={<JobsPage />} />
         <Route path="transfers" element={<TransfersPage />} />
         <Route path="sync-jobs" element={<SyncJobsPage />} />

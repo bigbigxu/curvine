@@ -535,6 +535,19 @@ where
         self.store.check_available()
     }
 
+    /// Store-wide job counters plus this process's in-memory task state.
+    ///
+    /// Used by [`crate::transfer::TransferServiceProbe`] to answer the per-instance
+    /// status query. The store half is two `COUNT`s; the memory half is a read of
+    /// the file-level task cache, so this stays cheap enough to answer per scrape.
+    pub fn workload(&self) -> FsResult<crate::transfer::TransferWorkload> {
+        Ok(crate::transfer::workload_from_counts(
+            self.store.count_active_transfers()?,
+            self.store.count_executing_transfers()?,
+            self.task_cache.as_deref(),
+        ))
+    }
+
     pub fn get_transfer(&self, job_id: &str) -> FsResult<TransferJobRecord> {
         self.store
             .get_transfer(job_id)?

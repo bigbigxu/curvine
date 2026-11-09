@@ -18,6 +18,9 @@ curvine-raft = { workspace = true }
 curvine-sys = { workspace = true }
 curvine-fs-api = { workspace = true }
 curvine-job-client = { workspace = true }
+# Only for `FsContext`: the transfer status probe pins one client per configured
+# endpoint, and the cluster contexts hold an `FsContext`, not a `Runtime`.
+curvine-client-core = { workspace = true }
 curvine-unified-fs = { workspace = true, features = ["opendal-s3"] }
 curvine-proto = { workspace = true }
 axum = { workspace = true }

@@ -37,6 +37,7 @@ import type {
   OverviewData,
   RangeSeries,
   TargetHealth,
+  TransferServicesData,
   WorkerAction,
   WorkerDetailData,
   WorkersData
@@ -119,6 +120,7 @@ export interface ApiClient {
   fetchTransferStatus(jobId: string, params?: JobQuery): Promise<JobInfo>
   cancelTransfer(jobId: string): Promise<unknown>
   retryTransfer(jobId: string): Promise<unknown>
+  fetchTransferServices(): Promise<TransferServicesData>
 
   fetchObservabilityHealth(): Promise<ObservabilityHealth>
   fetchObservabilitySettings(): Promise<ObservabilitySettings>
@@ -319,6 +321,21 @@ export function createApiClient(options: HttpClientOptions = {}): ApiClient {
         timeout: 30000
       }),
     retryTransfer: (jobId) => post(`/v1/transfers/${encodeURIComponent(jobId)}/retry`, {}),
+    /**
+     * Status of every instance in the configured `transfer.endpoints` list.
+     *
+     * One row per configured address, including the ones that did not answer:
+     * `transfer.endpoints` is the only instance list there is, so an
+     * unreachable row is information, not a gap to filter out.
+     */
+    fetchTransferServices: async () => {
+      const data = await get<TransferServicesData>('/v1/transfers/instances')
+      return {
+        items: Array.isArray(data?.items) ? data.items : [],
+        configured: Array.isArray(data?.configured) ? data.configured : []
+      }
+    },
+
 
     fetchObservabilityHealth: () => get<ObservabilityHealth>('/v1/observability/health'),
     fetchObservabilitySettings: () => get<ObservabilitySettings>('/v1/observability/settings'),

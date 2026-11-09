@@ -54,7 +54,12 @@ struct PreparedDiscovery {
 }
 
 async fn prepare_discovery(provider: &BuiltinProvider, mutate_tsdb: bool) -> PreparedDiscovery {
-    let discovery = discover_targets(provider.conf(), provider.unified_fs()).await;
+    let discovery = discover_targets(
+        provider.conf(),
+        provider.unified_fs(),
+        provider.transfer_services(),
+    )
+    .await;
     let master_warning = discovery.master.error.clone();
     let discovery_failed = master_warning.is_some();
     if let Some(ref err) = master_warning {

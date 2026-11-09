@@ -603,6 +603,10 @@ pub struct AdminRouterHandler {
     /// a snapshot stays a complete description of its cluster.
     #[allow(dead_code)]
     observability: Arc<ObservabilityService>,
+    /// Last per-instance transfer status fan-out for this cluster. Cluster-scoped
+    /// and shared across requests, so the Runtime page's polling collapses into
+    /// one round of RPCs per TTL instead of one per widget.
+    transfer_services: Arc<crate::transfer_services::TransferServicesCache>,
 
     // Console-scoped: identical for every cluster.
     rt: Arc<Runtime>,
@@ -625,6 +629,7 @@ pub(crate) fn snapshot(console: &AdminRouterHandler, ctx: &Arc<ClusterCtx>) -> A
         load_jobs: Arc::clone(&ctx.load_jobs),
         load_job_cache: Arc::clone(&ctx.load_job_cache),
         observability: Arc::clone(&ctx.observability),
+        transfer_services: Arc::clone(&ctx.transfer_services),
         rt: Arc::clone(&console.rt),
         start_time: console.start_time.clone(),
         auth_sessions: Arc::clone(&console.auth_sessions),
@@ -1856,6 +1861,7 @@ impl AdminRouterHandler {
             load_jobs: Arc::clone(&default.load_jobs),
             load_job_cache: Arc::clone(&default.load_job_cache),
             observability: Arc::clone(&default.observability),
+            transfer_services: Arc::clone(&default.transfer_services),
             rt,
             start_time: LocalTime::now_datetime(),
             auth_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -4629,6 +4635,37 @@ async fn resolve_transfer_paths(
     Ok((source.clone_uri(), target.clone_uri()))
 }
 
+/// Status of every transfer instance, one row per configured endpoint.
+///
+/// Each instance is asked directly (`GetTransferServiceInfo`) instead of being
+/// inferred from shared metrics or the shared store: "which instance is carrying
+/// this job", "which build is it running" and "is its metadata snapshot stale"
+/// are per-process facts that a Prometheus scrape or a store query cannot
+/// attribute. An instance that is down, or older than this RPC, is reported as
+/// `reachable: false` with the reason rather than dropped from the list — a
+/// console that hides unreachable instances is how a broken HA member stays
+/// invisible.
+///
+/// The fan-out is cached for a couple of seconds per cluster: the page polls,
+/// and several widgets read it in the same refresh.
+async fn transfer_instances_v1(
+    Extension(instance): Extension<Arc<AdminRouterHandler>>,
+) -> FsResult<Json<Value>> {
+    let configured = crate::transfer_services::instance_addrs(&instance.conf);
+    let items = instance
+        .transfer_services
+        .instances(&instance.conf, instance.unified_fs.fs_context())
+        .await;
+
+    // `configured` goes back with the answers so the UI can compare each
+    // instance's ring against what this console was configured with: a mismatch
+    // means placement is genuinely ambiguous across processes.
+    Ok(api_success(json!({
+        "items": items.as_ref(),
+        "configured": configured
+    })))
+}
+
 async fn transfers_v1(
     Extension(instance): Extension<Arc<AdminRouterHandler>>,
     Query(query): Query<TransferListQuery>,
@@ -5029,6 +5066,7 @@ impl RouterHandler for AdminRouterHandler {
                 "/api/v1/transfers",
                 get(transfers_v1).post(submit_transfer_v1),
             )
+            .route("/api/v1/transfers/instances", get(transfer_instances_v1))
             .route(
                 "/api/v1/transfers/:job_id",
                 get(transfer_status_v1).delete(transfer_cancel_v1),
@@ -5054,6 +5092,7 @@ impl RouterHandler for AdminRouterHandler {
             .route("/clusters", get(spa_index))
             .route("/workers", get(workers1))
             .route("/workers/:id", get(spa_index))
+            .route("/transfer-services", get(spa_index))
             // Layer order (axum applies the last added layer outermost, so it
             // runs first): console handler -> cookie auth -> cluster resolution.
             // Keeping resolution inside auth means an anonymous caller cannot

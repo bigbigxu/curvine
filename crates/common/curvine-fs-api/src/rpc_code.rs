@@ -92,6 +92,9 @@ pub enum RpcCode {
     ListJobStatus = 56,
     ReportTransferTaskBatch = 57,
     CloseFile = 58,
+    /// Per-instance transfer status. Answered by the instance itself; the
+    /// console sends it to every configured `transfer.endpoints` address.
+    GetTransferServiceInfo = 75,
 
     PrepareReplication = 65,
     ReconcileReplication = 66,

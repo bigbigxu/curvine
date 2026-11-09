@@ -214,6 +214,11 @@ impl ObservabilityService {
         &self.observability_conf
     }
 
+    /// The per-cluster transfer status cache used by discovery and the UI.
+    pub fn transfer_services_cache(&self) -> &Arc<crate::transfer_services::TransferServicesCache> {
+        self.builtin.transfer_services()
+    }
+
     pub fn builtin(&self) -> &Arc<BuiltinProvider> {
         &self.builtin
     }

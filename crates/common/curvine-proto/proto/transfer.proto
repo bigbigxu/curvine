@@ -284,3 +284,55 @@ message QueryTransferTaskResponse {
   required TransferProgressProto progress = 3;
   repeated TaskBlockLocationProto block_locations = 4;
 }
+
+// ---------------------------------------------------------------------------
+// Per-instance service status.
+//
+// Answers "what is this transfer instance doing right now" for operators. The
+// console sends this to every address in the configured `transfer.endpoints`
+// list, so that list stays the single source of truth for *which* instances
+// exist while each instance answers for itself. Every field is optional and
+// additive: an instance that predates this RPC simply fails the call, and the
+// console reports it as unreachable instead of guessing from metrics.
+// ---------------------------------------------------------------------------
+message GetTransferServiceInfoRequest {}
+
+message TransferServiceInfoResponse {
+  // Always "transfer", so a mixed fleet proves the answer came from the right role.
+  optional string role = 1;
+  // Process-unique lease owner id: changes on restart, unlike the address.
+  optional string instance_id = 2;
+  // This instance's rpc address (`hostname:rpc_port`) — the value the ring holds.
+  optional string addr = 3;
+  // This instance's web address (`hostname:web_port`), where /metrics and /healthz live.
+  optional string web_addr = 4;
+  optional string version = 5;
+  optional string version_commit = 6;
+  optional int64 start_time_ms = 7;
+  optional int64 uptime_ms = 8;
+  optional bool ready = 9;
+  // `normal` | `degraded` | `not_ready`; `state_reason` says why.
+  optional string state = 10;
+  optional string state_reason = 11;
+  optional string store_backend = 12;
+  // Dispatch ceilings currently in effect (runtime-overridable, not the file value).
+  optional uint64 max_running_transfers = 13;
+  optional uint64 worker_task_limit = 14;
+  optional uint64 max_tasks_per_transfer = 15;
+  optional uint64 max_plan_entries = 16;
+  // Store-wide job counts: identical on every instance that shares the store.
+  optional uint64 active_jobs = 17;
+  optional uint64 executing_jobs = 18;
+  // Jobs whose file-level task state lives in this process: this instance's load.
+  optional uint64 in_memory_jobs = 19;
+  optional uint64 in_memory_running_tasks = 20;
+  // Health of the master-derived worker/mount snapshot this instance plans from.
+  optional uint64 snapshot_version = 21;
+  optional int64 snapshot_updated_at = 22;
+  optional int64 snapshot_staleness_ms = 23;
+  optional uint64 snapshot_live_workers = 24;
+  optional uint64 snapshot_capable_workers = 25;
+  // The placement ring this instance is using, so a drifted config is visible.
+  optional string ring_self = 26;
+  repeated string ring_members = 27;
+}

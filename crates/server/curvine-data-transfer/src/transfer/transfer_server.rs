@@ -33,7 +33,7 @@ use crate::transfer::{
     build_transfer_runtime_registry, ClusterMetadataCache, Forwarder, MemoryTransferStore,
     MysqlTransferStore, PostgresTransferStore, SqliteTransferStore, TaskCache, TransferHandler,
     TransferMetrics, TransferPlanner, TransferRouterHandler, TransferRuntimeConfig,
-    TransferScheduler, TransferService, TransferStoreBackend,
+    TransferScheduler, TransferService, TransferServiceProbe, TransferStoreBackend,
 };
 
 #[derive(Clone)]
@@ -47,6 +47,9 @@ pub struct TransferRpcService {
     /// Layer attribution from the loader, for the config endpoint.
     config_sources: ConfigSourceMap,
     conf: Arc<ClusterConf>,
+    /// One status source for both transports (RPC `GetTransferServiceInfo`
+    /// and `GET /api/v1/transfer/info`).
+    probe: Arc<TransferServiceProbe>,
 }
 
 impl TransferRpcService {
@@ -60,6 +63,7 @@ impl TransferRpcService {
         runtime_config: Arc<RuntimeConfigRegistry>,
         conf: Arc<ClusterConf>,
         config_sources: ConfigSourceMap,
+        probe: Arc<TransferServiceProbe>,
     ) -> Self {
         Self {
             service,
@@ -70,6 +74,7 @@ impl TransferRpcService {
             runtime_config,
             config_sources,
             conf,
+            probe,
         }
     }
 }
@@ -78,7 +83,7 @@ impl HandlerService for TransferRpcService {
     type Item = TransferHandler<TransferStoreBackend>;
 
     fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
-        let handler = TransferHandler::new(self.service.clone());
+        let handler = TransferHandler::new(self.service.clone()).with_probe(self.probe.clone());
         match &self.forwarder {
             Some(forwarder) => handler.with_forwarder(forwarder.clone()),
             None => handler,
@@ -98,6 +103,7 @@ impl WebHandlerService for TransferRpcService {
             self.runtime_config.clone(),
             &self.conf,
             self.config_sources.clone(),
+            self.probe.clone(),
         )
     }
 }
@@ -207,7 +213,7 @@ impl TransferServer {
             cache.clone(),
             factory,
             fs,
-            owner,
+            owner.clone(),
             // Workers report back to whoever dispatched the task: that is the
             // lease owner and the only instance holding the job's in-memory
             // task state.
@@ -219,7 +225,10 @@ impl TransferServer {
         );
 
         let ready = Arc::new(AtomicBool::new(false));
-        let runtime_config = Arc::new(build_transfer_runtime_registry(runtime_state, &conf));
+        let runtime_config = Arc::new(build_transfer_runtime_registry(
+            runtime_state.clone(),
+            &conf,
+        ));
         let transfer_service = TransferService::with_cache_and_report_queue(
             store,
             cache.clone(),
@@ -228,6 +237,19 @@ impl TransferServer {
             conf.transfer.worker_threads,
         )?
         .with_task_cache(task_cache.clone());
+        // One probe, two transports: the RPC handler and the web router both
+        // answer `GetTransferServiceInfo` / `GET /api/v1/transfer/info` from it,
+        // so the two surfaces cannot drift apart. It clones the service, which
+        // shares the same store, report queue and task cache.
+        let probe = Arc::new(TransferServiceProbe::new(
+            owner,
+            ready.clone(),
+            store_backend,
+            transfer_service.clone(),
+            cache.clone(),
+            runtime_state,
+            Arc::new(conf.clone()),
+        ));
         let service = TransferRpcService::new(
             transfer_service,
             forwarder,
@@ -237,6 +259,7 @@ impl TransferServer {
             runtime_config,
             Arc::new(conf.clone()),
             config_sources,
+            probe,
         );
         let rpc_server =
             RpcServer::with_rt(rt.clone(), conf.transfer_server_conf(), service.clone());

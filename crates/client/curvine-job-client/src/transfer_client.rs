@@ -23,12 +23,13 @@ use curvine_model::{
 };
 use curvine_net::net::NodeAddr;
 use curvine_proto::{
-    CancelTransferRequest, CancelTransferResponse, GetTransferStatusRequest,
-    GetTransferStatusResponse, ListTransferTenantsRequest, ListTransferTenantsResponse,
-    ListTransfersRequest, ListTransfersResponse, RetryTransferRequest, SubmitTransferRequest,
-    SubmitTransferResponse, TaskBlockLocationProto, TransferProgressProto,
-    TransferTaskReportBatchRequest, TransferTaskReportBatchResponse, TransferTaskReportRequest,
-    TransferTaskReportResponse, WatchTransferRequest, WatchTransferResponse,
+    CancelTransferRequest, CancelTransferResponse, GetTransferServiceInfoRequest,
+    GetTransferStatusRequest, GetTransferStatusResponse, ListTransferTenantsRequest,
+    ListTransferTenantsResponse, ListTransfersRequest, ListTransfersResponse, RetryTransferRequest,
+    SubmitTransferRequest, SubmitTransferResponse, TaskBlockLocationProto, TransferProgressProto,
+    TransferServiceInfoResponse, TransferTaskReportBatchRequest, TransferTaskReportBatchResponse,
+    TransferTaskReportRequest, TransferTaskReportResponse, WatchTransferRequest,
+    WatchTransferResponse,
 };
 use curvine_rpc::client::ClusterConnector;
 use curvine_runtime::runtime::Runtime;
@@ -81,8 +82,48 @@ impl TransferClient {
         Self::with_endpoints(
             conf.client_rpc_conf(),
             rt,
-            transfer_endpoints_from_conf(conf),
+            configured_transfer_endpoints(conf),
         )
+    }
+
+    /// One client pinned to exactly one instance.
+    ///
+    /// Used by the console to ask every configured `transfer.endpoints` address
+    /// "how are you": a status answer must come from *that* instance, never from
+    /// whichever one wins a fan-out race.
+    pub fn with_single_endpoint(
+        conf: &ClusterConf,
+        rt: Arc<Runtime>,
+        endpoint: impl Into<String>,
+    ) -> FsResult<Self> {
+        Self::with_endpoints(conf.client_rpc_conf(), rt, vec![endpoint.into()])
+    }
+
+    /// One client pinned to one instance, built from an `FsContext`.
+    ///
+    /// Same as [`TransferClient::with_single_endpoint`] without needing a
+    /// `Runtime` handle: the console's cluster contexts hold a `UnifiedFileSystem`
+    /// and nothing else, and resolving the same endpoint for every page load must
+    /// not require a second runtime.
+    pub fn with_context_single_endpoint(
+        context: &Arc<FsContext>,
+        endpoint: impl Into<String>,
+    ) -> FsResult<Self> {
+        Self::with_endpoints(
+            context.conf().client_rpc_conf(),
+            context.clone_runtime(),
+            vec![endpoint.into()],
+        )
+    }
+
+    /// Asks this instance for its own status.
+    pub async fn service_info(&self) -> FsResult<TransferServiceInfoResponse> {
+        self.connector
+            .proto_rpc::<_, TransferServiceInfoResponse, FsError>(
+                RpcCode::GetTransferServiceInfo,
+                GetTransferServiceInfoRequest {},
+            )
+            .await
     }
 
     fn with_endpoints(
@@ -307,7 +348,12 @@ fn transfer_endpoints(context: &Arc<FsContext>) -> Vec<String> {
     transfer_endpoints_from_conf(context.conf())
 }
 
-fn transfer_endpoints_from_conf(conf: &ClusterConf) -> Vec<String> {
+/// The instance list this configuration points at.
+///
+/// `transfer.endpoints` is authoritative (there is no registry or heartbeat);
+/// an empty list means a single-instance deployment that never configured one,
+/// which [`TransferConf::init`] already normalizes to its own `hostname:rpc_port`.
+pub fn configured_transfer_endpoints(conf: &ClusterConf) -> Vec<String> {
     if conf.transfer.endpoints.is_empty() {
         vec![format!(
             "{}:{}",
@@ -316,6 +362,10 @@ fn transfer_endpoints_from_conf(conf: &ClusterConf) -> Vec<String> {
     } else {
         conf.transfer.endpoints.clone()
     }
+}
+
+fn transfer_endpoints_from_conf(conf: &ClusterConf) -> Vec<String> {
+    configured_transfer_endpoints(conf)
 }
 
 fn transfer_kind_code(kind: TransferKind) -> i32 {

@@ -7,6 +7,7 @@ import browse from './modules/browse.en'
 import mounts from './modules/mounts.en'
 import jobs from './modules/jobs.en'
 import transfers from './modules/transfers.en'
+import transferServices from './modules/transfer-services.en'
 import syncJobs from './modules/sync-jobs.en'
 import observability from './modules/observability.en'
 import operations from './modules/operations.en'
@@ -23,6 +24,7 @@ export default {
   ...mounts,
   ...jobs,
   ...transfers,
+  ...transferServices,
   ...syncJobs,
   ...observability,
   ...operations,

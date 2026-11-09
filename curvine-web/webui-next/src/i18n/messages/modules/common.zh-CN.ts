@@ -97,6 +97,8 @@ export default {
     browseSubtitle: '浏览路径、查看状态与块分布',
     workers: 'Worker',
     workersSubtitle: 'Worker 状态、心跳与容量使用',
+    transferServices: 'Transfer 服务',
+    transferServicesSubtitle: '每个 transfer 实例的状态、版本与当前负载',
     observability: '可观测性',
     observabilitySubtitle: '内置指标采集、目标与图表',
     operations: '平台健康',

@@ -139,24 +139,111 @@ pub fn discover_fuse_targets(conf: &ClusterConf) -> Vec<MetricTarget> {
         .collect()
 }
 
-pub fn discover_transfer_targets(conf: &ClusterConf) -> Vec<MetricTarget> {
+/// Scrape targets for every configured transfer instance.
+///
+/// `transfer.endpoints` only carries RPC ports, so the web port each instance
+/// scraper needs is asked for rather than configured: one
+/// `GetTransferServiceInfo` per instance, the same call the Runtime page makes.
+/// An instance that does not answer cannot report a port, so it falls back to
+/// the console's own `transfer.web_port` — the URL then fails to scrape, which
+/// is the honest outcome for an instance that is down.
+pub async fn discover_transfer_targets(
+    conf: &ClusterConf,
+    unified_fs: &UnifiedFileSystem,
+    cache: &crate::transfer_services::TransferServicesCache,
+) -> Vec<MetricTarget> {
     if !conf.transfer.enabled {
         return Vec::new();
     }
-    let configured = conf.transfer.hostname.trim();
-    let hostname = if configured.is_empty() {
-        "127.0.0.1".to_string()
+    let instances = cache.instances(conf, unified_fs.fs_context()).await;
+    transfer_targets_from_instances(conf, &instances)
+}
+
+/// Pure mapping from probe answers to scrape targets.
+///
+/// Split out so the address rules — reported web address, bind-all hosts, and
+/// the down-instance fallback — are testable without a live transfer service.
+pub fn transfer_targets_from_instances(
+    conf: &ClusterConf,
+    instances: &[crate::transfer_services::TransferInstanceStatus],
+) -> Vec<MetricTarget> {
+    if !conf.transfer.enabled {
+        return Vec::new();
+    }
+    let mut targets: Vec<MetricTarget> = Vec::new();
+    for status in instances {
+        let instance = transfer_metrics_addr(
+            status.reported_addr(),
+            status
+                .info
+                .as_ref()
+                .and_then(|info| info.web_addr.as_deref()),
+            conf.transfer.web_port,
+        );
+        if targets.iter().any(|target| target.instance == instance) {
+            continue;
+        }
+        let url = format!("http://{instance}/metrics");
+        targets.push(MetricTarget::transfer(instance, url));
+    }
+    targets
+}
+
+/// `host:port` a scraper can actually reach.
+///
+/// The instance reports its own `web_addr`, but its hostname may be a bind-all
+/// address (`0.0.0.0`, `::`) chosen so the process can listen on every
+/// interface. Scraping that is meaningless, so the host comes from the endpoint
+/// the console connected to — which is by definition reachable from here — while
+/// the port comes from the answer, because it differs per instance.
+fn transfer_metrics_addr(endpoint: &str, web_addr: Option<&str>, fallback_port: u16) -> String {
+    let (endpoint_host, _) = split_host_port(endpoint);
+    let (web_host, web_port) = split_host_port(web_addr.unwrap_or(""));
+    let host = if web_host.is_empty() || is_bind_all(&web_host) {
+        endpoint_host
     } else {
-        configured.to_string()
+        web_host
     };
-    let instance = format!("{hostname}:{}", conf.transfer.web_port);
-    let url = format!("http://{instance}/metrics");
-    vec![MetricTarget::transfer(instance, url)]
+    let port = web_port.unwrap_or(fallback_port);
+    format!("{host}:{port}")
+}
+
+/// Splits `host:port`, tolerating bracketed IPv6 and a missing port.
+fn split_host_port(value: &str) -> (String, Option<u16>) {
+    let value = value.trim();
+    if value.is_empty() {
+        return (String::new(), None);
+    }
+    // `[::1]:9011`: the colon inside the brackets is not the separator.
+    if let Some(rest) = value.strip_prefix('[') {
+        if let Some((host, tail)) = rest.split_once(']') {
+            let port = tail.strip_prefix(':').and_then(|port| port.parse().ok());
+            return (host.to_string(), port);
+        }
+    }
+    // More than one colon means an unbracketed IPv6 literal (`::1`), which has no
+    // port to split off: every colon belongs to the address.
+    if value.matches(':').count() > 1 {
+        return (value.to_string(), None);
+    }
+    match value.rsplit_once(':') {
+        Some((host, port)) => match port.parse() {
+            Ok(port) => (host.to_string(), Some(port)),
+            // Not a port: the whole value is a host.
+            Err(_) => (value.to_string(), None),
+        },
+        None => (value.to_string(), None),
+    }
+}
+
+fn is_bind_all(host: &str) -> bool {
+    matches!(host, "0.0.0.0" | "::" | "[::]" | "*")
 }
 
 pub async fn discover_targets(
     conf: &ClusterConf,
     unified_fs: &UnifiedFileSystem,
+    transfer_cache: &crate::transfer_services::TransferServicesCache,
 ) -> DiscoveryResult {
     match timeout(
         Duration::from_secs(MASTER_INFO_TIMEOUT_SECS),
@@ -175,7 +262,7 @@ pub async fn discover_targets(
             },
             workers: discover_workers_from_master_info(&info, conf),
             fuses: discover_fuse_targets(conf),
-            transfers: discover_transfer_targets(conf),
+            transfers: discover_transfer_targets(conf, unified_fs, transfer_cache).await,
             master_info: Some(info),
         },
         Ok(Err(err)) => DiscoveryResult {
@@ -185,7 +272,7 @@ pub async fn discover_targets(
             },
             workers: Vec::new(),
             fuses: discover_fuse_targets(conf),
-            transfers: discover_transfer_targets(conf),
+            transfers: discover_transfer_targets(conf, unified_fs, transfer_cache).await,
             master_info: None,
         },
         Err(_) => DiscoveryResult {
@@ -197,7 +284,7 @@ pub async fn discover_targets(
             },
             workers: Vec::new(),
             fuses: discover_fuse_targets(conf),
-            transfers: discover_transfer_targets(conf),
+            transfers: discover_transfer_targets(conf, unified_fs, transfer_cache).await,
             master_info: None,
         },
     }
@@ -403,51 +490,111 @@ mod tests {
         assert_eq!(targets[0].instance, "10.0.0.9:9002");
     }
 
-    #[test]
-    fn discovers_no_transfer_target_when_disabled_by_default() {
-        let conf = test_conf();
-        assert!(!conf.transfer.enabled);
-        assert!(discover_transfer_targets(&conf).is_empty());
+    fn transfer_status(
+        addr: &str,
+        web_addr: Option<&str>,
+    ) -> crate::transfer_services::TransferInstanceStatus {
+        crate::transfer_services::TransferInstanceStatus {
+            addr: addr.to_string(),
+            reachable: web_addr.is_some(),
+            error: web_addr.is_none().then(|| "no answer".to_string()),
+            info: web_addr.map(|web_addr| curvine_proto::TransferServiceInfoResponse {
+                role: Some("transfer".to_string()),
+                addr: Some(addr.to_string()),
+                web_addr: Some(web_addr.to_string()),
+                ..Default::default()
+            }),
+        }
     }
 
     #[test]
-    fn discovers_transfer_target_from_config() {
+    fn discovers_no_transfer_target_when_disabled() {
+        let mut conf = test_conf();
+        conf.transfer.enabled = false;
+        assert!(transfer_targets_from_instances(&conf, &[]).is_empty());
+        // Enabled instances still produce nothing while transfer is off: the
+        // console must not scrape a service the cluster does not run.
+        let instances = vec![transfer_status(
+            "cv-transfer-0:9010",
+            Some("cv-transfer-0:9011"),
+        )];
+        assert!(transfer_targets_from_instances(&conf, &instances).is_empty());
+    }
+
+    #[test]
+    fn discovers_one_target_per_configured_instance() {
         let mut conf = test_conf();
         conf.transfer.enabled = true;
-        conf.transfer.hostname = "cv-transfer-0".to_string();
-        conf.transfer.web_port = 9011;
-        let targets = discover_transfer_targets(&conf);
-        assert_eq!(targets.len(), 1);
+        let instances = vec![
+            transfer_status("cv-transfer-0:9010", Some("cv-transfer-0:9011")),
+            transfer_status("10.0.0.9:9010", Some("10.0.0.9:9021")),
+            transfer_status(
+                "cv-transfer-1.svc.local:9010",
+                Some("cv-transfer-1.svc.local:9011"),
+            ),
+        ];
+        let targets = transfer_targets_from_instances(&conf, &instances);
+        assert_eq!(targets.len(), 3);
         assert_eq!(targets[0].component, "transfer");
-        assert_eq!(targets[0].instance, "cv-transfer-0:9011");
-        assert_eq!(targets[0].url, "http://cv-transfer-0:9011/metrics");
         assert_eq!(targets[0].id, "transfer:cv-transfer-0:9011");
+        assert_eq!(targets[0].url, "http://cv-transfer-0:9011/metrics");
+        // The port comes from the instance, not from this console's config.
+        assert_eq!(targets[1].instance, "10.0.0.9:9021");
+        assert_eq!(
+            targets[2].url,
+            "http://cv-transfer-1.svc.local:9011/metrics"
+        );
     }
 
     #[test]
-    fn discovers_transfer_target_preserves_ip_literal_host() {
+    fn replaces_a_bind_all_host_with_the_configured_endpoint_host() {
+        // `hostname = 0.0.0.0` is a legal listen address but a useless scrape
+        // target, so the host comes from the endpoint the console connected to.
         let mut conf = test_conf();
         conf.transfer.enabled = true;
-        conf.transfer.hostname = "10.0.0.9".to_string();
-        conf.transfer.web_port = 9011;
-        let targets = discover_transfer_targets(&conf);
-        assert_eq!(targets.len(), 1);
+        let instances = vec![transfer_status("10.0.0.9:9010", Some("0.0.0.0:9011"))];
+        let targets = transfer_targets_from_instances(&conf, &instances);
         assert_eq!(targets[0].instance, "10.0.0.9:9011");
         assert_eq!(targets[0].url, "http://10.0.0.9:9011/metrics");
     }
 
     #[test]
-    fn discovers_transfer_target_preserves_fqdn_host() {
+    fn a_silent_instance_still_gets_a_target() {
+        // No answer means no reported port: keep the row visible with the
+        // configured web port so the failure surfaces as up=0 rather than as a
+        // silently missing instance.
         let mut conf = test_conf();
         conf.transfer.enabled = true;
-        conf.transfer.hostname = "cv-transfer-0.svc.local".to_string();
         conf.transfer.web_port = 9011;
-        let targets = discover_transfer_targets(&conf);
+        let instances = vec![transfer_status("10.0.0.9:9010", None)];
+        let targets = transfer_targets_from_instances(&conf, &instances);
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].instance, "cv-transfer-0.svc.local:9011");
+        assert_eq!(targets[0].instance, "10.0.0.9:9011");
+    }
+
+    #[test]
+    fn duplicate_instances_collapse_into_one_target() {
+        let mut conf = test_conf();
+        conf.transfer.enabled = true;
+        let instances = vec![
+            transfer_status("cv-transfer-0:9010", Some("cv-transfer-0:9011")),
+            transfer_status("cv-transfer-0:9010", Some("cv-transfer-0:9011")),
+        ];
+        assert_eq!(transfer_targets_from_instances(&conf, &instances).len(), 1);
+    }
+
+    #[test]
+    fn parses_host_and_port_for_every_address_shape() {
         assert_eq!(
-            targets[0].url,
-            "http://cv-transfer-0.svc.local:9011/metrics"
+            split_host_port("host:9011"),
+            ("host".to_string(), Some(9011))
         );
+        assert_eq!(split_host_port("host"), ("host".to_string(), None));
+        assert_eq!(
+            split_host_port("[::1]:9011"),
+            ("::1".to_string(), Some(9011))
+        );
+        assert_eq!(split_host_port("::1"), ("::1".to_string(), None));
+        assert_eq!(split_host_port(""), (String::new(), None));
     }
 }

@@ -3236,6 +3236,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "curvine-client-core",
  "curvine-config",
  "curvine-core-error",
  "curvine-error",
