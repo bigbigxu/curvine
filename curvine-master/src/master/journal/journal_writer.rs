@@ -487,20 +487,6 @@ impl JournalWriter {
         Ok(())
     }
 
-    pub fn log_ufs_deferred(&self, entry: UfsDeferredEntry) -> FsResult<()> {
-        if !self.enable {
-            return Ok(());
-        }
-        if self.recovery.rejects_writes() {
-            return Err(FsError::journal_unavailable(
-                "journal writer is not accepting writes",
-            ));
-        }
-        self.metrics.journal_queue_len.inc();
-        self.sender.send(JournalEntry::UfsDeferred(entry))?;
-        Ok(())
-    }
-
     pub fn log_set_locks(&self, fs_dir: &FsDir, ino: i64, locks: Vec<FileLock>) -> FsResult<()> {
         let entry = SetLocksEntry {
             op_id: fs_dir.next_op_id(),

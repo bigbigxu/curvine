@@ -15,9 +15,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::master::fs::MasterFilesystem;
-use crate::master::journal::recovery::{
-    classify_apply_error, should_defer_ufs, ApplyDisposition, RecoveryGate,
-};
+use crate::master::journal::recovery::{classify_apply_error, ApplyDisposition, RecoveryGate};
 use crate::master::journal::*;
 use crate::master::meta::inode::InodeView::File;
 use crate::master::meta::inode::{InodePath, InodeView};
@@ -41,19 +39,10 @@ use raft::eraftpb::{Entry, EntryType};
 use raft::StateRole;
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use std::{fs, mem};
-use tokio::sync::Notify;
-
-enum UfsDrive {
-    CaughtUp,
-    Advanced,
-    WaitWorkers,
-    Retry(String),
-    Stopped,
-}
 
 // Replay the master metadata operation log.
 #[derive(Clone)]
@@ -64,10 +53,7 @@ pub struct JournalLoader {
     journal_writer: Arc<JournalWriter>,
     ufs_loader: UfsLoader,
     worker_manager: SyncWorkerManager,
-    worker_notify: Arc<Notify>,
     recovery: RecoveryGate,
-    is_leader: Arc<AtomicBool>,
-    ufs_wake: Arc<Notify>,
     log_store: RocksLogStorage,
     sender: AsyncSender<ApplyMsg>,
     fsm_state: Arc<Mutex<FsmState>>,
@@ -166,7 +152,6 @@ impl JournalLoader {
 
         let ufs_loader = UfsLoader::new(job_manager, fs_dir.clone(), conf);
         let (sender, receiver) = AsyncChannel::new(conf.writer_channel_size).split();
-        let worker_notify = worker_manager.read().registered_notify();
         let loader = Self {
             node_id: conf.node_id()?,
             fs_dir,
@@ -174,10 +159,7 @@ impl JournalLoader {
             journal_writer,
             ufs_loader,
             worker_manager,
-            worker_notify,
             recovery,
-            is_leader: Arc::new(AtomicBool::new(false)),
-            ufs_wake: Arc::new(Notify::new()),
             log_store,
             sender,
             fsm_state: Arc::new(Mutex::new(FsmState::default())),
@@ -197,10 +179,6 @@ impl JournalLoader {
             let apply_loader = loader.clone();
             rt.spawn(async move {
                 Self::run_apply(apply_loader, receiver).await;
-            });
-            let replay_loader = loader.clone();
-            rt.spawn(async move {
-                replay_loader.run_ufs_replay().await;
             });
         }
 
@@ -222,31 +200,34 @@ impl JournalLoader {
         &self,
         is_leader: bool,
         applied: AppliedIndex,
-        _has_ufs_affecting: bool,
+        has_ufs_affecting: bool,
     ) -> CommonResult<()> {
-        // Metadata and UFS watermarks move independently. UFS success is
-        // recorded by the replay coordinator, not by this apply path.
-        let mut state = self.fsm_state()?;
-        state.applied = applied;
-        self.refresh_fsm_metrics(&state);
-        drop(state);
-        self.hard_state_changed(&self.log_store.hard_state());
-        if is_leader {
-            self.ufs_wake.notify_one();
-        }
-        Ok(())
-    }
-
-    fn commit_ufs_progress(&self, applied: AppliedIndex, log_marker: bool) -> CommonResult<()> {
-        if log_marker {
+        // The leader runs the UFS side effect inline with the metadata op, so a
+        // completed apply moves both watermarks together and records the marker
+        // followers replay.
+        if is_leader && has_ufs_affecting {
             self.journal_writer
                 .log_ufs_applied(applied.op_id, applied.term, applied.index)?;
         }
+
         let mut state = self.fsm_state()?;
-        if applied.index >= state.ufs_applied.index {
-            state.ufs_applied = applied;
+        if is_leader {
+            state.ufs_applied = applied.clone();
+            state.applied = applied;
+        } else {
+            state.applied = applied;
         }
+
+        if is_leader {
+            let caught_up = state.ufs_applied.index >= state.applied.index;
+            self.recovery.set_ufs_caught_up(caught_up);
+            self.recovery
+                .set_pending(state.applied.index.saturating_sub(state.ufs_applied.index));
+        }
+
         self.refresh_fsm_metrics(&state);
+        drop(state);
+        self.hard_state_changed(&self.log_store.hard_state());
         Ok(())
     }
 
@@ -278,7 +259,11 @@ impl JournalLoader {
     /// under `ignore_reply_error` both need the watermark to move so that
     /// replay can continue past them.
     fn advance_watermark(&self, is_leader: bool, cur: FsmState, entry: &Entry) -> CommonResult<()> {
-        let mut applied = cur.applied;
+        let mut applied = if is_leader {
+            cur.ufs_applied
+        } else {
+            cur.applied
+        };
         applied.term = entry.term;
         applied.index = entry.index;
         self.set_applied(is_leader, applied, false)
@@ -294,9 +279,9 @@ impl JournalLoader {
         }
 
         if is_leader {
-            // The leader already applied this metadata in the RPC handler, or
-            // catch-up did. UFS side effects run on the coordinator.
-            Ok(())
+            // The leader already applied this metadata in the RPC handler; the
+            // UFS side effect is the part replay owes here.
+            self.ufs_loader.apply_entry(entry).await
         } else {
             self.apply_entry(entry.clone())
         }
@@ -390,32 +375,17 @@ impl JournalLoader {
 
         if let Some(e) = snapshot {
             let spent = TimeSpent::new();
-            // A leader snapshot claims every entry up to `applied` and lets the
-            // log drop them. If the UFS replay is behind, those entries are
-            // still owed a copy: publishing this snapshot would delete them and
-            // strand the replay forever. Skip it and keep the log.
-            let state = self.fsm_state_snapshot()?;
-            if !state.ufs_replay_caught_up() {
-                info!(
-                    "skip leader snapshot {}: UFS replay at i{} is behind applied i{}",
-                    e.dir, state.ufs_applied.index, state.applied.index
-                );
-                if let Err(err) = self.purge_checkpoint(&e.dir) {
-                    warn!("purge skipped leader snapshot {}: {}", e.dir, err);
-                }
-            } else {
-                let snap_data = self.create_snapshot0(Some(e.dir.to_string()))?;
+            let snap_data = self.create_snapshot0(Some(e.dir.to_string()))?;
 
-                self.log_store.create_snapshot(snap_data.clone())?;
-                self.log_store.compact(snap_data.fsm_state.compact())?;
+            self.log_store.create_snapshot(snap_data.clone())?;
+            self.log_store.compact(snap_data.fsm_state.compact())?;
 
-                info!(
-                    "create leader snapshot, dir={}, cost={}ms, fsm_state={:?}",
-                    e.dir,
-                    spent.used_ms(),
-                    snap_data.fsm_state
-                );
-            }
+            info!(
+                "create leader snapshot, dir={}, cost={}ms, fsm_state={:?}",
+                e.dir,
+                spent.used_ms(),
+                snap_data.fsm_state
+            );
         }
 
         Ok(())
@@ -497,25 +467,8 @@ impl JournalLoader {
         }
         Ok(())
     }
-    fn publish_leadership(&self, is_leader: bool) {
-        self.is_leader.store(is_leader, Ordering::Release);
-        self.recovery.bump_generation();
-        if is_leader {
-            let caught_up = self
-                .fsm_state_snapshot()
-                .map(|state| {
-                    state.ufs_applied.index >= state.applied.index
-                        && self.deferred_ufs_count().unwrap_or(1) == 0
-                })
-                .unwrap_or(false);
-            self.recovery.set_ufs_caught_up(caught_up);
-            if !caught_up {
-                self.recovery.set_pending(1);
-            }
-        } else {
-            self.recovery.set_ufs_caught_up(false);
-        }
-        self.ufs_wake.notify_one();
+    fn get_ufs_applied(&self) -> CommonResult<AppliedIndex> {
+        Ok(self.fsm_state()?.ufs_applied.clone())
     }
 
     async fn run_apply(self, mut receiver: AsyncReceiver<ApplyMsg>) {
@@ -590,13 +543,18 @@ impl JournalLoader {
                 ApplyMsg::RoleChange((role, tx)) => {
                     let result = async {
                         if role == StateRole::Leader {
+                            // Publish leadership only after committed namespace
+                            // mutations have advanced local metadata high-water marks.
                             self.catch_up_committed_metadata().await?;
                             is_leader = true;
-                            self.publish_leadership(true);
-                            info!("metadata caught up for leader promotion; UFS replay continues in the background");
+                            let ufs_applied = self.get_ufs_applied()?;
+                            info!(
+                                "metadata caught up for leader promotion, scheduling UFS replay from {:?}",
+                                ufs_applied
+                            );
+                            retry_msg.replace(ApplyMsg::new_scan(ufs_applied));
                         } else {
                             is_leader = false;
-                            self.publish_leadership(false);
                         }
                         Ok(())
                     }
@@ -647,398 +605,6 @@ impl JournalLoader {
                 }
             }
         }
-    }
-
-    fn record_ufs_progress(&self, drive: &UfsDrive) {
-        match drive {
-            UfsDrive::CaughtUp => {
-                if self.deferred_ufs_count().unwrap_or(1) == 0 {
-                    self.recovery.set_pending(0);
-                    self.recovery.set_ufs_caught_up(true);
-                } else {
-                    self.recovery
-                        .set_pending(self.deferred_ufs_count().unwrap_or(1));
-                    self.recovery.set_ufs_caught_up(false);
-                }
-            }
-            UfsDrive::Advanced | UfsDrive::WaitWorkers | UfsDrive::Retry(_) => {
-                self.recovery.set_ufs_caught_up(false);
-            }
-            UfsDrive::Stopped => {}
-        }
-    }
-
-    fn live_worker_count(&self) -> usize {
-        self.worker_manager.read().live_worker_count()
-    }
-
-    async fn run_ufs_replay(self) {
-        let mut failures: u64 = 0;
-        let mut logged_skip_ignored = false;
-        loop {
-            if self.recovery.is_safe_mode() {
-                tokio::time::sleep(self.retry_interval).await;
-                continue;
-            }
-            if !self.is_leader.load(Ordering::Acquire) {
-                self.recovery.set_ufs_caught_up(false);
-                self.ufs_wake.notified().await;
-                continue;
-            }
-            let generation = self.recovery.generation();
-            let drive = self.drive_ufs_once(generation).await;
-            self.record_ufs_progress(&drive);
-            match drive {
-                UfsDrive::CaughtUp => {
-                    failures = 0;
-                    tokio::select! {
-                        _ = self.ufs_wake.notified() => {}
-                        _ = self.worker_notify.notified() => {}
-                        _ = tokio::time::sleep(self.retry_interval) => {}
-                    }
-                }
-                UfsDrive::Advanced => {
-                    failures = 0;
-                }
-                UfsDrive::WaitWorkers => {
-                    self.recovery.note_error("No workers available");
-                    tokio::select! {
-                        _ = self.worker_notify.notified() => {}
-                        _ = self.ufs_wake.notified() => {}
-                        _ = tokio::time::sleep(self.retry_interval) => {}
-                    }
-                }
-                UfsDrive::Retry(message) => {
-                    failures = failures.saturating_add(1);
-                    self.recovery.note_error(&message);
-                    if should_defer_ufs(&message, failures, self.max_retry_num) {
-                        match self.defer_current_ufs(generation, &message).await {
-                            Ok(true) => {
-                                failures = 0;
-                                self.recovery.set_ufs_caught_up(false);
-                                warn!(
-                                    "UFS op recorded in metadata and removed from the replay cursor: {message}"
-                                );
-                                continue;
-                            }
-                            Ok(false) => {}
-                            Err(e) => self.recovery.note_error(&e.to_string()),
-                        }
-                    }
-                    if !logged_skip_ignored
-                        && self.skip_failed_ufs_replay_after_retry
-                        && failures >= self.max_retry_num
-                    {
-                        error!(
-                            "UFS replay still failing after {} attempts; continuing to retry without abort or skip: {}",
-                            self.max_retry_num, message
-                        );
-                        logged_skip_ignored = true;
-                    } else {
-                        warn!("UFS replay retry: {message}");
-                    }
-                    tokio::select! {
-                        _ = self.ufs_wake.notified() => {}
-                        _ = self.worker_notify.notified() => {}
-                        _ = tokio::time::sleep(self.retry_interval) => {}
-                    }
-                }
-                UfsDrive::Stopped => {}
-            }
-        }
-    }
-
-    async fn drive_ufs_once(&self, generation: u64) -> UfsDrive {
-        if generation != self.recovery.generation() || !self.is_leader.load(Ordering::Acquire) {
-            return UfsDrive::Stopped;
-        }
-        let state = match self.fsm_state_snapshot() {
-            Ok(state) => state,
-            Err(e) => return UfsDrive::Retry(e.to_string()),
-        };
-        let target = state.applied.index;
-        let cursor = state.ufs_applied.index;
-        if cursor >= target {
-            return self.drive_deferred(generation).await;
-        }
-        let list = match self.log_store.scan_entries(cursor + 1, cursor + 2) {
-            Ok(list) => list,
-            Err(e) => {
-                let message = e.to_string();
-                if classify_apply_error(&message) == ApplyDisposition::EnterSafeMode {
-                    self.recovery.enter_safe_mode(&message);
-                    return UfsDrive::Stopped;
-                }
-                return UfsDrive::Retry(message);
-            }
-        };
-        let Some(entry) = list.into_iter().next() else {
-            // A snapshot can advance past this cursor, deleting the entries the
-            // replay still needs. Waiting forever blocks every later checkpoint
-            // and grows the journal without bound, so the cluster never recovers
-            // on its own. Skip the range that is already gone and record the new
-            // watermark so followers apply the same position.
-            let first = match raft::Storage::first_index(&self.log_store) {
-                Ok(first) => first,
-                Err(e) => return UfsDrive::Retry(e.to_string()),
-            };
-            if cursor + 1 < first {
-                error!(
-                    "UFS replay skips entries {}..{} already discarded by a snapshot",
-                    cursor + 1,
-                    first
-                );
-                let mut applied = state.ufs_applied.clone();
-                applied.index = first - 1;
-                return self.finish_ufs_entry(&Entry::default(), generation, applied, true);
-            }
-            return UfsDrive::Retry(format!("ufs replay waiting for log entry {}", cursor + 1));
-        };
-        if entry.index > target {
-            return UfsDrive::CaughtUp;
-        }
-        if entry.get_entry_type() != EntryType::EntryNormal || entry.data.is_empty() {
-            return self.finish_ufs_entry(
-                &entry,
-                generation,
-                AppliedIndex {
-                    term: entry.term,
-                    index: entry.index,
-                    ..Default::default()
-                },
-                false,
-            );
-        }
-        let batch = match JournalBatch::decode(&entry.data) {
-            Ok(batch) => batch,
-            Err(e) if self.ignore_reply_error => {
-                warn!(
-                    "skip failed journal batch during UFS replay, entry index={}, error={}",
-                    entry.index, e
-                );
-                return self.finish_ufs_entry(
-                    &entry,
-                    generation,
-                    AppliedIndex {
-                        term: entry.term,
-                        index: entry.index,
-                        ..Default::default()
-                    },
-                    false,
-                );
-            }
-            Err(e) => {
-                self.recovery.enter_safe_mode(&e.to_string());
-                return UfsDrive::Stopped;
-            }
-        };
-
-        let mut applied = AppliedIndex {
-            term: entry.term,
-            index: entry.index,
-            ..Default::default()
-        };
-        let mut ufs_ops = Vec::new();
-        let mut needs_worker = false;
-        for op in batch.batch {
-            applied.op_id = op.op_id();
-            applied.rpc_id = op.rpc_id();
-            if self.ufs_loader.needs_worker(&op) {
-                needs_worker = true;
-            }
-            if op.affects_ufs() {
-                ufs_ops.push(op);
-            }
-        }
-        if needs_worker && self.live_worker_count() == 0 {
-            self.recovery.set_pending(target.saturating_sub(cursor));
-            return UfsDrive::WaitWorkers;
-        }
-        // Transfer mode merges the entry's consecutive CompleteFile exports into
-        // one submit, flushed before the next namespace op so copies are
-        // enqueued in journal order.
-        let mut exports = Vec::new();
-        for op in &ufs_ops {
-            if generation != self.recovery.generation() || !self.is_leader.load(Ordering::Acquire) {
-                return UfsDrive::Stopped;
-            }
-            let result = match op {
-                JournalEntry::CompleteFile(e) if self.ufs_loader.transfer_enabled() => {
-                    match self.ufs_loader.fs_mode_export(e) {
-                        Ok(export) => {
-                            exports.extend(export);
-                            Ok(())
-                        }
-                        Err(err) => Err(err.into()),
-                    }
-                }
-                _ => {
-                    self.ufs_loader
-                        .submit_fs_mode_exports(mem::take(&mut exports))
-                        .await;
-                    self.ufs_loader.apply_entry(op).await
-                }
-            };
-            if let Err(e) = result {
-                let message = e.to_string();
-                if classify_apply_error(&message) == ApplyDisposition::EnterSafeMode {
-                    self.recovery.enter_safe_mode(&message);
-                    return UfsDrive::Stopped;
-                }
-                self.recovery.set_pending(target.saturating_sub(cursor));
-                return UfsDrive::Retry(message);
-            }
-        }
-        self.ufs_loader.submit_fs_mode_exports(exports).await;
-        self.finish_ufs_entry(&entry, generation, applied, !ufs_ops.is_empty())
-    }
-
-    fn finish_ufs_entry(
-        &self,
-        _entry: &Entry,
-        generation: u64,
-        applied: AppliedIndex,
-        log_marker: bool,
-    ) -> UfsDrive {
-        if generation != self.recovery.generation() || !self.is_leader.load(Ordering::Acquire) {
-            return UfsDrive::Stopped;
-        }
-        match self.commit_ufs_progress(applied, log_marker) {
-            Ok(()) => UfsDrive::Advanced,
-            Err(e) => UfsDrive::Retry(e.to_string()),
-        }
-    }
-
-    fn encode_deferred_ops(ops: Vec<JournalEntry>) -> CommonResult<Vec<u8>> {
-        let mut batch = JournalBatch::new(0);
-        for op in ops {
-            batch.push(op);
-        }
-        batch.encode()
-    }
-
-    fn decode_deferred_ops(payload: &[u8]) -> CommonResult<Vec<JournalEntry>> {
-        Ok(JournalBatch::decode(payload)?.batch)
-    }
-
-    fn deferred_ufs_count(&self) -> CommonResult<u64> {
-        Ok(self.deferred_ufs_records()?.len() as u64)
-    }
-
-    fn deferred_ufs_records(&self) -> CommonResult<Vec<(u64, Vec<u8>)>> {
-        let fs_dir = self.fs_dir.read();
-        fs_dir.store.store().ufs_deferred_records()
-    }
-
-    fn put_deferred_ufs(&self, index: u64, payload: &[u8]) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.read();
-        fs_dir.store.store().put_ufs_deferred(index, payload)
-    }
-
-    fn delete_deferred_ufs(&self, index: u64) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.read();
-        fs_dir.store.store().delete_ufs_deferred(index)
-    }
-
-    /// Copy the current log entry's UFS ops into the metadata store and move
-    /// the replay cursor past them. Catch-up stays false while the record exists.
-    async fn defer_current_ufs(&self, generation: u64, error: &str) -> CommonResult<bool> {
-        if generation != self.recovery.generation() || !self.is_leader.load(Ordering::Acquire) {
-            return Ok(false);
-        }
-        let state = self.fsm_state_snapshot()?;
-        if state.ufs_applied.index >= state.applied.index {
-            return Ok(false);
-        }
-        let list = self
-            .log_store
-            .scan_entries(state.ufs_applied.index + 1, state.ufs_applied.index + 2)?;
-        let Some(entry) = list.into_iter().next() else {
-            return Ok(false);
-        };
-        let batch = JournalBatch::decode(&entry.data)?;
-        let ufs_ops: Vec<JournalEntry> = batch
-            .batch
-            .into_iter()
-            .filter(|op| op.affects_ufs())
-            .collect();
-        if ufs_ops.is_empty() {
-            self.commit_ufs_progress(
-                AppliedIndex {
-                    term: entry.term,
-                    index: entry.index,
-                    ..Default::default()
-                },
-                false,
-            )?;
-            return Ok(true);
-        }
-        let op_id = ufs_ops.last().expect("ufs ops is non-empty").op_id();
-        let rpc_id = ufs_ops.last().expect("ufs ops is non-empty").rpc_id();
-        let payload = Self::encode_deferred_ops(ufs_ops)?;
-        self.put_deferred_ufs(entry.index, &payload)?;
-        self.journal_writer.log_ufs_deferred(UfsDeferredEntry {
-            op_id,
-            rpc_id,
-            term: entry.term,
-            index: entry.index,
-            error: error.to_string(),
-            payload,
-        })?;
-        self.commit_ufs_progress(
-            AppliedIndex {
-                op_id,
-                rpc_id,
-                term: entry.term,
-                index: entry.index,
-            },
-            false,
-        )?;
-        self.recovery
-            .set_pending(self.deferred_ufs_count().unwrap_or(1));
-        self.recovery.set_ufs_caught_up(false);
-        Ok(true)
-    }
-
-    async fn drive_deferred(&self, generation: u64) -> UfsDrive {
-        if generation != self.recovery.generation() || !self.is_leader.load(Ordering::Acquire) {
-            return UfsDrive::Stopped;
-        }
-        let records = match self.deferred_ufs_records() {
-            Ok(records) => records,
-            Err(e) => return UfsDrive::Retry(e.to_string()),
-        };
-        let Some((index, payload)) = records.into_iter().next() else {
-            return UfsDrive::CaughtUp;
-        };
-        let ops: Vec<JournalEntry> = match Self::decode_deferred_ops(&payload) {
-            Ok(ops) => ops,
-            Err(e) => {
-                self.recovery.enter_safe_mode(&e.to_string());
-                return UfsDrive::Stopped;
-            }
-        };
-        if ops.iter().any(|op| self.ufs_loader.needs_worker(op)) && self.live_worker_count() == 0 {
-            self.recovery.set_pending(1);
-            return UfsDrive::WaitWorkers;
-        }
-        for op in &ops {
-            if generation != self.recovery.generation() || !self.is_leader.load(Ordering::Acquire) {
-                return UfsDrive::Stopped;
-            }
-            if let Err(e) = self.ufs_loader.apply_entry(op).await {
-                let message = e.to_string();
-                if classify_apply_error(&message) == ApplyDisposition::EnterSafeMode {
-                    self.recovery.enter_safe_mode(&message);
-                    return UfsDrive::Stopped;
-                }
-                return UfsDrive::Retry(message);
-            }
-        }
-        if let Err(e) = self.delete_deferred_ufs(index) {
-            return UfsDrive::Retry(e.to_string());
-        }
-        UfsDrive::Advanced
     }
 
     fn create_snapshot0(&self, dir_option: Option<String>) -> RaftResult<SnapshotData> {
@@ -1249,7 +815,16 @@ impl JournalLoader {
 
             JournalEntry::UfsApplied(e) => self.ufs_applied(e),
 
-            JournalEntry::UfsDeferred(e) => self.apply_ufs_deferred(e),
+            // Deferred UFS records are no longer produced. One can still arrive
+            // from a log written by the version that copied UFS ops out of the
+            // raft log, so replay it as a plain watermark marker instead of
+            // failing the batch.
+            JournalEntry::UfsDeferred(e) => self.ufs_applied(UfsAppliedEntry {
+                op_id: e.op_id,
+                rpc_id: e.rpc_id,
+                term: e.term,
+                index: e.index,
+            }),
             JournalEntry::TrashPurge(e) => self.trash_purge(e),
 
             JournalEntry::WorkerIntent(e) => self.worker_intent(e),
@@ -1535,20 +1110,6 @@ impl JournalLoader {
         Ok(())
     }
 
-    fn apply_ufs_deferred(&self, entry: UfsDeferredEntry) -> CommonResult<()> {
-        self.put_deferred_ufs(entry.index, &entry.payload)?;
-        let current = self.fsm_state_snapshot()?.ufs_applied.index;
-        if entry.index > current {
-            self.ufs_applied(UfsAppliedEntry {
-                op_id: entry.op_id,
-                rpc_id: entry.rpc_id,
-                term: entry.term,
-                index: entry.index,
-            })?;
-        }
-        Ok(())
-    }
-
     // Clean up expired checkpoints.
     pub fn purge_checkpoint(&self, current_ck: impl AsRef<str>) -> CommonResult<()> {
         let current_ck = current_ck.as_ref();
@@ -1686,8 +1247,6 @@ impl AppStorage for JournalLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::master::journal::{DeleteEntry, MkdirEntry};
-    use crate::master::meta::inode::InodeDir;
     use curvine_config::{ClusterConf, MasterConf};
     use curvine_error::FsResult;
     use curvine_runtime::common::Utils;
@@ -1824,7 +1383,7 @@ mod tests {
     }
 
     #[test]
-    fn leader_metadata_apply_does_not_advance_ufs_watermark() -> FsResult<()> {
+    fn leader_advances_ufs_watermark_when_skipping_corrupt_batch() -> FsResult<()> {
         let (conf, root) = ignore_reply_error_conf("leader", true);
         let js = JournalSystem::from_conf(&conf)?;
         let loader = js.journal_loader();
@@ -1835,13 +1394,16 @@ mod tests {
         }
         let state = loader.get_fsm_state();
         assert_eq!(
-            state.ufs_applied.index, 0,
-            "leader metadata apply must not advance the UFS watermark"
+            state.ufs_applied.index, 2,
+            "skipped batch must advance the leader UFS watermark"
         );
-        assert_eq!(
-            state.applied.index, 2,
-            "leader metadata watermark still advances"
+        assert_eq!(state.ufs_applied.term, 7);
+        assert_eq!(state.applied.index, 2, "leader advances both watermarks");
+        assert!(
+            loader.recovery.ufs_caught_up(),
+            "a synchronous UFS apply leaves nothing pending"
         );
+        assert_eq!(loader.recovery.pending(), 0);
 
         drop(loader);
         js.shutdown();
@@ -1869,236 +1431,6 @@ mod tests {
             0,
             "failed replay must not move the watermark"
         );
-
-        drop(loader);
-        js.shutdown();
-        let _ = fs::remove_dir_all(&root);
-        Ok(())
-    }
-
-    fn raft_batch(index: u64, op: JournalEntry) -> Entry {
-        let mut batch = JournalBatch::new(index);
-        batch.push(op);
-        Entry {
-            index,
-            term: 3,
-            entry_type: EntryType::EntryNormal as i32,
-            data: batch.encode().unwrap(),
-            ..Default::default()
-        }
-    }
-
-    fn set_metadata_applied(loader: &JournalLoader, index: u64) {
-        let mut state = loader.fsm_state.lock().expect("fsm lock");
-        state.applied.index = index;
-        state.applied.term = 3;
-    }
-
-    #[test]
-    fn ufs_replay_waits_for_a_live_worker_then_catches_up() -> FsResult<()> {
-        let (conf, root) = ignore_reply_error_conf("ufs-gate", false);
-        let js = JournalSystem::from_conf(&conf)?;
-        let loader = js.journal_loader();
-        let rt = conf.journal.create_runtime();
-
-        let mkdir = JournalEntry::Mkdir(MkdirEntry {
-            op_id: 1,
-            rpc_id: 1,
-            path: "/ufs".to_string(),
-            dir: InodeDir::new(1, 0),
-        });
-        let delete = JournalEntry::Delete(DeleteEntry {
-            op_id: 2,
-            rpc_id: 2,
-            path: "/ufs/file".to_string(),
-            mtime: 0,
-        });
-        loader
-            .log_store
-            .append(&[raft_batch(1, mkdir), raft_batch(2, delete)])
-            .expect("log append");
-        set_metadata_applied(&loader, 2);
-        loader.is_leader.store(true, Ordering::Release);
-
-        let waiting = rt.block_on(loader.drive_ufs_once(loader.recovery.generation()));
-        assert!(
-            matches!(waiting, UfsDrive::Advanced),
-            "mkdir does not need a worker"
-        );
-        loader.record_ufs_progress(&waiting);
-        assert!(!loader.recovery.ufs_caught_up());
-        assert_eq!(loader.get_fsm_state().ufs_applied.index, 1);
-
-        let blocked = rt.block_on(loader.drive_ufs_once(loader.recovery.generation()));
-        assert!(
-            matches!(blocked, UfsDrive::WaitWorkers),
-            "export must not run while worker_map is empty"
-        );
-        loader.record_ufs_progress(&blocked);
-        assert!(!loader.recovery.ufs_caught_up());
-        assert_eq!(loader.get_fsm_state().ufs_applied.index, 1);
-        assert_eq!(loader.get_fsm_state().applied.index, 2);
-
-        let cluster_id = loader.worker_manager.read().cluster_id.clone();
-        loader
-            .worker_manager
-            .write()
-            .heartbeat(
-                &cluster_id,
-                curvine_model::HeartbeatStatus::Running,
-                curvine_model::WorkerAddress {
-                    worker_id: 4,
-                    hostname: "worker-4".to_string(),
-                    ip_addr: "127.0.0.1".to_string(),
-                    rpc_port: 8997,
-                    web_port: 9000,
-                },
-                1,
-                String::new(),
-                curvine_model::TransferWorkerCapabilities::default(),
-                0,
-                0,
-                String::new(),
-                0,
-                vec![],
-                None,
-                false,
-            )
-            .expect("running heartbeat");
-        assert_eq!(loader.live_worker_count(), 1);
-
-        let resumed = rt.block_on(loader.drive_ufs_once(loader.recovery.generation()));
-        assert!(
-            matches!(resumed, UfsDrive::Advanced),
-            "delete replay continues from the previous ufs watermark"
-        );
-        assert_eq!(loader.get_fsm_state().ufs_applied.index, 2);
-
-        let caught_up = rt.block_on(loader.drive_ufs_once(loader.recovery.generation()));
-        assert!(matches!(caught_up, UfsDrive::CaughtUp));
-        loader.record_ufs_progress(&caught_up);
-        assert!(loader.recovery.ufs_caught_up());
-        assert_eq!(loader.recovery.pending(), 0);
-
-        let stale = rt.block_on(loader.drive_ufs_once(loader.recovery.generation() + 1));
-        assert!(matches!(stale, UfsDrive::Stopped));
-        assert_eq!(loader.get_fsm_state().ufs_applied.index, 2);
-
-        drop(loader);
-        js.shutdown();
-        let _ = fs::remove_dir_all(&root);
-        Ok(())
-    }
-
-    #[test]
-    fn corrupt_ufs_replay_enters_safe_mode_without_advancing() -> FsResult<()> {
-        let (conf, root) = ignore_reply_error_conf("ufs-damage", false);
-        let js = JournalSystem::from_conf(&conf)?;
-        let loader = js.journal_loader();
-        let rt = conf.journal.create_runtime();
-
-        loader
-            .log_store
-            .append(&[corrupt_entry(1, 3)])
-            .expect("log append");
-        set_metadata_applied(&loader, 1);
-        loader.is_leader.store(true, Ordering::Release);
-
-        let drive = rt.block_on(loader.drive_ufs_once(loader.recovery.generation()));
-        assert!(matches!(drive, UfsDrive::Stopped));
-        assert!(loader.recovery.is_safe_mode());
-        assert_eq!(loader.get_fsm_state().ufs_applied.index, 0);
-        assert_eq!(loader.get_fsm_state().applied.index, 1);
-
-        drop(loader);
-        js.shutdown();
-        let _ = fs::remove_dir_all(&root);
-        Ok(())
-    }
-
-    #[test]
-    fn permanent_ufs_failure_is_stored_without_reporting_catch_up() -> FsResult<()> {
-        let (conf, root) = ignore_reply_error_conf("ufs-defer", false);
-        let js = JournalSystem::from_conf(&conf)?;
-        let loader = js.journal_loader();
-        let rt = conf.journal.create_runtime();
-
-        let mkdir = JournalEntry::Mkdir(MkdirEntry {
-            op_id: 1,
-            rpc_id: 1,
-            path: "/ufs".to_string(),
-            dir: InodeDir::new(1, 0),
-        });
-        let delete = JournalEntry::Delete(DeleteEntry {
-            op_id: 2,
-            rpc_id: 2,
-            path: "/ufs/file".to_string(),
-            mtime: 0,
-        });
-        loader
-            .log_store
-            .append(&[raft_batch(1, mkdir), raft_batch(2, delete)])
-            .expect("log append");
-        set_metadata_applied(&loader, 2);
-        loader.is_leader.store(true, Ordering::Release);
-        let generation = loader.recovery.generation();
-
-        let mkdir_drive = rt.block_on(loader.drive_ufs_once(generation));
-        assert!(matches!(mkdir_drive, UfsDrive::Advanced));
-        loader.record_ufs_progress(&mkdir_drive);
-        let blocked = rt.block_on(loader.drive_ufs_once(generation));
-        assert!(matches!(blocked, UfsDrive::WaitWorkers));
-        assert_eq!(loader.deferred_ufs_count().expect("count"), 0);
-        assert_eq!(loader.get_fsm_state().compact(), 0);
-
-        assert!(rt
-            .block_on(loader.defer_current_ufs(generation, "UFS permission denied"))
-            .expect("defer"));
-        let state = loader.get_fsm_state();
-        assert_eq!(state.ufs_applied.index, 2);
-        assert_eq!(state.compact(), 1, "log GC can pass the copied UFS op");
-        assert!(!loader.recovery.ufs_caught_up());
-        assert_eq!(loader.deferred_ufs_count().expect("count"), 1);
-
-        let still_blocked = rt.block_on(loader.drive_ufs_once(generation));
-        assert!(matches!(still_blocked, UfsDrive::WaitWorkers));
-        assert_eq!(loader.deferred_ufs_count().expect("count"), 1);
-        assert!(!loader.recovery.ufs_caught_up());
-
-        let cluster_id = loader.worker_manager.read().cluster_id.clone();
-        loader
-            .worker_manager
-            .write()
-            .heartbeat(
-                &cluster_id,
-                curvine_model::HeartbeatStatus::Running,
-                curvine_model::WorkerAddress {
-                    worker_id: 4,
-                    hostname: "worker-4".to_string(),
-                    ip_addr: "127.0.0.1".to_string(),
-                    rpc_port: 8997,
-                    web_port: 9000,
-                },
-                1,
-                String::new(),
-                curvine_model::TransferWorkerCapabilities::default(),
-                0,
-                0,
-                String::new(),
-                0,
-                vec![],
-                None,
-                false,
-            )
-            .expect("running heartbeat");
-
-        let retried = rt.block_on(loader.drive_ufs_once(generation));
-        assert!(matches!(retried, UfsDrive::Advanced));
-        assert_eq!(loader.deferred_ufs_count().expect("count"), 0);
-        let caught_up = rt.block_on(loader.drive_ufs_once(generation));
-        assert!(matches!(caught_up, UfsDrive::CaughtUp));
-        loader.record_ufs_progress(&caught_up);
-        assert!(loader.recovery.ufs_caught_up());
 
         drop(loader);
         js.shutdown();

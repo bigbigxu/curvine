@@ -40,47 +40,8 @@ fn is_metadata_damage(lower: &str) -> bool {
         || lower.contains("poisoned")
 }
 
-/// Permission and credential failures will not succeed by repeating the same
-/// UFS call. Transport and "no worker" errors stay on the in-log retry path.
-pub(crate) fn is_permanent_ufs_error(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("permission")
-        || lower.contains("access denied")
-        || lower.contains("credential")
-        || lower.contains("unauthorized")
-        || lower.contains("not authorized")
-        || lower.contains("forbidden")
-}
-
-fn keeps_ufs_in_log(lower: &str) -> bool {
-    lower.contains("no workers")
-        || lower.contains("notleader")
-        || lower.contains("leader not ready")
-        || lower.contains("leadernotready")
-        || lower.contains("timeout")
-        || lower.contains("timed out")
-        || lower.contains("deadline")
-        || lower.contains("connection")
-        || lower.contains("refused")
-        || lower.contains("reset by peer")
-        || lower.contains("broken pipe")
-}
-
-/// Move a failed UFS op out of the raft log only when retrying it there cannot
-/// succeed. Transient errors, including an empty worker map, stay put.
-pub(crate) fn should_defer_ufs(message: &str, failures: u64, max_retry_num: u64) -> bool {
-    let lower = message.to_ascii_lowercase();
-    if is_metadata_damage(&lower) || keeps_ufs_in_log(&lower) {
-        return false;
-    }
-    if is_permanent_ufs_error(message) {
-        return true;
-    }
-    max_retry_num > 0 && failures >= max_retry_num
-}
-
-/// Shared recovery flags for the journal apply loop, UFS coordinator, writer,
-/// and HTTP probes. Clone shares the same atomics.
+/// Shared recovery flags for the journal apply loop, writer, and HTTP probes.
+/// Clone shares the same atomics.
 #[derive(Clone)]
 pub(crate) struct RecoveryGate {
     inner: Arc<RecoveryInner>,
@@ -90,7 +51,6 @@ struct RecoveryInner {
     safe_mode: AtomicBool,
     writer_failed: AtomicBool,
     ufs_caught_up: AtomicBool,
-    generation: AtomicU64,
     pending: AtomicU64,
     last_error: Mutex<String>,
 }
@@ -102,7 +62,6 @@ impl RecoveryGate {
                 safe_mode: AtomicBool::new(false),
                 writer_failed: AtomicBool::new(false),
                 ufs_caught_up: AtomicBool::new(false),
-                generation: AtomicU64::new(1),
                 pending: AtomicU64::new(0),
                 last_error: Mutex::new(String::new()),
             }),
@@ -126,14 +85,6 @@ impl RecoveryGate {
 
     pub(crate) fn rejects_writes(&self) -> bool {
         self.is_safe_mode() || self.inner.writer_failed.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn bump_generation(&self) -> u64 {
-        self.inner.generation.fetch_add(1, Ordering::AcqRel) + 1
-    }
-
-    pub(crate) fn generation(&self) -> u64 {
-        self.inner.generation.load(Ordering::Acquire)
     }
 
     pub(crate) fn set_ufs_caught_up(&self, caught_up: bool) {
@@ -214,30 +165,6 @@ mod tests {
     }
 
     #[test]
-    fn permanent_ufs_failure_defers_and_worker_gaps_do_not() {
-        assert!(should_defer_ufs("UFS permission denied", 1, 1000));
-        assert!(should_defer_ufs(
-            "export job failed: credential rejected",
-            1,
-            1000
-        ));
-        assert!(!should_defer_ufs("No workers available", 1000, 1000));
-        assert!(!should_defer_ufs("Connection refused", 1000, 1000));
-        assert!(!should_defer_ufs("NotLeader", 5, 1000));
-        assert!(!should_defer_ufs(
-            "failed to deserialize journal batch",
-            1000,
-            1000
-        ));
-        assert!(!should_defer_ufs("export job failed: worker busy", 3, 1000));
-        assert!(should_defer_ufs(
-            "export job failed: worker busy",
-            1000,
-            1000
-        ));
-    }
-
-    #[test]
     fn safe_mode_rejects_writes_and_clears_caught_up() {
         let gate = RecoveryGate::new();
         gate.set_ufs_caught_up(true);
@@ -246,14 +173,5 @@ mod tests {
         assert!(gate.is_safe_mode());
         assert!(gate.rejects_writes());
         assert!(!gate.ufs_caught_up());
-    }
-
-    #[test]
-    fn generation_bumps_cancel_stale_replay() {
-        let gate = RecoveryGate::new();
-        let first = gate.generation();
-        let second = gate.bump_generation();
-        assert_ne!(first, second);
-        assert_eq!(gate.generation(), second);
     }
 }

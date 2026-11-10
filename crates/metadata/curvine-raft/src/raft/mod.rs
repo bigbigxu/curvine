@@ -64,8 +64,7 @@ pub const LOG_START_INDEX: u64 = 0;
 
 impl FsmState {
     /// Compact only through the prefix both metadata apply and UFS replay have
-    /// passed. A failed UFS op stays in the log until it has been copied into
-    /// the metadata store; the cursor then moves without reporting catch-up.
+    /// passed: a UFS side effect that is still owed stays in the log.
     pub fn compact(&self) -> u64 {
         let applied = if self.applied.index <= self.ufs_applied.index {
             &self.applied
@@ -86,15 +85,6 @@ impl FsmState {
 
     pub fn op_id(&self) -> u64 {
         self.applied.op_id.max(self.ufs_applied.op_id)
-    }
-
-    /// True when the UFS replay has consumed every applied entry.
-    ///
-    /// A snapshot claims the whole applied prefix and lets the log drop it.
-    /// Publishing one while this is false deletes entries the replay still
-    /// owes a copy, which then blocks replay and checkpointing forever.
-    pub fn ufs_replay_caught_up(&self) -> bool {
-        self.ufs_applied.index >= self.applied.index
     }
 }
 

@@ -380,25 +380,6 @@ impl JournalEntry {
         }
     }
 
-    /// UFS mkdir/export/rename/delete. Metadata-only entries are not included.
-    pub fn affects_ufs(&self) -> bool {
-        matches!(
-            self,
-            JournalEntry::Mkdir(_)
-                | JournalEntry::CompleteFile(_)
-                | JournalEntry::Rename(_)
-                | JournalEntry::Delete(_)
-        )
-    }
-
-    /// Export-style side effects that select a worker. Mkdir talks to UFS directly.
-    pub fn needs_worker_for_ufs(&self) -> bool {
-        matches!(
-            self,
-            JournalEntry::CompleteFile(_) | JournalEntry::Rename(_) | JournalEntry::Delete(_)
-        )
-    }
-
     pub fn inode_id(&self) -> Option<i64> {
         match self {
             JournalEntry::Mkdir(e) => Some(e.dir.id),

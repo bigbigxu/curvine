@@ -186,12 +186,6 @@ impl UfsLoader {
         self.job_manager.transfer_enabled()
     }
 
-    /// Whether replaying `entry` needs a live Curvine worker. Transfer mode never
-    /// does: the replayer only enqueues, and Transfer schedules the copy.
-    pub fn needs_worker(&self, entry: &JournalEntry) -> bool {
-        !self.transfer_enabled() && entry.needs_worker_for_ufs()
-    }
-
     /// Export described by a replayed `CompleteFile`, in transfer mode.
     ///
     /// The inode is re-read by id: the journal path can be stale after a rename,

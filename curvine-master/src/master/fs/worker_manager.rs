@@ -27,8 +27,6 @@ use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::{ByteUnit, LocalTime};
 use log::{info, warn};
 use std::fmt::{Display, Formatter};
-use std::sync::Arc;
-use tokio::sync::Notify;
 
 pub struct WorkerManager {
     pub(crate) worker_map: WorkerMap,
@@ -36,7 +34,6 @@ pub struct WorkerManager {
     pub(crate) worker_policy: WorkerPolicyAdapter,
     pub(crate) cluster_id: String,
     pub(crate) conf: ClusterConf,
-    worker_registered: Arc<Notify>,
 }
 
 /// A committed replica to settle: `(block_id, block_len, worker_id)`.
@@ -52,12 +49,7 @@ impl WorkerManager {
             worker_policy,
             cluster_id: conf.cluster_id.to_string(),
             conf: conf.clone(),
-            worker_registered: Arc::new(Notify::new()),
         })
-    }
-
-    pub fn registered_notify(&self) -> Arc<Notify> {
-        self.worker_registered.clone()
     }
 
     pub fn live_worker_count(&self) -> usize {
@@ -219,7 +211,6 @@ impl WorkerManager {
             storages,
             component_info,
         )?;
-        self.worker_registered.notify_one();
         self.expire_scheduled_bytes();
         Ok((cmds, false))
     }
