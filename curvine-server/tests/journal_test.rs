@@ -632,11 +632,7 @@ fn test_ufs_loader_mkdir_recreates_missing_ufs_parent() -> CommonResult<()> {
 
     assert!(!ufs_dir.join("db/table").exists());
 
-    let loader = UfsLoader::new(
-        journal_system.job_manager(),
-        journal_system.fs().fs_dir.clone(),
-        &conf.journal,
-    );
+    let loader = ufs_loader_of(&journal_system);
     let rt = AsyncRuntime::single();
     rt.block_on(async { loader.mkdir(&mkdir_entry).await })?;
 
@@ -691,6 +687,12 @@ fn new_ufs_loader_complete_env(
     )?;
 
     Ok((conf, journal_system, fs, ufs_dir))
+}
+
+/// The UFS loader owned by a test journal system. It carries the replay wiring,
+/// so an export op is replayed through the same view the worker uses.
+fn ufs_loader_of(journal_system: &JournalSystem) -> UfsLoader {
+    journal_system.journal_loader().ufs_loader().clone()
 }
 
 fn take_complete_file_entry(journal_system: &JournalSystem) -> CommonResult<CompleteFileEntry> {
@@ -748,7 +750,7 @@ fn collect_ufs_rel_files(dir: &std::path::Path) -> Vec<String> {
 #[test]
 fn test_ufs_loader_complete_file_skips_non_mount() -> CommonResult<()> {
     let _serial = serialize_metrics_sensitive_test();
-    let (conf, journal_system, fs, ufs_dir) = new_ufs_loader_complete_env("skip-non-mount")?;
+    let (_conf, journal_system, fs, ufs_dir) = new_ufs_loader_complete_env("skip-non-mount")?;
 
     fs.create("/plain.log", true)?;
     journal_system.fs().fs_dir.read().take_entries();
@@ -761,11 +763,7 @@ fn test_ufs_loader_complete_file_skips_non_mount() -> CommonResult<()> {
         entry_debug
     );
 
-    let loader = UfsLoader::new(
-        journal_system.job_manager(),
-        journal_system.fs().fs_dir.clone(),
-        &conf.journal,
-    );
+    let loader = ufs_loader_of(&journal_system);
     let rt = AsyncRuntime::single();
     rt.block_on(async { loader.complete_file(&entry).await })?;
 
@@ -789,7 +787,7 @@ fn test_ufs_loader_complete_file_skips_non_mount() -> CommonResult<()> {
 #[test]
 fn test_ufs_loader_complete_file_rename_within_mount_exports_live_path() -> CommonResult<()> {
     let _serial = serialize_metrics_sensitive_test();
-    let (conf, journal_system, fs, ufs_dir) = new_ufs_loader_complete_env("rename-within-mount")?;
+    let (_conf, journal_system, fs, ufs_dir) = new_ufs_loader_complete_env("rename-within-mount")?;
 
     let created = fs.create("/mnt/old.log", true)?;
     fs.rename("/mnt/old.log", "/mnt/new.log", RenameFlags::empty())?;
@@ -809,11 +807,7 @@ fn test_ufs_loader_complete_file_rename_within_mount_exports_live_path() -> Comm
         entry_debug
     );
 
-    let loader = UfsLoader::new(
-        journal_system.job_manager(),
-        journal_system.fs().fs_dir.clone(),
-        &conf.journal,
-    );
+    let loader = ufs_loader_of(&journal_system);
     let rt = AsyncRuntime::single();
     let export = rt.block_on(async { loader.complete_file(&entry).await });
 
@@ -861,7 +855,7 @@ fn test_ufs_loader_complete_file_rename_within_mount_exports_live_path() -> Comm
 #[test]
 fn test_ufs_loader_complete_exports_and_release_writer_is_a_fallback() -> CommonResult<()> {
     let _serial = serialize_metrics_sensitive_test();
-    let (conf, journal_system, fs, ufs_dir) = new_ufs_loader_complete_env("release-writer")?;
+    let (_conf, journal_system, fs, ufs_dir) = new_ufs_loader_complete_env("release-writer")?;
 
     let mut opts = CreateFileOpts::with_create(false);
     opts.client_name = "client-a".to_string();
@@ -876,11 +870,7 @@ fn test_ufs_loader_complete_exports_and_release_writer_is_a_fallback() -> Common
     open_opts.client_name = "client-b".to_string();
     fs.open_file("/mnt/two-writers.log", open_opts, OpenFlags::new_create())?;
 
-    let loader = UfsLoader::new(
-        journal_system.job_manager(),
-        journal_system.fs().fs_dir.clone(),
-        &conf.journal,
-    );
+    let loader = ufs_loader_of(&journal_system);
     let rt = AsyncRuntime::single();
     let live = Path::from_str("/mnt/two-writers.log")?;
     let live_job_id = CommonUtils::create_job_id(live.clone_uri());
@@ -1192,18 +1182,14 @@ fn new_ufs_loader_transfer_env(
 /// reconciliation.
 #[test]
 fn test_ufs_loader_transfer_mode_does_not_block_on_export() -> CommonResult<()> {
-    let (conf, journal_system, fs, ufs_dir) = new_ufs_loader_transfer_env("no-block")?;
+    let (_conf, journal_system, fs, ufs_dir) = new_ufs_loader_transfer_env("no-block")?;
 
     fs.create("/mnt/block.log", true)?;
     journal_system.fs().fs_dir.read().take_entries();
     fs.complete_file("/mnt/block.log", None, 0, vec![], "", false, None)?;
     let entry = take_complete_file_entry(&journal_system)?;
 
-    let loader = UfsLoader::new(
-        journal_system.job_manager(),
-        journal_system.fs().fs_dir.clone(),
-        &conf.journal,
-    );
+    let loader = ufs_loader_of(&journal_system);
     let rt = AsyncRuntime::single();
 
     let started = std::time::Instant::now();

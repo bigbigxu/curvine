@@ -24,7 +24,7 @@ use crate::master::{
     JobManager, Master, MasterMetrics, MountManager, SyncFsDir, SyncWorkerManager,
 };
 use curvine_config::JournalConf;
-use curvine_core_error::{err_box, ternary, CommonResult, ErrorExt};
+use curvine_core_error::{err_box, CommonResult, ErrorExt};
 use curvine_error::FsError;
 use curvine_model::RenameFlags;
 use curvine_raft::conf::JournalConfExt;
@@ -50,7 +50,6 @@ pub struct JournalLoader {
     node_id: u64,
     fs_dir: SyncFsDir,
     mnt_mgr: Arc<MountManager>,
-    journal_writer: Arc<JournalWriter>,
     ufs_loader: UfsLoader,
     worker_manager: SyncWorkerManager,
     recovery: RecoveryGate,
@@ -150,19 +149,27 @@ impl JournalLoader {
             job_manager.master_fs().set_fs_mode_releaser(releaser);
         }
 
-        let ufs_loader = UfsLoader::new(job_manager, fs_dir.clone(), conf);
+        let fsm_state = Arc::new(Mutex::new(FsmState::default()));
+        let ufs_loader = UfsLoader::new(
+            job_manager,
+            fs_dir.clone(),
+            conf,
+            log_store.clone(),
+            journal_writer.clone(),
+            recovery.clone(),
+            fsm_state.clone(),
+        )?;
         let (sender, receiver) = AsyncChannel::new(conf.writer_channel_size).split();
         let loader = Self {
             node_id: conf.node_id()?,
             fs_dir,
             mnt_mgr,
-            journal_writer,
             ufs_loader,
             worker_manager,
             recovery,
             log_store,
             sender,
-            fsm_state: Arc::new(Mutex::new(FsmState::default())),
+            fsm_state,
             retain_checkpoint_num: conf.retain_checkpoint_num,
             ignore_reply_error: conf.ignore_reply_error,
             max_retry_num: conf.max_retry_num,
@@ -175,10 +182,16 @@ impl JournalLoader {
         };
 
         loader.refresh_metrics()?;
+        loader.refresh_ufs_gate()?;
         if !testing {
             let apply_loader = loader.clone();
             rt.spawn(async move {
                 Self::run_apply(apply_loader, receiver).await;
+            });
+
+            let ufs_replayer = loader.ufs_loader.clone();
+            rt.spawn(async move {
+                ufs_replayer.run().await;
             });
         }
 
@@ -196,39 +209,41 @@ impl JournalLoader {
         Ok(self.fsm_state()?.clone())
     }
 
-    fn set_applied(
-        &self,
-        is_leader: bool,
-        applied: AppliedIndex,
-        has_ufs_affecting: bool,
-    ) -> CommonResult<()> {
-        // The leader runs the UFS side effect inline with the metadata op, so a
-        // completed apply moves both watermarks together and records the marker
-        // followers replay.
-        if is_leader && has_ufs_affecting {
-            self.journal_writer
-                .log_ufs_applied(applied.op_id, applied.term, applied.index)?;
-        }
-
+    /// Advance the metadata watermark only. UFS progress belongs to the
+    /// replayer inside `UfsLoader`, which walks `(ufs_applied, applied]` on its
+    /// own schedule so a slow object store can never stall raft apply. It polls
+    /// the watermarks, so there is no wake-up to send here.
+    fn set_applied(&self, applied: AppliedIndex) -> CommonResult<()> {
         let mut state = self.fsm_state()?;
-        if is_leader {
-            state.ufs_applied = applied.clone();
-            state.applied = applied;
-        } else {
-            state.applied = applied;
-        }
-
-        if is_leader {
-            let caught_up = state.ufs_applied.index >= state.applied.index;
-            self.recovery.set_ufs_caught_up(caught_up);
-            self.recovery
-                .set_pending(state.applied.index.saturating_sub(state.ufs_applied.index));
-        }
-
+        state.applied = applied;
         self.refresh_fsm_metrics(&state);
+        let (caught_up, pending) = Self::ufs_gate(&state);
         drop(state);
         self.hard_state_changed(&self.log_store.hard_state());
+        self.publish_ufs_gate(caught_up, pending);
         Ok(())
+    }
+
+    /// Publish the local UFS backlog once at startup; the replayer refreshes it
+    /// as it advances.
+    fn refresh_ufs_gate(&self) -> CommonResult<()> {
+        let state = self.fsm_state_snapshot()?;
+        let (caught_up, pending) = Self::ufs_gate(&state);
+        self.publish_ufs_gate(caught_up, pending);
+        Ok(())
+    }
+
+    /// Every path that moves either watermark publishes through here, so probes
+    /// and metrics never read a stale backlog.
+    fn publish_ufs_gate(&self, caught_up: bool, pending: u64) {
+        self.recovery.set_ufs_caught_up(caught_up);
+        self.recovery.set_pending(pending);
+    }
+
+    fn ufs_gate(state: &FsmState) -> (bool, u64) {
+        let caught_up = state.ufs_applied.index >= state.applied.index;
+        let pending = state.applied.index.saturating_sub(state.ufs_applied.index);
+        (caught_up, pending)
     }
 
     fn refresh_fsm_metrics(&self, state: &FsmState) {
@@ -258,18 +273,26 @@ impl JournalLoader {
     /// metadata op: the no-op/config branch and batches deliberately skipped
     /// under `ignore_reply_error` both need the watermark to move so that
     /// replay can continue past them.
-    fn advance_watermark(&self, is_leader: bool, cur: FsmState, entry: &Entry) -> CommonResult<()> {
-        let mut applied = if is_leader {
-            cur.ufs_applied
-        } else {
-            cur.applied
-        };
+    fn advance_watermark(&self, cur: FsmState, entry: &Entry) -> CommonResult<()> {
+        let mut applied = cur.applied;
         applied.term = entry.term;
         applied.index = entry.index;
-        self.set_applied(is_leader, applied, false)
+        self.set_applied(applied)
     }
 
-    async fn replay_entry(&self, is_leader: bool, entry: &JournalEntry) -> CommonResult<()> {
+    /// Replay one metadata operation from the log.
+    ///
+    /// `already_applied` marks entries this node proposed while leading: the
+    /// RPC handler mutated the namespace before proposing, so running the
+    /// operation again would apply it twice. Every replicated entry — including
+    /// the ones a new leader commits on behalf of the previous one — must be
+    /// replayed, otherwise a failover silently loses whichever mutations were
+    /// not committed yet when the election happened.
+    fn replay_entry(&self, already_applied: bool, entry: &JournalEntry) -> CommonResult<()> {
+        if already_applied {
+            return Ok(());
+        }
+
         {
             let fs_dir = self.fs_dir.read();
             fs_dir.update_op_id(entry.op_id());
@@ -278,24 +301,12 @@ impl JournalLoader {
             }
         }
 
-        if is_leader {
-            // The leader already applied this metadata in the RPC handler; the
-            // UFS side effect is the part replay owes here.
-            self.ufs_loader.apply_entry(entry).await
-        } else {
-            self.apply_entry(entry.clone())
-        }
+        self.apply_entry(entry.clone())
     }
 
-    async fn apply0(
-        &self,
-        is_leader: bool,
-        entry: &Entry,
-        skip_ufs_error: bool,
-    ) -> CommonResult<()> {
+    fn apply0(&self, is_leader: bool, already_applied: bool, entry: &Entry) -> CommonResult<()> {
         let cur = self.fsm_state_snapshot()?;
-        let role_applied = ternary!(is_leader, cur.ufs_applied.index, cur.applied.index);
-        if entry.index <= role_applied {
+        if entry.index <= cur.applied.index {
             info!(
                 "skip entry index {}, term {}, fsm_state {:?}",
                 entry.index, entry.term, cur
@@ -306,7 +317,7 @@ impl JournalLoader {
         // Empty leader no-ops and configuration entries have no metadata mutation,
         // but still advance the committed apply high-water mark.
         if entry.get_entry_type() != EntryType::EntryNormal || entry.data.is_empty() {
-            return self.advance_watermark(is_leader, cur, entry);
+            return self.advance_watermark(cur, entry);
         }
 
         let batch = match JournalBatch::decode(&entry.data) {
@@ -316,7 +327,7 @@ impl JournalLoader {
                     "skip failed journal batch deserialization, entry index={}, term={}, error={}",
                     entry.index, entry.term, e
                 );
-                return self.advance_watermark(is_leader, cur, entry);
+                return self.advance_watermark(cur, entry);
             }
             Err(e) => return err_box!("failed to decode journal batch: {}", e),
         };
@@ -324,7 +335,6 @@ impl JournalLoader {
         let batch_len = batch.len();
         let mut snapshot = None;
         let mut applied = Self::build_applied(entry);
-        let mut has_ufs_affecting = false;
 
         for (seq, op_entry) in batch.batch.into_iter().enumerate() {
             applied.op_id = op_entry.op_id();
@@ -339,29 +349,13 @@ impl JournalLoader {
                     continue;
                 }
 
-                JournalEntry::CacheInvalidation(_)
-                | JournalEntry::UfsApplied(_)
-                | JournalEntry::UfsDeferred(_) => (),
-
-                // A purge only touches the local trash namespace, so it owes no
-                // UFS acknowledgement record.
-                JournalEntry::TrashPurge(_) => (),
-
-                _ => has_ufs_affecting = true,
+                _ => {}
             }
 
-            if let Err(e) = self.replay_entry(is_leader, &op_entry).await {
+            if let Err(e) = self.replay_entry(already_applied, &op_entry) {
                 if self.ignore_reply_error {
                     error!(
                         "skip failed journal replay, entry index={}, term={}, journal={:?}, error={}",
-                        entry.index, entry.term, op_entry, e
-                    );
-                    continue;
-                }
-
-                if is_leader && skip_ufs_error {
-                    error!(
-                        "skip failed UFS replay after retries, entry index={}, term={}, journal={:?}, error={}",
                         entry.index, entry.term, op_entry, e
                     );
                     continue;
@@ -371,7 +365,7 @@ impl JournalLoader {
             }
         }
 
-        self.set_applied(is_leader, applied, has_ufs_affecting)?;
+        self.set_applied(applied)?;
 
         if let Some(e) = snapshot {
             let spent = TimeSpent::new();
@@ -391,23 +385,21 @@ impl JournalLoader {
         Ok(())
     }
 
-    async fn apply_msg(
-        &self,
-        is_leader: bool,
-        msg: &ApplyMsg,
-        skip_ufs_error: bool,
-    ) -> CommonResult<()> {
+    async fn apply_msg(&self, is_leader: bool, msg: &ApplyMsg) -> CommonResult<()> {
         match msg {
-            ApplyMsg::Entry(entry) | ApplyMsg::EntryWithAck((entry, _)) => {
-                self.apply0(is_leader, entry, skip_ufs_error).await?;
-                Ok(())
-            }
+            // A replicated entry no handler here ever ran: the sender's RPC
+            // path belongs to another incarnation, so the state machine has to
+            // apply it. This covers followers replaying the leader's log and a
+            // new leader replaying what the previous one left uncommitted.
+            ApplyMsg::Entry(entry) => self.apply0(is_leader, false, entry),
+
+            // Only produced for an entry this node proposed while leading: the
+            // RPC handler already mutated the namespace and is parked on the
+            // acknowledgement, so replaying it here would apply it twice.
+            ApplyMsg::EntryWithAck((entry, _)) => self.apply0(is_leader, true, entry),
 
             ApplyMsg::Scan(applied_index) => {
                 let mut last_applied = applied_index.index;
-                if is_leader && skip_ufs_error {
-                    last_applied = last_applied.max(self.fsm_state_snapshot()?.ufs_applied.index);
-                }
 
                 let commit_index = self.log_store.hard_state().commit;
                 loop {
@@ -418,8 +410,17 @@ impl JournalLoader {
                     let high = (last_applied + self.batch_size).min(commit_index + 1);
                     let list = self.log_store.scan_entries(last_applied + 1, high)?;
 
+                    // `scan_entries` reads the raw range and silently returns
+                    // nothing when the entries were compacted away. Below commit
+                    // that can only mean the owed UFS range is gone; continuing
+                    // would let the next entry advance `ufs_applied` past the gap
+                    // and lose those UFS side effects for good.
                     if list.is_empty() {
-                        return Ok(());
+                        return err_box!(
+                            "metadata invariant broken: journal replay stopped at index {}, commit index {}, but no entries are on disk",
+                            last_applied,
+                            commit_index
+                        );
                     };
 
                     info!(
@@ -430,11 +431,8 @@ impl JournalLoader {
                     );
 
                     for entry in list {
-                        self.apply0(is_leader, &entry, skip_ufs_error).await?;
+                        self.apply0(is_leader, false, &entry)?;
                         last_applied = entry.index;
-                        if skip_ufs_error {
-                            return Ok(());
-                        }
                     }
                 }
             }
@@ -454,8 +452,7 @@ impl JournalLoader {
     async fn catch_up_committed_metadata(&self) -> RaftResult<()> {
         let committed = self.log_store.hard_state().commit;
         let applied = self.fsm_state_snapshot()?.applied;
-        self.apply_msg(false, &ApplyMsg::new_scan(applied), false)
-            .await?;
+        self.apply_msg(false, &ApplyMsg::new_scan(applied)).await?;
 
         let metadata_applied = self.fsm_state_snapshot()?.applied.index;
         if metadata_applied < committed {
@@ -466,9 +463,6 @@ impl JournalLoader {
             );
         }
         Ok(())
-    }
-    fn get_ufs_applied(&self) -> CommonResult<AppliedIndex> {
-        Ok(self.fsm_state()?.ufs_applied.clone())
     }
 
     async fn run_apply(self, mut receiver: AsyncReceiver<ApplyMsg>) {
@@ -544,17 +538,16 @@ impl JournalLoader {
                     let result = async {
                         if role == StateRole::Leader {
                             // Publish leadership only after committed namespace
-                            // mutations have advanced local metadata high-water marks.
+                            // mutations have advanced local metadata high-water
+                            // marks. The UFS replayer then resumes on its own,
+                            // from `ufs_applied`.
                             self.catch_up_committed_metadata().await?;
+                            self.refresh_ufs_gate()?;
                             is_leader = true;
-                            let ufs_applied = self.get_ufs_applied()?;
-                            info!(
-                                "metadata caught up for leader promotion, scheduling UFS replay from {:?}",
-                                ufs_applied
-                            );
-                            retry_msg.replace(ApplyMsg::new_scan(ufs_applied));
+                            self.ufs_loader.set_leader(true);
                         } else {
                             is_leader = false;
+                            self.ufs_loader.set_leader(false);
                         }
                         Ok(())
                     }
@@ -575,7 +568,7 @@ impl JournalLoader {
                         Self::complete_entry_ack(msg, err_box!("master is in safe mode"));
                         continue;
                     }
-                    match self.apply_msg(is_leader, &msg, false).await {
+                    match self.apply_msg(is_leader, &msg).await {
                         Ok(()) => Self::complete_entry_ack(msg, Ok(())),
                         Err(error) => {
                             let message = error.to_string();
@@ -766,6 +759,7 @@ impl JournalLoader {
 
         *self.fsm_state()? = snapshot.fsm_state;
         self.refresh_metrics()?;
+        self.refresh_ufs_gate()?;
 
         info!(
             "apply_snapshot: fs_dir_restore={} ms, mount_restore={} ms, total={} ms",
@@ -1117,14 +1111,30 @@ impl JournalLoader {
     }
 
     pub fn ufs_applied(&self, entry: UfsAppliedEntry) -> CommonResult<()> {
-        let mut lock = self.fsm_state()?;
-        lock.ufs_applied = AppliedIndex {
-            op_id: entry.op_id,
-            rpc_id: entry.rpc_id,
-            term: entry.term,
-            index: entry.index,
+        let (caught_up, pending) = {
+            let mut lock = self.fsm_state()?;
+            if entry.index <= lock.ufs_applied.index {
+                return Ok(());
+            }
+            lock.ufs_applied = AppliedIndex {
+                op_id: entry.op_id,
+                rpc_id: entry.rpc_id,
+                term: entry.term,
+                index: entry.index,
+            };
+            let gate = Self::ufs_gate(&lock);
+            drop(lock);
+            gate
         };
+        self.publish_ufs_gate(caught_up, pending);
         Ok(())
+    }
+
+    /// The UFS side-effect loader. It carries the replay wiring, so tests replay
+    /// single entries through this view instead of rebuilding the state by hand.
+    #[doc(hidden)]
+    pub fn ufs_loader(&self) -> &UfsLoader {
+        &self.ufs_loader
     }
 
     // Clean up expired checkpoints.
@@ -1169,11 +1179,12 @@ impl JournalLoader {
         let (tx, rx) = CallChannel::channel();
         self.sender.send(ApplyMsg::Shutdown(tx)).await?;
         rx.receive().await?;
+        self.ufs_loader.stop();
         Ok(())
     }
 
     async fn apply_direct(&self, msg: ApplyMsg) -> RaftResult<()> {
-        let result = self.apply_msg(false, &msg, false).await.map_err(Into::into);
+        let result = self.apply_msg(false, &msg).await.map_err(Into::into);
 
         if matches!(&msg, ApplyMsg::EntryWithAck(_)) {
             Self::complete_entry_ack(msg, result);
@@ -1400,27 +1411,161 @@ mod tests {
     }
 
     #[test]
-    fn leader_advances_ufs_watermark_when_skipping_corrupt_batch() -> FsResult<()> {
+    fn leader_advances_only_the_metadata_watermark() -> FsResult<()> {
         let (conf, root) = ignore_reply_error_conf("leader", true);
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+
+        for index in 1..=2 {
+            loader.apply0(true, true, &corrupt_entry(index, 7))?;
+        }
+        let state = loader.get_fsm_state();
+        assert_eq!(
+            state.applied.index, 2,
+            "leader advances the metadata watermark"
+        );
+        assert_eq!(state.applied.term, 7);
+        assert_eq!(
+            state.ufs_applied.index, 0,
+            "UFS progress belongs to the background replayer, never to apply"
+        );
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn ufs_replayer_advances_its_own_watermark() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("ufs-replay", true);
         let js = JournalSystem::from_conf(&conf)?;
         let loader = js.journal_loader();
         let rt = conf.journal.create_runtime();
 
-        for index in 1..=2 {
-            rt.block_on(loader.apply0(true, &corrupt_entry(index, 7), false))?;
-        }
+        // Metadata apply never moves the UFS watermark; it only publishes work.
+        loader.apply0(true, true, &valid_entry(1, 5))?;
+        let state = loader.get_fsm_state();
+        assert_eq!(state.applied.index, 1);
+        assert_eq!(state.ufs_applied.index, 0);
+        assert_eq!(
+            loader.ufs_loader.replay_range()?,
+            (0, 1),
+            "the replayer owes (ufs_applied, applied]"
+        );
+
+        // The replayer pulls the owed entry straight from the log.
+        rt.block_on(loader.ufs_loader.replay_entry(&valid_entry(1, 5)))?;
         let state = loader.get_fsm_state();
         assert_eq!(
-            state.ufs_applied.index, 2,
-            "skipped batch must advance the leader UFS watermark"
+            state.ufs_applied.index, 1,
+            "the replayer advances ufs_applied on its own"
         );
-        assert_eq!(state.ufs_applied.term, 7);
-        assert_eq!(state.applied.index, 2, "leader advances both watermarks");
+        assert_eq!(
+            loader.ufs_loader.replay_range()?,
+            (1, 1),
+            "nothing is owed once the replayer caught up"
+        );
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn follower_aligns_ufs_watermark_from_the_log_marker() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("ufs-marker", true);
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+
+        let mut batch = JournalBatch::new(1);
+        batch.push(JournalEntry::UfsApplied(UfsAppliedEntry {
+            op_id: 7,
+            rpc_id: 8,
+            term: 3,
+            index: 3,
+        }));
+        let entry = Entry {
+            index: 3,
+            term: 3,
+            data: batch.encode().unwrap(),
+            ..Default::default()
+        };
+
+        loader.apply0(false, false, &entry)?;
+        let state = loader.get_fsm_state();
+        assert_eq!(
+            state.ufs_applied.index, 3,
+            "a follower takes the UFS watermark from the leader marker"
+        );
+        assert_eq!(state.applied.index, 3);
+
+        drop(loader);
+        js.shutdown();
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    fn trash_purge_entry(index: u64, paths: Vec<&str>) -> Entry {
+        let mut batch = JournalBatch::new(1);
+        batch.push(JournalEntry::TrashPurge(TrashPurgeEntry {
+            op_id: 77 + index,
+            rpc_id: 0,
+            entry: "/victim".to_string(),
+            mtime: 5,
+            paths: paths.into_iter().map(|p| p.to_string()).collect(),
+        }));
+
+        Entry {
+            index,
+            term: 3,
+            data: batch.encode().unwrap(),
+            ..Default::default()
+        }
+    }
+
+    // The apply path must key off the message shape, not the current role: a
+    // new leader replays what the previous leader left committed (`Entry`,
+    // no caller parked here), while its own propose arrives as `EntryWithAck`
+    // because the RPC handler already mutated the namespace.
+    #[test]
+    fn leader_replays_a_replicated_entry_and_skips_its_own_acknowledged_one() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("leader-replay", true);
+        let js = JournalSystem::from_conf(&conf)?;
+        let fs = js.fs();
+        let loader = js.journal_loader();
+        let rt = conf.journal.create_runtime();
+
+        fs.create("/victim/a/file-a", true)?;
+        fs.create("/victim/b/file-b", true)?;
+
+        // Written by the previous leader and committed only after this node won
+        // the election: no handler here ever ran, so the entry must apply.
+        rt.block_on(
+            loader.apply(true, ApplyMsg::new_entry(trash_purge_entry(1, vec!["/victim/a/file-a"]))),
+        )?;
         assert!(
-            loader.recovery.ufs_caught_up(),
-            "a synchronous UFS apply leaves nothing pending"
+            !fs.exists("/victim/a/file-a")?,
+            "a leader must replay entries carried over from the previous leader"
         );
-        assert_eq!(loader.recovery.pending(), 0);
+
+        // This leader's own propose: the handler already removed the file and
+        // is parked on the acknowledgement, so replaying it would be a no-op.
+        let (tx, _rx) = CallChannel::channel();
+        rt.block_on(loader.apply(
+            true,
+            ApplyMsg::new_entry_with_ack(trash_purge_entry(2, vec!["/victim/b/file-b"]), tx),
+        ))?;
+        assert!(
+            fs.exists("/victim/b/file-b")?,
+            "an acknowledged entry already ran in the handler and must not be replayed"
+        );
+        assert_eq!(
+            loader.get_fsm_state().applied.index,
+            2,
+            "both entries advance the metadata watermark"
+        );
 
         drop(loader);
         js.shutdown();
