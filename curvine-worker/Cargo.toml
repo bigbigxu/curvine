@@ -56,4 +56,5 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 prost = { workspace = true }
+curvine-storage-local = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }
