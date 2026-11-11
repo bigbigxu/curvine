@@ -38,6 +38,17 @@ impl StorageVersion {
         }
     }
 
+    /// Reads the recorded version of `path` without any side effect.
+    ///
+    /// [`StorageVersion::read_version`] reads and generates in one step, so it
+    /// cannot be used to look for an existing identity: a directory whose version
+    /// file is missing would be handed a random id and look like a candidate.
+    pub fn probe<T: AsRef<str>>(path: T) -> CommonResult<Option<StorageVersion>> {
+        let file = PathBuf::from_str(path.as_ref())?.join("version");
+        let ver = LocalFile::read_toml(file.as_path())?;
+        Ok(ver)
+    }
+
     // Read the version information of the storage directory.
     pub fn read_version<T: AsRef<str>>(path: T, cluster_id: T) -> CommonResult<StorageVersion> {
         let path = PathBuf::from_str(path.as_ref())?;

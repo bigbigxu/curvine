@@ -179,7 +179,19 @@ impl VfsDataset {
         let dir_reserved = ByteUnit::from_str(&conf.worker.dir_reserved)?.as_byte();
         let free_ratio = normalize_free_ratio(conf.worker.free_ratio);
 
-        let mut worker_id: Option<u32> = None;
+        // Every data directory records the same worker id, so take it from the
+        // first directory that still has a version file instead of from the first
+        // configured one. Losing (or re-creating) the first data directory used to
+        // renumber the worker and overwrite the healthy directories with the new
+        // id, which orphaned every block location the master knew for the old one.
+        let recorded_id = if conf.format_worker {
+            // The directories are deleted below: what they recorded does not survive.
+            None
+        } else {
+            Self::probe_worker_id(conf)?
+        };
+
+        let mut worker_id: Option<u32> = recorded_id;
         let mut has_spdk = false;
         for s in &conf.worker.data_dir {
             let data_dir = WorkerDataDir::from_str(s)?;
@@ -246,6 +258,24 @@ impl VfsDataset {
             conf.worker.block_checksum_allow_missing,
         );
         Ok(ds)
+    }
+
+    /// Worker id recorded by the first data directory that has a version file.
+    ///
+    /// All data directories of one worker record the same id (each start rewrites
+    /// them with the resolved one), so scanning them all is equivalent to reading
+    /// any single one — but it keeps the identity when the first directory lost its
+    /// file (lost disk, un-mounted path, re-created directory). Read-only: nothing
+    /// is created and no id is generated.
+    fn probe_worker_id(conf: &ClusterConf) -> CommonResult<Option<u32>> {
+        for s in &conf.worker.data_dir {
+            let data_dir = WorkerDataDir::from_str(s)?;
+            let path = data_dir.storage_path(&conf.cluster_id);
+            if let Some(version) = StorageVersion::probe(&path)? {
+                return Ok(Some(version.worker_id));
+            }
+        }
+        Ok(None)
     }
 
     // Initialize.
@@ -839,7 +869,7 @@ mod test {
         StorageVersion, VfsDataset, VfsDir, DEFAULT_CHECKSUM_CHUNK_SIZE,
     };
     use crate::{BlockMeta, BlockState, ChecksumHeader, ChecksumVerify};
-    use curvine_config::{ClusterConf, WorkerConf};
+    use curvine_config::{ClusterConf, WorkerConf, WorkerDataDir};
     use curvine_core_error::CommonResult;
     use curvine_io::DataSlice;
     use curvine_model::{ExtendedBlock, FileType, StorageType};
@@ -852,6 +882,78 @@ mod test {
 
     fn create_data_set(format: bool, dir: &str) -> VfsDataset {
         create_data_set_with_free_ratio(format, dir, 0.0)
+    }
+
+    // ---- worker identity (CV-80) -------------------------------------------------
+
+    fn identity_conf(name: &str, format: bool) -> ClusterConf {
+        ClusterConf {
+            format_worker: format,
+            worker: WorkerConf {
+                dir_reserved: "0".to_string(),
+                data_dir: vec![
+                    format!("[SSD:200B]../testing/dataset-id-{}/d1", name),
+                    format!("[SSD:200B]../testing/dataset-id-{}/d2", name),
+                    format!("[SSD:200B]../testing/dataset-id-{}/d3", name),
+                ],
+                ..WorkerConf::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn dir_version_file(conf: &ClusterConf, index: usize) -> String {
+        let data_dir = WorkerDataDir::from_str(&conf.worker.data_dir[index]).unwrap();
+        format!("{}/version", data_dir.storage_path(&conf.cluster_id))
+    }
+
+    fn open_id(conf: &ClusterConf) -> u32 {
+        VfsDataset::from_conf("test", conf).unwrap().worker_id()
+    }
+
+    /// A lost first data directory must not renumber the worker: the id is read
+    /// from whichever directory still has it instead of from `data_dir[0]`.
+    #[test]
+    fn worker_id_survives_a_lost_first_data_dir() {
+        let conf = identity_conf("lost-dir", true);
+        let id = open_id(&conf);
+
+        // The first disk is gone or was replaced: its version file is missing while
+        // the other directories still hold the real id.
+        std::fs::remove_file(dir_version_file(&conf, 0)).unwrap();
+
+        let reopened = identity_conf("lost-dir", false);
+        assert_eq!(open_id(&reopened), id, "the worker must keep its identity");
+    }
+
+    /// Every directory records the same id, so the config order is irrelevant.
+    #[test]
+    fn worker_id_is_independent_of_the_data_dir_order() {
+        let conf = identity_conf("order", true);
+        let id = open_id(&conf);
+
+        let mut reordered = identity_conf("order", false);
+        reordered.worker.data_dir.reverse();
+        assert_eq!(open_id(&reordered), id);
+    }
+
+    /// `format_worker` still resets the identity: the directories are deleted.
+    #[test]
+    fn format_worker_regenerates_the_identity() {
+        let conf = identity_conf("format", true);
+        let first = open_id(&conf);
+        let second = open_id(&identity_conf("format", true));
+        assert_ne!(first, second);
+    }
+
+    /// Probing must not create or write anything, otherwise a missing directory
+    /// would look like a candidate.
+    #[test]
+    fn probe_has_no_side_effects() {
+        let path = "../testing/dataset-id-probe/absent";
+        let _ = FileUtils::delete_path(path, true);
+        assert!(StorageVersion::probe(path).unwrap().is_none());
+        assert!(!std::path::Path::new(path).exists(), "probe created a dir");
     }
 
     fn create_data_set_with_free_ratio(format: bool, dir: &str, free_ratio: f64) -> VfsDataset {
