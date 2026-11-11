@@ -24,7 +24,7 @@ jobs:
       image: ghcr.io/curvineio/curvine-compile:rocky9
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     # hdfs-sys (opendal-hdfs) uses java-locator which shells out to `which`
     - name: Ensure which is available for hdfs-sys build
@@ -34,7 +34,7 @@ jobs:
         fi
 
     - name: Cache cargo registry
-      uses: actions/cache@v3
+      uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/registry
@@ -70,7 +70,7 @@ jobs:
         echo "Injected artifact versions verified for ${RELEASE_VERSION}"
 
     - name: Upload build artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: curvine-rocky9-x86_64
         path: curvine-*.tar.gz
@@ -81,15 +81,15 @@ jobs:
     needs: build
     runs-on: self-hosted
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Download all artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         path: artifacts
 
     - name: Create Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v3
       with:
         files: artifacts/*/*
         generate_release_notes: true
