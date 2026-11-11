@@ -846,6 +846,22 @@ mod tests {
     }
 
     #[test]
+    fn complete_releases_every_writer_record() {
+        let mut file = InodeFile::new(1, 1);
+        file.features.set_writing("planner".to_string());
+        file.features.set_writing("worker-seg0".to_string());
+
+        // A flush keeps the write open: the target is still being written.
+        file.complete(0, &[], "worker-seg0", true).unwrap();
+        assert!(!file.is_complete());
+
+        // The final complete finalizes the contents whoever reports it, so a
+        // segment target cannot stay permanently incomplete.
+        file.complete(0, &[], "dispatcher", false).unwrap();
+        assert!(file.is_complete());
+    }
+
+    #[test]
     fn release_unwritten_block_only_drops_an_empty_pre_allocated_tail() {
         let worker = WorkerAddress {
             worker_id: 1,
