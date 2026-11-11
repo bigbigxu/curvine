@@ -10,6 +10,9 @@ on:
       - '**'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Self-hosted runners on older glibc hosts cannot run the runner-bundled Node 24.
