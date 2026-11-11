@@ -183,7 +183,7 @@ trait-variant = "0.1.2"
 nix = { version = "0.30.1", features = ["ioctl", "user", "event"] }
 if-addrs = "0.13"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
-mysql = { version = "25.0.1", default-features = false, features = ["default-rustls"] }
+mysql = "26.0.1"
 postgres = "0.19.13"
 postgres_rustls = "0.1.6"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
