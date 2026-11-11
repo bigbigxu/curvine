@@ -225,7 +225,7 @@ const WORKER_LOCATION_LOCK_STRIPES: usize = 256;
 
 impl MasterFilesystem {
     // Max block-report location updates applied under a single fs_dir write lock.
-    const BLOCK_REPORT_WRITE_CHUNK: usize = 4096;
+    pub(crate) const BLOCK_REPORT_WRITE_CHUNK: usize = 4096;
     // Max lost-worker block ids inspected under a single fs_dir write lock.
     const LOST_WORKER_INVALIDATION_CHUNK: usize = Self::BLOCK_REPORT_WRITE_CHUNK;
 
@@ -2474,7 +2474,7 @@ impl MasterFilesystem {
                     replication_handler,
                 )?;
             }
-            self.apply_block_report_batch_locked(list.worker_id, batch, limit_replicas)
+            self.apply_report_locations(list.worker_id, batch, limit_replicas)
         })();
 
         if let Some(blocks) = retry_blocks {
@@ -2687,73 +2687,10 @@ impl MasterFilesystem {
                 );
                 return Ok(Vec::new());
             }
-            self.apply_block_report_batch_locked(worker_id, batch, false)?;
+            self.apply_report_locations(worker_id, batch, false)?;
         }
 
         Ok(stale_block_ids)
-    }
-
-    fn apply_block_report_batch_locked(
-        &self,
-        worker_id: u32,
-        batch: Vec<(bool, i64, BlockLocation)>,
-        limit_replicas: bool,
-    ) -> FsResult<Vec<i64>> {
-        if batch.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut delete_blocks = Vec::new();
-        let mut iter = batch.into_iter();
-        loop {
-            let chunk: Vec<_> = iter.by_ref().take(Self::BLOCK_REPORT_WRITE_CHUNK).collect();
-            if chunk.is_empty() {
-                break;
-            }
-            let mut fs_dir = self.fs_dir.write();
-            let mut accepted = Vec::with_capacity(chunk.len());
-            for (add, block_id, location) in chunk {
-                if !add {
-                    accepted.push((false, block_id, location));
-                    continue;
-                }
-
-                let Some(state) = fs_dir.replication_block_state(block_id)? else {
-                    delete_blocks.push(block_id);
-                    continue;
-                };
-                if state
-                    .locations
-                    .iter()
-                    .any(|current| current.worker_id == worker_id)
-                {
-                    debug!(
-                        "block report: block {} already recorded on worker {}",
-                        block_id, worker_id
-                    );
-                    continue;
-                }
-                if limit_replicas && state.locations.len() >= state.replicas as usize {
-                    debug!(
-                        "block report: block {} ask worker {} to delete, already at {} of {} replicas ({:?})",
-                        block_id,
-                        worker_id,
-                        state.locations.len(),
-                        state.replicas,
-                        state.locations
-                    );
-                    delete_blocks.push(block_id);
-                    continue;
-                }
-                debug!(
-                    "block report: add block {} location for worker {} ({:?}, replicas {})",
-                    block_id, worker_id, state.locations, state.replicas
-                );
-                accepted.push((true, block_id, location));
-            }
-            fs_dir.block_report(accepted)?;
-        }
-        Ok(delete_blocks)
     }
 
     fn worker_location_lock(&self, worker_id: u32) -> &Mutex<()> {
@@ -2795,10 +2732,8 @@ impl MasterFilesystem {
     }
 
     fn delete_locations_unchecked(&self, worker_id: u32) -> FsResult<LostWorkerLocationCleanup> {
-        let removed_block_ids = {
-            let fs_dir = self.fs_dir.write();
-            fs_dir.delete_locations(worker_id)?
-        };
+        // CV-70：位置写入统一经 location_entry 汇聚（journal 落点）。
+        let removed_block_ids = self.purge_worker_locations(worker_id)?;
         info!(
             "Dropped all {} block location(s) of worker {} from metadata",
             removed_block_ids.len(),
@@ -3819,10 +3754,11 @@ mod tests {
             .is_some());
 
         fs.delete(path, false).unwrap();
-        let mut fs_dir = fs.fs_dir.write();
+        let fs_dir = fs.fs_dir.write();
         assert!(fs_dir.replication_block_state(block_id).unwrap().is_none());
-        assert!(!fs_dir
-            .add_replication_location_if_needed(block_id, BlockLocation::with_id(200))
+        drop(fs_dir);
+        assert!(!fs
+            .commit_replica_added(block_id, BlockLocation::with_id(200))
             .unwrap());
     }
 
@@ -3839,13 +3775,14 @@ mod tests {
         fs.create_with_opts(path, opts, OpenFlags::new_create().set_overwrite(true))
             .unwrap();
 
-        let mut fs_dir = fs.fs_dir.write();
+        let fs_dir = fs.fs_dir.write();
         assert!(fs_dir
             .replication_block_state(old_block_id)
             .unwrap()
             .is_none());
-        assert!(!fs_dir
-            .add_replication_location_if_needed(old_block_id, BlockLocation::with_id(200))
+        drop(fs_dir);
+        assert!(!fs
+            .commit_replica_added(old_block_id, BlockLocation::with_id(200))
             .unwrap());
     }
 
@@ -3899,24 +3836,22 @@ mod tests {
     fn replication_location_update_is_idempotent_and_respects_replica_count() {
         let fs = test_fs("replication-location-guard");
         let block_id = replication_file(&fs, "/replication-location-guard.log");
-        let mut fs_dir = fs.fs_dir.write();
-
-        assert!(fs_dir
-            .add_replication_location_if_needed(block_id, BlockLocation::with_id(200))
+        assert!(fs
+            .commit_replica_added(block_id, BlockLocation::with_id(200))
             .unwrap());
-        assert!(
-            !fs_dir
-                .add_replication_location_if_needed(
-                    block_id,
-                    BlockLocation::new(200, StorageType::Ssd),
-                )
-                .unwrap()
-        );
-        assert!(!fs_dir
-            .add_replication_location_if_needed(block_id, BlockLocation::with_id(300))
+        assert!(!fs
+            .commit_replica_added(block_id, BlockLocation::new(200, StorageType::Ssd))
+            .unwrap());
+        assert!(!fs
+            .commit_replica_added(block_id, BlockLocation::with_id(300))
             .unwrap());
 
-        let state = fs_dir.replication_block_state(block_id).unwrap().unwrap();
+        let state = fs
+            .fs_dir
+            .read()
+            .replication_block_state(block_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(state.replicas, 2);
         assert_eq!(state.locations.len(), 2);
         assert_eq!(

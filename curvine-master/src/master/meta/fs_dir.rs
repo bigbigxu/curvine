@@ -1832,6 +1832,8 @@ impl FsDir {
     /// Adds a replication result only if the block is still current and still needs a replica.
     /// The caller holds the filesystem write lock, so validation and insertion are atomic with
     /// respect to overwrite and deletion.
+    ///
+    /// 位置写入统一入口见 `crate::master::fs::location_entry`（CV-70）。
     pub(crate) fn add_replication_location_if_needed(
         &mut self,
         block_id: i64,
@@ -1864,6 +1866,8 @@ impl FsDir {
     /// one is dropped in the same batch, so a block is never left with fewer
     /// copies than before the move. Returns `false` when the block is gone or the
     /// draining location is already absent (idempotent retry).
+    ///
+    /// 位置写入统一入口见 `crate::master::fs::location_entry`（CV-70）。
     pub(crate) fn move_block_location(
         &mut self,
         block_id: i64,
@@ -2089,7 +2093,9 @@ impl FsDir {
         self.store.get_file_counts()
     }
 
-    pub fn block_report(&mut self, blocks: Vec<(bool, i64, BlockLocation)>) -> FsResult<()> {
+    /// 上报对账的批量位置应用。位置写入统一入口见
+    /// `crate::master::fs::location_entry`（CV-70）。
+    pub(crate) fn block_report(&mut self, blocks: Vec<(bool, i64, BlockLocation)>) -> FsResult<()> {
         let mut batch = self.store.new_batch();
         for (add, id, loc) in blocks {
             if add {
@@ -2121,7 +2127,9 @@ impl FsDir {
         self.store.begin_snapshot_scan()
     }
 
-    pub fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
+    /// 摘除某 worker 的全部位置。位置写入统一入口见
+    /// `crate::master::fs::location_entry`（CV-70）。
+    pub(crate) fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
         let block_ids = self.store.store.delete_locations(worker_id)?;
         Ok(block_ids)
     }

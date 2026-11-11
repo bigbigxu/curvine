@@ -921,10 +921,7 @@ impl MasterReplicationManager {
             context: { "block_id" => block_id },
             return_error: |fault| Err(curvine_error::FsError::common(fault.message)),
         }
-        self.fs
-            .fs_dir
-            .write()
-            .add_replication_location_if_needed(block_id, location)
+        self.fs.commit_replica_added(block_id, location)
     }
 
     fn release_target(&self, block_id: BlockId, attempt: &ReplicationAttempt) {

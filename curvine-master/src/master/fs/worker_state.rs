@@ -1263,10 +1263,8 @@ impl MasterFilesystem {
         to: curvine_model::BlockLocation,
         from_worker: u32,
     ) -> FsResult<bool> {
-        let moved = self
-            .fs_dir
-            .write()
-            .move_block_location(block_id, to.clone(), from_worker)?;
+        // CV-70：位置写入统一经 location_entry 汇聚（journal 落点）。
+        let moved = self.commit_drain_move_location(block_id, to.clone(), from_worker)?;
         if moved {
             self.on_drain_block_moved(from_worker, block_id);
             info!(
