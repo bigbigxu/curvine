@@ -432,9 +432,17 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
             (Ok(active_hash), Ok(standby_hash)) => active_hash == standby_hash,
             _ => false,
         };
+        let version_converged = match (
+            mnt_mgr1.mount_table_snapshot(),
+            mnt_mgr2.mount_table_snapshot(),
+        ) {
+            (Ok(a), Ok(b)) => a.version == b.version,
+            _ => false,
+        };
         if active.last_inode_id() == standby.last_inode_id()
             && hash_converged
             && leader_mnt.len() == follower_mnt.len()
+            && version_converged
         {
             break;
         }
@@ -845,8 +853,13 @@ fn test_ufs_loader_complete_file_rename_within_mount_exports_live_path() -> Comm
     Ok(())
 }
 
+/// A real `CompleteFile` finalizes the contents and drops every writer record
+/// (`InodeFile::complete`), so the replay export is driven by the complete.
+/// A replayed `ReleaseWriter` stays a fallback: it exports nothing while the
+/// file is unfinished, and once the file is complete it re-submits an export
+/// that collapses onto the job already recorded for the live path.
 #[test]
-fn test_ufs_loader_release_writer_exports_after_last_writer() -> CommonResult<()> {
+fn test_ufs_loader_complete_exports_and_release_writer_is_a_fallback() -> CommonResult<()> {
     let _serial = serialize_metrics_sensitive_test();
     let (conf, journal_system, fs, ufs_dir) = new_ufs_loader_complete_env("release-writer")?;
 
@@ -863,6 +876,38 @@ fn test_ufs_loader_release_writer_exports_after_last_writer() -> CommonResult<()
     open_opts.client_name = "client-b".to_string();
     fs.open_file("/mnt/two-writers.log", open_opts, OpenFlags::new_create())?;
 
+    let loader = UfsLoader::new(
+        journal_system.job_manager(),
+        journal_system.fs().fs_dir.clone(),
+        &conf.journal,
+    );
+    let rt = AsyncRuntime::single();
+    let live = Path::from_str("/mnt/two-writers.log")?;
+    let live_job_id = CommonUtils::create_job_id(live.clone_uri());
+
+    // A writer that closes without completing releases only its own marker, and
+    // the fallback export stays silent: the file is still unfinished.
+    journal_system.fs().fs_dir.read().take_entries();
+    assert!(fs.release_writer(ino, "client-a")?);
+    let release_entry = take_release_writer_entry(&journal_system)?;
+    rt.block_on(async { loader.release_writer(&release_entry).await })?;
+    assert!(
+        journal_system
+            .job_manager()
+            .get_job_status(&live_job_id)
+            .is_err(),
+        "releasing one writer of an unfinished file must not export"
+    );
+    assert!(
+        collect_ufs_rel_files(&ufs_dir).is_empty(),
+        "no UFS object may appear for an unfinished file: {:?}",
+        collect_ufs_rel_files(&ufs_dir)
+    );
+
+    // Completing finalizes the contents whoever reports it: the remaining writer
+    // records are dropped and the export targets the live CV path. The harness
+    // has no RPC server for the copy, so the job is expected to fail after
+    // submission; what matters is that it was submitted.
     journal_system.fs().fs_dir.read().take_entries();
     fs.complete_file(
         "/mnt/two-writers.log",
@@ -874,43 +919,13 @@ fn test_ufs_loader_release_writer_exports_after_last_writer() -> CommonResult<()
         None,
     )?;
     let complete_entry = take_complete_file_entry(&journal_system)?;
+    let _complete_export = rt.block_on(async { loader.complete_file(&complete_entry).await });
 
-    let loader = UfsLoader::new(
-        journal_system.job_manager(),
-        journal_system.fs().fs_dir.clone(),
-        &conf.journal,
-    );
-    let rt = AsyncRuntime::single();
-    rt.block_on(async { loader.complete_file(&complete_entry).await })?;
-
-    let live = Path::from_str("/mnt/two-writers.log")?;
-    assert!(
-        journal_system
-            .job_manager()
-            .get_job_status(CommonUtils::create_job_id(live.clone_uri()))
-            .is_err(),
-        "completing one writer while another remains must not export"
-    );
-    assert!(
-        collect_ufs_rel_files(&ufs_dir).is_empty(),
-        "no UFS object may appear while a writer remains: {:?}",
-        collect_ufs_rel_files(&ufs_dir)
-    );
-
-    assert!(fs.release_writer(ino, "client-a")?);
-    let release_entry = take_release_writer_entry(&journal_system)?;
-    // The harness has no RPC server for the export to read from, so the job is
-    // expected to fail after submission; what matters is that it was submitted.
-    let _export = rt.block_on(async { loader.release_writer(&release_entry).await });
-
-    let job = match journal_system
-        .job_manager()
-        .get_job_status(CommonUtils::create_job_id(live.clone_uri()))
-    {
+    let job = match journal_system.job_manager().get_job_status(&live_job_id) {
         Ok(job) => job,
         Err(status_err) => {
             return err_box!(
-                "releasing the last writer must submit an export job; status={}",
+                "completing the file must submit an export job; status={}",
                 status_err
             );
         }
@@ -920,6 +935,27 @@ fn test_ufs_loader_release_writer_exports_after_last_writer() -> CommonResult<()
         "export source should be the live CV path, got {}",
         job.source_path
     );
+
+    // Replaying the release after the complete is the fallback path: it may
+    // submit again, but the job id is derived from the source path, so the job
+    // recorded for the live path is the one that keeps running.
+    let _fallback = rt.block_on(async { loader.release_writer(&release_entry).await });
+    let after = match journal_system.job_manager().get_job_status(&live_job_id) {
+        Ok(job) => job,
+        Err(status_err) => {
+            return err_box!(
+                "the fallback export must keep the job queryable; status={}",
+                status_err
+            );
+        }
+    };
+    assert_eq!(after.job_id, job.job_id);
+    assert!(
+        after.source_path.ends_with("/mnt/two-writers.log"),
+        "fallback export must keep the live CV source, got {}",
+        after.source_path
+    );
+
     let _ = std::fs::remove_dir_all(&ufs_dir);
     Ok(())
 }

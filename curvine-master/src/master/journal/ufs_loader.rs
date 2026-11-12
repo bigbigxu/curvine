@@ -366,10 +366,19 @@ impl UfsLoader {
         }
     }
 
-    /// Export a file that became complete because its last writer was released.
+    /// Best-effort export retry for a replayed `ReleaseWriter`.
+    ///
+    /// A real `CompleteFile` finalizes the contents and drops every writer
+    /// record (`InodeFile::complete`), so the export is driven by
+    /// [`Self::complete_file`]. This path stays as a fallback for a file that is
+    /// already complete when a writer's release is replayed: it re-submits the
+    /// export, and because the job id is derived from the source path, the
+    /// re-submission collapses onto the in-flight or finished job instead of
+    /// starting a second copy. A file still being written by someone else
+    /// exports nothing here.
     ///
     /// The metadata side of the entry is already applied on the leader, so the
-    /// stored inode tells us whether any writer remains. Reading it under the
+    /// stored inode tells us whether the file is complete. Reading it under the
     /// guard and exporting outside it keeps the export from stalling metadata
     /// writes.
     pub async fn release_writer(&self, e: &ReleaseWriterEntry) -> CommonResult<()> {
