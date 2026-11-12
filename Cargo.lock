@@ -3276,6 +3276,7 @@ dependencies = [
  "futures",
  "log",
  "opendal",
+ "tokio",
 ]
 
 [[package]]
