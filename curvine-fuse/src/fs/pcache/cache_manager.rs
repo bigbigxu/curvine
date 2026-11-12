@@ -76,7 +76,7 @@ impl CacheManager {
             return err_box!("write_back_page_size must be > 0");
         }
         let flush_delay = conf.write_back_flush_delay.as_millis() as u128;
-        let meta_cache_ttl = conf.meta_cache_ttl.as_millis();
+        let meta_cache_ttl = conf.effective_meta_cache_ttl().as_millis();
         if flush_delay > meta_cache_ttl / 2 {
             return err_box!(
                 "write_back_flush_delay ({}ms) must be less than half of meta_cache_ttl ({}ms)",
@@ -98,7 +98,7 @@ impl CacheManager {
                 conf.write_back_free_ratio
             );
         }
-        if !conf.enable_meta_cache {
+        if !conf.effective_meta_cache_enabled() {
             return err_box!("write_back cache requires enable_meta_cache to be enabled");
         }
         Ok(())

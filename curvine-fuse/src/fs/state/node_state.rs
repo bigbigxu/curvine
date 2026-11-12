@@ -84,8 +84,8 @@ impl NodeState {
     pub fn new(fs: UnifiedFileSystem) -> FuseResult<Self> {
         let conf = fs.conf().fuse.clone();
         let enable_write_back = conf.enable_write_back;
-        let meta_cache_ttl = conf.meta_cache_ttl.as_millis() as u64;
-        let enable_meta_cache = conf.enable_meta_cache;
+        let meta_cache_ttl = conf.effective_meta_cache_ttl().as_millis() as u64;
+        let enable_meta_cache = conf.effective_meta_cache_enabled();
 
         let (sender, receiver) = AsyncChannel::new(conf.write_back_channel_size).split();
         let cm = Arc::new(CacheManager::new(&conf, sender)?);
@@ -1244,7 +1244,11 @@ impl NodeState {
             dir.check_deleted_child(ino, name)?;
 
             let inode = if add_lookup {
-                dir.lookup_valid_inode(ino, name, self.meta_cache_ttl)
+                if self.conf.entry_ttl.is_zero() {
+                    None
+                } else {
+                    dir.lookup_valid_inode(ino, name, self.meta_cache_ttl)
+                }
             } else {
                 dir.get_valid_inode(ino, name, self.meta_cache_ttl)
             };
@@ -1942,7 +1946,7 @@ mod test {
     use curvine_fs_api::{StateReader, StateWriter};
     use curvine_model::FileStatus;
     use curvine_net::net::InetAddr;
-    use curvine_runtime::common::{FastHashMap, Utils};
+    use curvine_runtime::common::{DurationUnit, FastHashMap, Utils};
     use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
     use std::sync::Arc;
 
@@ -2120,7 +2124,9 @@ mod test {
     #[test]
     fn resolved_root_status_is_cached_when_metadata_cache_is_disabled() {
         let rt = Arc::new(AsyncRuntime::single());
-        let fs = UnifiedFileSystem::with_rt(ClusterConf::default(), rt).unwrap();
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = Some(false);
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
         let state = NodeState::new(fs).unwrap();
         assert!(!state.enable_meta_cache);
         assert_eq!(
@@ -2149,10 +2155,42 @@ mod test {
     }
 
     #[test]
+    fn lookup_hit_follows_entry_timeout() {
+        let rt = Arc::new(AsyncRuntime::single());
+        let mut conf = ClusterConf::default();
+        conf.fuse.attr_timeout = DurationUnit::new(5 * DurationUnit::SECONDS);
+        conf.fuse.entry_timeout = DurationUnit::new(0);
+        conf.fuse.init().unwrap();
+        let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
+        let state = NodeState::new(fs).unwrap();
+
+        let status = FileStatus::with_name(11, "name_ttl".to_string(), false);
+        {
+            let mut tree = state.dir_write();
+            tree.lookup(FUSE_ROOT_ID, "name_ttl", status, true).unwrap();
+        }
+
+        assert!(
+            state
+                .get_cached_status(FUSE_ROOT_ID, Some("name_ttl"), true)
+                .unwrap()
+                .is_none(),
+            "entry_timeout = 0 must not serve names from the userspace cache"
+        );
+        assert!(
+            state
+                .get_cached_status(FUSE_ROOT_ID, Some("name_ttl"), false)
+                .unwrap()
+                .is_some(),
+            "the attr copy stays cached for getattr"
+        );
+    }
+
+    #[test]
     fn cached_lookup_counts_concurrent_hits_under_read_lock() {
         let rt = Arc::new(AsyncRuntime::single());
         let mut conf = ClusterConf::default();
-        conf.fuse.enable_meta_cache = true;
+        conf.fuse.enable_meta_cache = Some(true);
         conf.fuse.metrics_enabled = false;
         let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
         let state = NodeState::new(fs).unwrap();
@@ -2192,7 +2230,7 @@ mod test {
     fn invalidating_parent_status_drops_stale_nlink() {
         let rt = Arc::new(AsyncRuntime::single());
         let mut conf = ClusterConf::default();
-        conf.fuse.enable_meta_cache = true;
+        conf.fuse.enable_meta_cache = Some(true);
         conf.fuse.metrics_enabled = false;
         let fs = UnifiedFileSystem::with_rt(conf, rt).unwrap();
         let state = NodeState::new(fs).unwrap();
@@ -2228,7 +2266,7 @@ mod test {
         let rt = Arc::new(AsyncRuntime::single());
         rt.block_on(async {
             let mut conf = ClusterConf::default();
-            conf.fuse.enable_meta_cache = true;
+            conf.fuse.enable_meta_cache = Some(true);
             conf.fuse.metrics_enabled = false;
             let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
             let state = Arc::new(NodeState::new(fs).unwrap());
@@ -2275,7 +2313,7 @@ mod test {
         let rt = Arc::new(AsyncRuntime::single());
         rt.block_on(async {
             let mut conf = ClusterConf::default();
-            conf.fuse.enable_meta_cache = false;
+            conf.fuse.enable_meta_cache = Some(false);
             conf.fuse.metrics_enabled = false;
             // Hermetic backend: point at a closed port and keep every retry
             // budget short, so the RPC fails deterministically well inside

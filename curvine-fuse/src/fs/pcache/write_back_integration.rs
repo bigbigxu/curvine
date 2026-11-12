@@ -76,7 +76,7 @@ impl WriteBackTestContext {
 
         let mut fuse = FuseConf {
             enable_write_back: true,
-            enable_meta_cache: true,
+            enable_meta_cache: Some(true),
             write_back_cache_type: cache_type.to_string(),
             write_back_disk_dirs: vec![disk_dir.to_string_lossy().to_string()],
             write_back_page_size: ByteUnit::new(page_size),
