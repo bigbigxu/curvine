@@ -129,6 +129,7 @@ pub(crate) fn errno_of(value: &FsError) -> i32 {
         FsError::InProgress(_) => Some(libc::EBUSY),
         FsError::UnsupportedUfsRead(_) => Some(libc::EOPNOTSUPP),
         FsError::ReadOnly(_) => Some(libc::EROFS),
+        FsError::PermissionDenied(_) => Some(libc::EACCES),
         _ => None,
     };
 
@@ -257,6 +258,13 @@ mod tests {
         let err: FuseError = FsError::read_only("/mnt/ro").into();
         assert_eq!(err.errno, libc::EROFS);
         assert_eq!(errno_label(err.errno), "EROFS");
+    }
+
+    #[test]
+    fn permission_denied_maps_to_eacces() {
+        let err: FuseError = FsError::permission_denied("special file nodes are read-only").into();
+        assert_eq!(err.errno, libc::EACCES);
+        assert_eq!(errno_label(err.errno), "EACCES");
     }
 
     #[test]

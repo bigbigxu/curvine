@@ -73,6 +73,7 @@ pub enum ErrorKind {
     TransferStoreUnavailable = 34,
     TransferAlreadyRunning = 35,
     TransferTargetConflict = 36,
+    PermissionDenied = 37,
 
     #[num_enum(default)]
     Common = 10000,
@@ -226,6 +227,10 @@ pub enum FsError {
     #[error("{0}")]
     TransferTargetConflict(ErrorImpl<StringError>),
 
+    // The operation is not permitted for this object (POSIX EACCES).
+    #[error("{0}")]
+    PermissionDenied(ErrorImpl<StringError>),
+
     // Other errors that are not defined.
     #[error("{0}")]
     Common(ErrorImpl<StringError>),
@@ -314,6 +319,16 @@ impl FsError {
 
     pub fn transfer_target_conflict(msg: impl Into<String>) -> Self {
         Self::TransferTargetConflict(ErrorImpl::with_source(msg.into().into()))
+    }
+
+    pub fn permission_denied(msg: impl Into<String>) -> Self {
+        // Keep the "permission denied" token in the text: clients that predate
+        // ErrorKind::PermissionDenied decode it as Common and map the message
+        // back to EACCES via the same fallback used for UFS errors.
+        let msg = msg.into();
+        Self::PermissionDenied(ErrorImpl::with_source(
+            format!("permission denied: {msg}").into(),
+        ))
     }
 
     pub fn file_exists(path: impl AsRef<str>) -> Self {
@@ -460,6 +475,7 @@ impl FsError {
             FsError::TransferStoreUnavailable(_) => ErrorKind::TransferStoreUnavailable,
             FsError::TransferAlreadyRunning(_) => ErrorKind::TransferAlreadyRunning,
             FsError::TransferTargetConflict(_) => ErrorKind::TransferTargetConflict,
+            FsError::PermissionDenied(_) => ErrorKind::PermissionDenied,
             FsError::Common(_) => ErrorKind::Common,
         }
     }
@@ -608,6 +624,7 @@ impl ErrorExt for FsError {
             FsError::TransferStoreUnavailable(e) => FsError::TransferStoreUnavailable(e.ctx(ctx)),
             FsError::TransferAlreadyRunning(e) => FsError::TransferAlreadyRunning(e.ctx(ctx)),
             FsError::TransferTargetConflict(e) => FsError::TransferTargetConflict(e.ctx(ctx)),
+            FsError::PermissionDenied(e) => FsError::PermissionDenied(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
     }
@@ -650,6 +667,7 @@ impl ErrorExt for FsError {
             FsError::TransferStoreUnavailable(e) => e.encode(ErrorKind::TransferStoreUnavailable),
             FsError::TransferAlreadyRunning(e) => e.encode(ErrorKind::TransferAlreadyRunning),
             FsError::TransferTargetConflict(e) => e.encode(ErrorKind::TransferTargetConflict),
+            FsError::PermissionDenied(e) => e.encode(ErrorKind::PermissionDenied),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
     }
@@ -697,6 +715,7 @@ impl ErrorExt for FsError {
             }
             ErrorKind::TransferAlreadyRunning => FsError::TransferAlreadyRunning(de.into_string()),
             ErrorKind::TransferTargetConflict => FsError::TransferTargetConflict(de.into_string()),
+            ErrorKind::PermissionDenied => FsError::PermissionDenied(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
     }
@@ -835,6 +854,20 @@ mod tests {
         let decoded = FsError::decode(bytes);
         assert!(matches!(decoded, FsError::TransferAlreadyRunning(_)));
         assert!(decoded.to_string().contains("different command"));
+    }
+
+    #[test]
+    pub fn permission_denied_round_trip_test() {
+        let error = FsError::permission_denied("/a: special file nodes are read-only metadata");
+
+        assert!(matches!(error.kind(), ErrorKind::PermissionDenied));
+        let decoded = FsError::decode(error.encode());
+        assert!(matches!(decoded.kind(), ErrorKind::PermissionDenied));
+        assert!(matches!(decoded, FsError::PermissionDenied(_)));
+        assert!(decoded.to_string().contains("read-only metadata"));
+        // Legacy clients decode unknown error kinds as Common and recover the
+        // errno from the text; keep the token they match on.
+        assert!(decoded.to_string().contains("permission denied"));
     }
 
     #[test]

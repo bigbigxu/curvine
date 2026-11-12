@@ -20,6 +20,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CreateCallerCreds {
+    /// Caller effective gid followed by supplementary groups.
+    pub gids: Vec<u32>,
+    pub umask: u32,
+    pub cap_fsetid: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CreateFileOpts {
     pub create_parent: bool,
@@ -34,6 +42,10 @@ pub struct CreateFileOpts {
     pub group: String,
     pub sync_ufs_meta: bool,
     pub ufs_len: i64,
+    /// When set, `mode` is the raw requested mode and the master normalizes it
+    /// (umask + setgid authorization) inside the create transaction.
+    #[serde(default)]
+    pub caller_creds: Option<CreateCallerCreds>,
 }
 
 impl CreateFileOpts {
@@ -51,6 +63,7 @@ impl CreateFileOpts {
             group: "".to_string(),
             sync_ufs_meta: false,
             ufs_len: 0,
+            caller_creds: None,
         }
     }
 
@@ -217,6 +230,7 @@ impl CreateFileOptsBuilder {
             group: self.group,
             sync_ufs_meta: self.sync_ufs_meta,
             ufs_len: self.ufs_len,
+            caller_creds: None,
         }
     }
 }

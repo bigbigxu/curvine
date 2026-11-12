@@ -25,9 +25,10 @@ use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
-    BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
-    FreeResult, LeaderSnapshotInfo, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts,
-    TrashEntry, TtlAction, WorkerAddress, INTERNAL_CTIME_XATTR,
+    normalize_create_mode, resolve_group_gid, BlockLocation, CommitBlock, CreateFileOpts,
+    ExtendedBlock, FileAllocOpts, FileLock, FileStatus, FreeResult, LeaderSnapshotInfo,
+    ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, TrashEntry, TtlAction,
+    WorkerAddress, INTERNAL_CTIME_XATTR, MODE_SETGID,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::AtomicCounter;
@@ -35,8 +36,6 @@ use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet, LinkedList};
 use std::mem;
 use std::sync::Arc;
-
-const MODE_SETGID: u32 = 0o2000;
 
 /// Note: The modification operation uses &mut self, which is a necessary improvement. We use the unsafe API to perform modifications.
 pub struct FsDir {
@@ -1504,10 +1503,48 @@ impl FsDir {
         }
 
         // Create a directory that does not exist.
-        inp = self.create_parent_dir(inp, opts.dir_opts())?;
+        let dir_opts = {
+            let mut dir_opts = opts.dir_opts();
+            // Auto-created parents: a requested S_ISGID targets the caller's
+            // own group (the dir group is opts.group), so the caller is always
+            // authorized and only umask applies. A parent's setgid bit is
+            // inherited later by create_single_dir and is not privilege-gated
+            // by POSIX.
+            if let Some(creds) = &opts.caller_creds {
+                dir_opts.mode &= !creds.umask;
+            }
+            dir_opts
+        };
+        inp = self.create_parent_dir(inp, dir_opts)?;
 
-        if let Some(group) = Self::setgid_parent_group(&inp)? {
+        let inherited_group = Self::setgid_parent_group(&inp)?;
+        let setgid_parent = inherited_group.is_some();
+        if let Some(group) = inherited_group {
             opts.group = group;
+        }
+
+        // The client delegated mode normalization: `mode` is the raw requested
+        // mode and the created group is now known (parent setgid group, or the
+        // caller's group already stored in opts). Normalize in place, in the
+        // same transaction that reads the parent - no extra lookup needed.
+        if let Some(creds) = &opts.caller_creds {
+            let caller_in_created_group = if setgid_parent {
+                // The created group is the parent's group name: the only case
+                // that needs an NSS lookup. A resolution failure means "not a
+                // member" and strips setgid.
+                resolve_group_gid(&opts.group).is_some_and(|gid| creds.gids.contains(&gid))
+            } else {
+                // Without a setgid parent the file keeps the caller's effective
+                // gid (opts.group is derived from it), so the caller is
+                // trivially in the created group.
+                true
+            };
+            opts.mode = normalize_create_mode(
+                opts.mode,
+                creds.umask,
+                caller_in_created_group,
+                creds.cap_fsetid,
+            );
         }
 
         let name = inp.name().to_string();

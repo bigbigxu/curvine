@@ -107,6 +107,13 @@ impl MasterHandshake {
             .unwrap_or(&[])
     }
 
+    /// Whether the master advertised this capability. Legacy peers and peers
+    /// that did not report capabilities return `false`, so callers fall back
+    /// to their pre-handshake behavior.
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.capabilities().iter().any(|c| c == capability)
+    }
+
     /// Compatibility mode the master advertises. An unset/unknown mode is
     /// treated as `DIAGNOSE` (lenient) per the proto contract, so a handshake
     /// never rejects peers by default.
@@ -194,6 +201,8 @@ mod tests {
             hs.capabilities(),
             &["transfer".to_string(), "batch-write".to_string()]
         );
+        assert!(hs.has_capability("transfer"));
+        assert!(!hs.has_capability("open-special-guard"));
         assert_eq!(
             hs.master_version()
                 .and_then(|v| v.release_version.as_deref()),

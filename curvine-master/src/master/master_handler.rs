@@ -92,7 +92,14 @@ impl MasterHandler {
         metrics.active_connections.inc();
         // Build the master's compatibility payload once; GetFilesystemInfo can
         // be hot (statfs) and the underlying version metadata is immutable.
-        let master_version = curvine_sys::version::component_version("master");
+        // Capabilities advertise master-side guards that let clients drop their
+        // pre-request metadata probes.
+        let master_version = curvine_sys::version::component_version("master").with_capabilities(
+            curvine_model::MASTER_CAPABILITIES
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+        );
         // The advertised contract and the enforcement policy both come from
         // the configured compatibility section; defaults are lenient diagnose
         // with no bounds, so old components are never rejected by default.

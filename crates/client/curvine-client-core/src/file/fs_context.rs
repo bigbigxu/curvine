@@ -168,6 +168,12 @@ impl FsContext {
         self.master_handshake.read().clone()
     }
 
+    /// Whether the master advertised `capability`, without cloning the cached
+    /// handshake. Safe on hot paths (one read lock, no allocation).
+    pub fn master_has_capability(&self, capability: &str) -> bool {
+        self.master_handshake.read().has_capability(capability)
+    }
+
     /// Atomically claim the one-time right to attach this client's
     /// `component_info` to a `GetFilesystemInfo` request. Returns `true` only
     /// for the first caller per session, so handshake metadata is reported

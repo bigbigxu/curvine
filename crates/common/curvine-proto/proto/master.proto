@@ -28,6 +28,17 @@ message MkdirResponse {
     required FileStatusProto status = 2;
 }
 
+// Caller credentials used by the master to normalize a create mode in the
+// metadata transaction (umask + setgid authorization). When present, `mode` in
+// CreateFileOptsProto is the raw requested mode and the master applies the
+// normalization; when absent, `mode` is already final.
+message CreateCallerCredsProto {
+    // Caller effective gid followed by supplementary groups.
+    repeated uint32 gids = 1;
+    required uint32 umask = 2;
+    required bool cap_fsetid = 3 [default = false];
+}
+
 message CreateFileOptsProto {
     required int32 create_flag = 1 [default = 1];
     required bool create_parent = 2;
@@ -43,6 +54,7 @@ message CreateFileOptsProto {
     required string group = 11;
     required bool sync_ufs_meta = 12 [default = false];
     required int64 ufs_len = 13 [default = 0];
+    optional CreateCallerCredsProto caller_creds = 14;
 }
 
 // Create a file.

@@ -289,6 +289,12 @@ impl UnifiedFileSystem {
         self.cv.master_handshake()
     }
 
+    /// Whether the master advertised `capability`, without cloning the cached
+    /// handshake.
+    pub fn master_has_capability(&self, capability: &str) -> bool {
+        self.cv.master_has_capability(capability)
+    }
+
     pub async fn get_filesystem_info_bytes(&self) -> FsResult<BytesMut> {
         let fut = async { self.cv.get_filesystem_info_bytes().await };
         self.track("GetFilesystemInfo", "", "", fut).await

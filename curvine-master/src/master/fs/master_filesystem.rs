@@ -995,6 +995,17 @@ impl MasterFilesystem {
                 if inode.is_dir() {
                     return err_box!("{} is a directory", inp.path());
                 }
+                // Special nodes are metadata-only. Reject before O_TRUNC /
+                // reopen_file so a failed write open leaves no side effects
+                // (no writer state, no journal entry, no block release).
+                if let InodeView::File(file) = &*inode {
+                    if is_special_file_type(file.file_type) {
+                        return err_ext!(FsError::permission_denied(format!(
+                            "{}: special file nodes are read-only metadata",
+                            inp.path()
+                        )));
+                    }
+                }
                 inode
             }
         };
@@ -5372,5 +5383,149 @@ mod tests {
             .set_lock("/getlk.log", lock_for("other-client", 2, false))
             .unwrap()
             .is_none());
+    }
+
+    fn create_special_node(fs: &MasterFilesystem, path: &str, file_type: FileType) {
+        let opts = CreateFileOptsBuilder::new().file_type(file_type).build();
+        fs.create_with_opts(path, opts, OpenFlags::new_create())
+            .unwrap();
+    }
+
+    #[test]
+    fn open_special_file_for_write_is_rejected_without_side_effects() {
+        let fs = test_fs("open-special-guard");
+        create_special_node(&fs, "/fifo", FileType::Fifo);
+        let before = fs.file_status("/fifo").unwrap();
+
+        let opts = CreateFileOpts::with_create(false);
+        let err = fs
+            .open_file(
+                "/fifo",
+                opts.clone(),
+                OpenFlags::new_write_only().set_truncate(true),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, FsError::PermissionDenied(_)),
+            "expected PermissionDenied, got {:?}",
+            err.kind()
+        );
+
+        // No truncation, no block list, no writer state left behind.
+        let after = fs.file_status("/fifo").unwrap();
+        assert_eq!(after.len, before.len);
+        assert!(fs
+            .get_block_locations("/fifo")
+            .unwrap()
+            .block_locs
+            .is_empty());
+        let err = fs
+            .open_file("/fifo", opts, OpenFlags::new_write_only())
+            .unwrap_err();
+        assert!(matches!(err, FsError::PermissionDenied(_)));
+    }
+
+    #[test]
+    fn open_special_file_read_only_returns_special_status() {
+        let fs = test_fs("open-special-read");
+        for file_type in [
+            FileType::Fifo,
+            FileType::Char,
+            FileType::Block,
+            FileType::Socket,
+        ] {
+            let path = format!("/node-{:?}", file_type);
+            create_special_node(&fs, &path, file_type);
+
+            let blocks = fs
+                .open_file(
+                    &path,
+                    CreateFileOpts::with_create(false),
+                    OpenFlags::new_read_only(),
+                )
+                .unwrap();
+            assert_eq!(blocks.status.file_type, file_type);
+        }
+    }
+
+    fn create_with_creds(
+        fs: &MasterFilesystem,
+        path: &str,
+        requested_mode: u32,
+        umask: u32,
+        gids: &[u32],
+        cap_fsetid: bool,
+    ) -> FileStatus {
+        let mut opts = CreateFileOptsBuilder::new().mode(requested_mode).build();
+        opts.owner = "caller".to_string();
+        opts.group = "1".to_string();
+        opts.caller_creds = Some(CreateCallerCreds {
+            gids: gids.to_vec(),
+            umask,
+            cap_fsetid,
+        });
+        fs.create_with_opts(path, opts, OpenFlags::new_create())
+            .unwrap()
+    }
+
+    #[test]
+    fn create_file_normalizes_mode_from_caller_creds() {
+        let fs = test_fs("create-mode-normalize");
+        // Without a setgid parent, the created group is the caller's own
+        // egid (gids[0], also recorded in opts.group), so the caller is
+        // always authorized and only umask applies here. The unauthorized
+        // setgid strip is covered by the setgid-parent test below.
+        let cases = [
+            // (requested, umask, gids, cap_fsetid, expected)
+            (0o2010, 0o022, vec![1], false, 0o2010),
+            (0o2010, 0o022, vec![1, 2], false, 0o2010),
+            // umask clears group-exec, but authorization is decided on the
+            // requested mode, so setgid is kept.
+            (0o2010, 0o0010, vec![1], false, 0o2000),
+            // No setgid requested: plain umask application.
+            (0o0666, 0o022, vec![1], false, 0o0644),
+        ];
+        for (i, (requested, umask, gids, cap, expected)) in cases.into_iter().enumerate() {
+            let path = format!("/file-{i}");
+            let status = create_with_creds(&fs, &path, requested, umask, &gids, cap);
+            assert_eq!(status.mode, expected, "case {i}: {requested:o}/{umask:o}");
+        }
+    }
+
+    #[test]
+    fn create_file_in_setgid_parent_authorizes_against_parent_group() {
+        let fs = test_fs("create-mode-setgid-parent");
+        let mut dir_opts = MkdirOptsBuilder::new().build();
+        dir_opts.mode = 0o2755;
+        dir_opts.group = "4242".to_string();
+        fs.mkdir_with_opts("/sg", dir_opts).unwrap();
+
+        // Caller in the inherited group keeps setgid and the file group is the
+        // parent's group.
+        let member = create_with_creds(&fs, "/sg/member", 0o2010, 0, &[4242], false);
+        assert_eq!(member.mode, 0o2010);
+        assert_eq!(member.group, "4242");
+
+        // Caller outside the inherited group loses setgid.
+        let outsider = create_with_creds(&fs, "/sg/outsider", 0o2010, 0, &[7], false);
+        assert_eq!(outsider.mode, 0o0010);
+        assert_eq!(outsider.group, "4242");
+
+        // CAP_FSETID lets an outsider keep setgid.
+        let capable = create_with_creds(&fs, "/sg/capable", 0o2010, 0, &[7], true);
+        assert_eq!(capable.mode, 0o2010);
+        assert_eq!(capable.group, "4242");
+    }
+
+    #[test]
+    fn create_file_without_creds_keeps_mode_as_is() {
+        let fs = test_fs("create-mode-legacy");
+        let mut opts = CreateFileOptsBuilder::new().mode(0o2010).build();
+        opts.group = "1".to_string();
+        opts.owner = "caller".to_string();
+        let status = fs
+            .create_with_opts("/legacy", opts, OpenFlags::new_create())
+            .unwrap();
+        assert_eq!(status.mode, 0o2010);
     }
 }

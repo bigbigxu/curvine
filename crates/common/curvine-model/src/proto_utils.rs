@@ -659,6 +659,11 @@ impl ProtoUtils {
             group: opts.group,
             sync_ufs_meta: opts.sync_ufs_meta,
             ufs_len: opts.ufs_len,
+            caller_creds: opts.caller_creds.map(|creds| CreateCallerCredsProto {
+                gids: creds.gids,
+                umask: creds.umask,
+                cap_fsetid: creds.cap_fsetid,
+            }),
         }
     }
 
@@ -676,6 +681,11 @@ impl ProtoUtils {
             group: opts.group,
             sync_ufs_meta: opts.sync_ufs_meta,
             ufs_len: opts.ufs_len,
+            caller_creds: opts.caller_creds.map(|creds| CreateCallerCreds {
+                gids: creds.gids,
+                umask: creds.umask,
+                cap_fsetid: creds.cap_fsetid,
+            }),
         }
     }
 

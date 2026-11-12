@@ -376,6 +376,12 @@ impl CurvineFileSystem {
         self.fs_client.master_handshake()
     }
 
+    /// Whether the master advertised `capability`, without cloning the cached
+    /// handshake.
+    pub fn master_has_capability(&self, capability: &str) -> bool {
+        self.fs_client.master_has_capability(capability)
+    }
+
     pub async fn get_filesystem_info_bytes(&self) -> FsResult<BytesMut> {
         self.fs_client.get_filesystem_info_bytes().await
     }

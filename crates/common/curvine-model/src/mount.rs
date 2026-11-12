@@ -312,6 +312,7 @@ impl MountInfo {
             group: opts.group,
             sync_ufs_meta: opts.sync_ufs_meta,
             ufs_len: opts.ufs_len,
+            caller_creds: opts.caller_creds,
         }
     }
 

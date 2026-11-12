@@ -122,9 +122,13 @@ pub use self::trash_entry::*;
 mod proto_utils;
 pub use self::proto_utils::ProtoUtils;
 
+mod create_mode;
+pub use self::create_mode::{normalize_create_mode, resolve_group_gid, MODE_SETGID};
+
 mod compatibility;
 pub use self::compatibility::{
     feature_enabled, CompatibilityMode, CompatibilityPolicy, CompatibilityVerdict,
+    CAP_CREATE_MODE_NORMALIZE, CAP_OPEN_SPECIAL_GUARD, MASTER_CAPABILITIES,
 };
 
 mod display;

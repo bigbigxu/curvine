@@ -809,6 +809,12 @@ impl FsClient {
         self.context.master_handshake()
     }
 
+    /// Whether the master advertised `capability`, without cloning the cached
+    /// handshake.
+    pub fn master_has_capability(&self, capability: &str) -> bool {
+        self.context.master_has_capability(capability)
+    }
+
     /// Build the client's own `component_info` payload for the handshake.
     fn handshake_request_component_info() -> ComponentInfoProto {
         ProtoUtils::component_version_to_pb(&curvine_sys::version::component_version("client"))

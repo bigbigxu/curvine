@@ -277,6 +277,17 @@ impl CompatibilityPolicy {
     }
 }
 
+/// Capability token: the master rejects write opens of special file nodes
+/// itself, so clients need no pre-open status probe.
+pub const CAP_OPEN_SPECIAL_GUARD: &str = "open-special-guard";
+
+/// Capability token: the master normalizes create modes from caller
+/// credentials sent in `CreateFileOptsProto.caller_creds`.
+pub const CAP_CREATE_MODE_NORMALIZE: &str = "create-mode-normalize";
+
+/// Capabilities advertised by the master build.
+pub const MASTER_CAPABILITIES: [&str; 2] = [CAP_OPEN_SPECIAL_GUARD, CAP_CREATE_MODE_NORMALIZE];
+
 /// A feature is enabled only when **both** the server and the peer declare the
 /// capability. Capabilities are finer-grained than versions and take priority
 /// for feature negotiation (short-circuit, batch-write, transfer, ...).

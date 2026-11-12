@@ -58,6 +58,20 @@ impl CallerProcessStatus {
     pub(crate) fn has_effective_capability(&self, capability: u32) -> bool {
         capability < u64::BITS && self.effective_capabilities & (1_u64 << capability) != 0
     }
+
+    /// Caller effective gid followed by supplementary groups, in the shape the
+    /// master expects in `CreateCallerCreds::gids`.
+    pub(crate) fn gids_with_effective(&self, effective_gid: u32) -> Vec<u32> {
+        let mut gids = Vec::with_capacity(self.supplementary_groups.len() + 1);
+        gids.push(effective_gid);
+        gids.extend(
+            self.supplementary_groups
+                .iter()
+                .copied()
+                .filter(|gid| *gid != effective_gid),
+        );
+        gids
+    }
 }
 
 impl FuseUtils {
@@ -682,29 +696,24 @@ impl FuseUtils {
 
     /// Resolve a stored numeric GID or group name without a configuration fallback.
     pub fn resolve_group_gid(group: &str) -> Option<u32> {
-        group
-            .parse::<u32>()
-            .ok()
-            .or_else(|| sys::get_gid_by_name(group))
+        curvine_model::resolve_group_gid(group)
     }
 
     /// Apply Linux file-creation ordering: decide whether setgid is authorized from
     /// the requested mode, then apply the request umask to the persisted mode.
+    /// Shared with the master so both sides cannot drift.
     pub fn normalize_create_mode(
         requested_mode: u32,
         umask: u32,
         caller_in_created_group: bool,
         has_cap_fsetid: bool,
     ) -> u32 {
-        let requested_mode = requested_mode & 0o7777;
-        let mut mode = requested_mode & !umask;
-        let requested_setgid_exec = requested_mode & (libc::S_ISGID as u32 | libc::S_IXGRP as u32)
-            == (libc::S_ISGID as u32 | libc::S_IXGRP as u32);
-
-        if requested_setgid_exec && !caller_in_created_group && !has_cap_fsetid {
-            mode &= !(libc::S_ISGID as u32);
-        }
-        mode
+        curvine_model::normalize_create_mode(
+            requested_mode,
+            umask,
+            caller_in_created_group,
+            has_cap_fsetid,
+        )
     }
 
     pub(crate) fn caller_has_cap_fsetid(status: &CallerProcessStatus) -> bool {

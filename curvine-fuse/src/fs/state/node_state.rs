@@ -35,8 +35,8 @@ use curvine_error::{FsError, FsResult};
 use curvine_fs_api::{FileSystem, ListStream, Path};
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_model::{
-    CreateFileOpts, DeleteResult, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags,
-    RenameFlags, SetAttrOpts,
+    is_special_file_type, CreateFileOpts, DeleteResult, FileAllocOpts, FileStatus, ListOptions,
+    MkdirOpts, OpenFlags, RenameFlags, SetAttrOpts,
 };
 use curvine_runtime::common::{FastHashMap, LocalTime};
 use curvine_runtime::sync::{AsyncMutex, AsyncSharedMap, AtomicCounter, RwLockHashMap};
@@ -1304,15 +1304,60 @@ impl NodeState {
         Ok(handle)
     }
 
-    pub async fn fs_open(
+    /// Open with the special-node decision taken from the open response.
+    ///
+    /// Read-only opens already receive the full status (including `file_type`)
+    /// from `get_block_locations`, so a special node becomes a metadata handle
+    /// without registering a reader - no separate `fs_stat` is needed. Write
+    /// opens keep the regular path; the master rejects special nodes itself.
+    pub async fn fs_open_or_meta(
         &self,
         ino: u64,
         flags: u32,
         opts: CreateFileOpts,
     ) -> FuseResult<Arc<FileHandle>> {
         let flags = OpenFlags::new(flags);
+        if !flags.read_only() {
+            let path = self.get_path(ino)?;
+            return self.new_handle(Some(ino), &path, flags, opts).await;
+        }
+
         let path = self.get_path(ino)?;
-        self.new_handle(Some(ino), &path, flags, opts).await
+        let reader = match self.new_reader(&path).await {
+            Ok(reader) => reader,
+            Err(e) => {
+                // A special node unlinked while still referenced by the kernel
+                // has no live path, but its tombstone status is still in the
+                // dcache. The old pre-open fs_stat served that status without
+                // touching the backend, so keep such opens working.
+                let tombstone = self
+                    .unlinked_status(ino)
+                    .filter(|status| is_special_file_type(status.file_type));
+                if let Some(status) = tombstone {
+                    if flags.truncate() {
+                        return err_fuse!(
+                            libc::EACCES,
+                            "special file nodes are read-only metadata"
+                        );
+                    }
+                    return self.new_meta_handle(ino, status).await;
+                }
+                return Err(e);
+            }
+        };
+        let mut status = reader.status().clone();
+        if is_special_file_type(status.file_type) {
+            drop(reader);
+            if flags.truncate() {
+                return err_fuse!(libc::EACCES, "special file nodes are read-only metadata");
+            }
+            return self.new_meta_handle(ino, status).await;
+        }
+
+        status.id = ino as i64;
+        Ok(self
+            .insert_handle_with_writer(ino, Some(Arc::new(reader)), None, status)
+            .await)
     }
 
     pub async fn new_meta_handle(
