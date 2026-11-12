@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::fs::{BlockInodeState, DeleteResult};
-use crate::master::journal::{JournalEntry, JournalWriter};
+use crate::master::journal::{BlockLocationOp, JournalEntry, JournalWriter};
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::*;
@@ -1857,7 +1857,14 @@ impl FsDir {
             return Ok(false);
         }
 
-        self.store.add_block_location(block_id, location)?;
+        self.store.add_block_location(block_id, location.clone())?;
+        // CV-70: journal the accepted add. Same critical section as the apply,
+        // so a follower replays exactly the operations this leader committed.
+        self.journal_writer.log_block_location_delta(
+            self,
+            vec![BlockLocationOp::new(block_id, location)],
+            Vec::new(),
+        )?;
         Ok(true)
     }
 
@@ -1890,15 +1897,27 @@ impl FsDir {
             return Ok(false);
         }
 
-        let mut batch = self.store.new_batch();
-        if !locations
+        let already_on_target = locations
             .iter()
-            .any(|current| current.worker_id == add.worker_id)
-        {
+            .any(|current| current.worker_id == add.worker_id);
+        let mut batch = self.store.new_batch();
+        if !already_on_target {
             batch.add_location(block_id, &add)?;
         }
         batch.delete_location(block_id, from_worker)?;
         batch.commit()?;
+
+        // CV-70: one move = one atomic delta, so a replay never observes the
+        // block with fewer copies than the leader had at any point.
+        let mut added = Vec::new();
+        if !already_on_target {
+            added.push(BlockLocationOp::new(block_id, add));
+        }
+        self.journal_writer.log_block_location_delta(
+            self,
+            added,
+            vec![BlockLocationOp::without_storage(block_id, from_worker)],
+        )?;
         Ok(true)
     }
 
@@ -2102,16 +2121,59 @@ impl FsDir {
     /// `crate::master::fs::location_entry`（CV-70）。
     pub(crate) fn block_report(&mut self, blocks: Vec<(bool, i64, BlockLocation)>) -> FsResult<()> {
         let mut batch = self.store.new_batch();
+        let mut journal_add = Vec::new();
+        let mut journal_del = Vec::new();
         for (add, id, loc) in blocks {
             if add {
                 batch.add_location(id, &loc)?;
+                journal_add.push(BlockLocationOp::new(id, loc));
             } else {
                 batch.delete_location(id, loc.worker_id)?;
+                journal_del.push(BlockLocationOp::without_storage(id, loc.worker_id));
             }
         }
 
         batch.commit()?;
+        // CV-70: block reports are the main non-failover source of location
+        // drift, so the accepted batch is journaled as well. Which entries are
+        // accepted was already decided by `apply_report_locations` under this
+        // same write lock.
+        self.journal_writer
+            .log_block_location_delta(self, journal_add, journal_del)?;
         Ok(())
+    }
+
+    /// Replays a journaled block-location delta (CV-70).
+    ///
+    /// The leader journaled the operations it *accepted*, so replay is a plain
+    /// set operation: add if absent, delete if present. Nothing is re-decided
+    /// here (no replica-count check, no inode lookup) and nothing is journaled
+    /// again — a follower must converge on the leader's set, not on its own
+    /// opinion of it. Idempotent: replaying the same delta twice is a no-op.
+    pub(crate) fn replay_block_location_delta(
+        &mut self,
+        add: &[BlockLocationOp],
+        del: &[BlockLocationOp],
+    ) -> FsResult<()> {
+        let mut batch = self.store.new_batch();
+        for op in add {
+            batch.add_location(op.block_id, &op.location())?;
+        }
+        for op in del {
+            batch.delete_location(op.block_id, op.worker_id)?;
+        }
+        batch.commit()?;
+        Ok(())
+    }
+
+    /// Replays a journaled worker location purge (CV-70).
+    ///
+    /// The block ids are not carried in the entry: replay runs the same
+    /// `(worker_id, block_id)` prefix scan the leader ran. It deletes whatever
+    /// this master still holds for that worker, which is what the leader
+    /// committed, and is therefore idempotent.
+    pub(crate) fn replay_worker_location_purge(&self, worker_id: u32) -> FsResult<Vec<i64>> {
+        Ok(self.store.store.delete_locations(worker_id)?)
     }
 
     pub fn get_rocks_store(&self) -> &RocksInodeStore {
@@ -2136,6 +2198,10 @@ impl FsDir {
     /// `crate::master::fs::location_entry`（CV-70）。
     pub(crate) fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
         let block_ids = self.store.store.delete_locations(worker_id)?;
+        // CV-70: one entry for the whole purge — the follower replays the same
+        // worker prefix scan instead of receiving every block id.
+        self.journal_writer
+            .log_worker_location_purge(self, worker_id)?;
         Ok(block_ids)
     }
 

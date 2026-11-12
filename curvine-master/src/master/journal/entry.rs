@@ -16,7 +16,10 @@ use crate::master::meta::inode::{InodeDir, InodeFile, InodeView};
 use crate::master::meta::BlockMeta;
 use crate::master::MetadataCodec;
 use curvine_core_error::{err_box, CommonResult};
-use curvine_model::{AdminState, CommitBlock, FileLock, MountInfo, ProtoUtils, SetAttrOpts};
+use curvine_model::{
+    AdminState, BlockLocation, CommitBlock, FileLock, MountInfo, ProtoUtils, SetAttrOpts,
+    StorageType,
+};
 use curvine_proto::*;
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -235,6 +238,64 @@ pub struct SnapshotEntry {
     pub(crate) dir: String,
 }
 
+/// One block-location add or remove carried by a [`BlockLocationDeltaEntry`].
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct BlockLocationOp {
+    pub(crate) block_id: i64,
+    pub(crate) worker_id: u32,
+    /// Only meaningful for `add`; `del` ignores it.
+    pub(crate) storage_type: StorageType,
+}
+
+impl BlockLocationOp {
+    pub(crate) fn new(block_id: i64, location: BlockLocation) -> Self {
+        Self {
+            block_id,
+            worker_id: location.worker_id,
+            storage_type: location.storage_type,
+        }
+    }
+
+    pub(crate) fn without_storage(block_id: i64, worker_id: u32) -> Self {
+        Self {
+            block_id,
+            worker_id,
+            storage_type: StorageType::Disk,
+        }
+    }
+
+    pub(crate) fn location(&self) -> BlockLocation {
+        BlockLocation::new(self.worker_id, self.storage_type)
+    }
+}
+
+/// A block-location delta the leader already applied (CV-70).
+///
+/// The entry records the *result*, never an intent. The leader decides under
+/// the filesystem write lock whether an operation is accepted (block still
+/// exists, location not already recorded, below the replica target) and
+/// journals only the accepted operations, so a follower replays them as plain
+/// idempotent set operations and can never diverge by re-deciding.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct BlockLocationDeltaEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) add: Vec<BlockLocationOp>,
+    pub(crate) del: Vec<BlockLocationOp>,
+}
+
+/// Drops every location of one worker (lost / force-retired / decommissioned).
+///
+/// The removed block ids are deliberately not enumerated: a worker can hold
+/// hundreds of thousands of blocks, so the follower replays the same
+/// `(worker_id, block_id)` prefix scan the leader ran instead.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct WorkerLocationPurgeEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) worker_id: u32,
+}
+
 /// One durable metadata mutation.
 ///
 /// Bincode encodes the variant discriminant and fields positionally, so this
@@ -276,6 +337,10 @@ pub enum JournalEntry {
     /// a client that was writing a file is gone; the journal entry is what makes
     /// "the file is complete again" durable and replayable.
     ReleaseWriter(ReleaseWriterEntry),
+
+    /// Journaled block-location metadata (CV-70).
+    BlockLocationDelta(BlockLocationDeltaEntry),
+    WorkerLocationPurge(WorkerLocationPurgeEntry),
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -378,6 +443,9 @@ impl JournalEntry {
 
             JournalEntry::WorkerIntent(e) => e.op_id,
             JournalEntry::ReleaseWriter(e) => e.op_id,
+
+            JournalEntry::BlockLocationDelta(e) => e.op_id,
+            JournalEntry::WorkerLocationPurge(e) => e.op_id,
         }
     }
 
@@ -406,6 +474,9 @@ impl JournalEntry {
 
             JournalEntry::WorkerIntent(e) => e.rpc_id,
             JournalEntry::ReleaseWriter(e) => e.rpc_id,
+
+            JournalEntry::BlockLocationDelta(e) => e.rpc_id,
+            JournalEntry::WorkerLocationPurge(e) => e.rpc_id,
         }
     }
 
@@ -621,6 +692,23 @@ impl JournalEntry {
                 ino: e.ino,
                 client: e.client,
             }),
+
+            JournalEntry::BlockLocationDelta(e) => {
+                PbEntry::BlockLocationDelta(BlockLocationDeltaEntryProto {
+                    op_id: e.op_id,
+                    rpc_id: e.rpc_id,
+                    add: e.add.into_iter().map(Self::location_op_to_pb).collect(),
+                    del: e.del.into_iter().map(Self::location_op_to_pb).collect(),
+                })
+            }
+
+            JournalEntry::WorkerLocationPurge(e) => {
+                PbEntry::WorkerLocationPurge(WorkerLocationPurgeEntryProto {
+                    op_id: e.op_id,
+                    rpc_id: e.rpc_id,
+                    worker_id: e.worker_id,
+                })
+            }
         };
 
         Ok(JournalEntryProto { entry: Some(entry) })
@@ -827,6 +915,42 @@ impl JournalEntry {
                 ino: e.ino,
                 client: e.client,
             }),
+
+            PbEntry::BlockLocationDelta(e) => {
+                JournalEntry::BlockLocationDelta(BlockLocationDeltaEntry {
+                    op_id: e.op_id,
+                    rpc_id: e.rpc_id,
+                    add: e.add.into_iter().map(Self::location_op_from_pb).collect(),
+                    del: e.del.into_iter().map(Self::location_op_from_pb).collect(),
+                })
+            }
+
+            PbEntry::WorkerLocationPurge(e) => {
+                JournalEntry::WorkerLocationPurge(WorkerLocationPurgeEntry {
+                    op_id: e.op_id,
+                    rpc_id: e.rpc_id,
+                    worker_id: e.worker_id,
+                })
+            }
         })
+    }
+
+    fn location_op_to_pb(op: BlockLocationOp) -> BlockLocationOpProto {
+        BlockLocationOpProto {
+            block_id: op.block_id,
+            worker_id: op.worker_id,
+            storage_type: Some(i32::from(op.storage_type)),
+        }
+    }
+
+    fn location_op_from_pb(op: BlockLocationOpProto) -> BlockLocationOp {
+        BlockLocationOp {
+            block_id: op.block_id,
+            worker_id: op.worker_id,
+            storage_type: op
+                .storage_type
+                .map(StorageType::from)
+                .unwrap_or(StorageType::Disk),
+        }
     }
 }

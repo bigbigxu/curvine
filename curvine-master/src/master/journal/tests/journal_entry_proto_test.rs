@@ -204,6 +204,20 @@ fn all_variant_batch() -> JournalBatch {
                     InodeView::new_entry("cached-entry".to_string(), 109),
                 ],
             }),
+            JournalEntry::BlockLocationDelta(BlockLocationDeltaEntry {
+                op_id: 19,
+                rpc_id: 19,
+                add: vec![
+                    BlockLocationOp::new(2_001, BlockLocation::with_id(7)),
+                    BlockLocationOp::new(2_002, BlockLocation::new(8, StorageType::Ssd)),
+                ],
+                del: vec![BlockLocationOp::without_storage(2_003, 9)],
+            }),
+            JournalEntry::WorkerLocationPurge(WorkerLocationPurgeEntry {
+                op_id: 20,
+                rpc_id: 20,
+                worker_id: 42,
+            }),
         ],
     }
 }
@@ -215,9 +229,9 @@ fn protobuf_batch_round_trips_all_entry_variants() {
 
     let mut decoded = JournalBatch::decode(&bytes).unwrap();
     assert_eq!(decoded.seq_id, 900);
-    assert_eq!(decoded.len(), 18);
+    assert_eq!(decoded.len(), 20);
     let op_ids: Vec<u64> = decoded.batch.iter().map(JournalEntry::op_id).collect();
-    assert_eq!(op_ids, (1..=18).collect::<Vec<_>>());
+    assert_eq!(op_ids, (1..=20).collect::<Vec<_>>());
 
     // Spot-check the shared protobuf models and the codec-backed inode list:
     // a field dropped symmetrically by encode and decode would not change the
@@ -253,6 +267,25 @@ fn protobuf_batch_round_trips_all_entry_variants() {
             assert!(matches!(e.inodes[2], InodeView::FileEntry(_)));
         }
         other => panic!("unexpected cache invalidation entry: {:?}", other),
+    }
+
+    match &decoded.batch[18] {
+        JournalEntry::BlockLocationDelta(e) => {
+            assert_eq!(e.add.len(), 2);
+            assert_eq!(e.del.len(), 1);
+            assert_eq!(e.add[0].block_id, 2_001);
+            assert_eq!(e.add[0].worker_id, 7);
+            assert_eq!(e.add[0].storage_type, StorageType::Disk);
+            // Non-default storage types must survive the optional enum field.
+            assert_eq!(e.add[1].storage_type, StorageType::Ssd);
+            assert_eq!(e.del[0].block_id, 2_003);
+            assert_eq!(e.del[0].worker_id, 9);
+        }
+        other => panic!("unexpected block location delta entry: {:?}", other),
+    }
+    match &decoded.batch[19] {
+        JournalEntry::WorkerLocationPurge(e) => assert_eq!(e.worker_id, 42),
+        other => panic!("unexpected worker location purge entry: {:?}", other),
     }
 
     // Re-encoding must reproduce the same bytes, so every field (including

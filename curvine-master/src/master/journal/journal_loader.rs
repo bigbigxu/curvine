@@ -824,8 +824,57 @@ impl JournalLoader {
 
             JournalEntry::WorkerIntent(e) => self.worker_intent(e),
 
+            JournalEntry::BlockLocationDelta(e) => self.block_location_delta(e),
+
+            JournalEntry::WorkerLocationPurge(e) => self.worker_location_purge(e),
+
             _ => Ok(()),
         }
+    }
+
+    /// Replays a journaled block-location delta (CV-70).
+    ///
+    /// The leader journaled the operations it *accepted*, so replay is a plain
+    /// set operation: add if absent, delete if present. Nothing is re-decided
+    /// here (no replica-count check, no inode lookup) and nothing is journaled
+    /// again — a follower must converge on the leader's set, not on its own
+    /// opinion of it.
+    fn block_location_delta(&self, entry: BlockLocationDeltaEntry) -> CommonResult<()> {
+        if entry.add.is_empty() && entry.del.is_empty() {
+            return Ok(());
+        }
+
+        self.fs_dir
+            .write()
+            .replay_block_location_delta(&entry.add, &entry.del)?;
+
+        debug!(
+            "BlockLocationDelta: op={} add={} del={}",
+            entry.op_id,
+            entry.add.len(),
+            entry.del.len()
+        );
+        Ok(())
+    }
+
+    /// Replays a worker location purge (CV-70).
+    ///
+    /// The block ids are not carried in the entry: the follower runs the same
+    /// `(worker_id, block_id)` prefix scan the leader ran. It is idempotent and
+    /// deletes whatever this follower still holds for that worker, which is
+    /// exactly the invariant the leader committed.
+    fn worker_location_purge(&self, entry: WorkerLocationPurgeEntry) -> CommonResult<()> {
+        let removed = self
+            .fs_dir
+            .write()
+            .replay_worker_location_purge(entry.worker_id)?;
+        debug!(
+            "WorkerLocationPurge: op={} worker={} removed={}",
+            entry.op_id,
+            entry.worker_id,
+            removed.len()
+        );
+        Ok(())
     }
 
     fn worker_intent(&self, entry: WorkerIntentEntry) -> CommonResult<()> {

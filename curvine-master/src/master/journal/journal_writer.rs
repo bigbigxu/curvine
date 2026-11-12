@@ -369,6 +369,43 @@ impl JournalWriter {
         self.send(fs_dir, JournalEntry::WorkerIntent(entry))
     }
 
+    /// Journals the block-location delta the leader just applied (CV-70).
+    ///
+    /// The caller must hold the filesystem write lock: the send has to happen
+    /// in the same critical section as the RocksDB apply, otherwise a follower
+    /// can replay a different order than the leader applied.
+    pub fn log_block_location_delta(
+        &self,
+        fs_dir: &FsDir,
+        add: Vec<BlockLocationOp>,
+        del: Vec<BlockLocationOp>,
+    ) -> FsResult<()> {
+        if add.is_empty() && del.is_empty() {
+            return Ok(());
+        }
+
+        let entry = BlockLocationDeltaEntry {
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
+            add,
+            del,
+        };
+        self.send(fs_dir, JournalEntry::BlockLocationDelta(entry))
+    }
+
+    /// Journals the removal of every location of one worker (CV-70).
+    ///
+    /// Block ids travel implicitly: replay runs the same worker prefix scan, so
+    /// a purge of a large worker costs one entry instead of one entry per block.
+    pub fn log_worker_location_purge(&self, fs_dir: &FsDir, worker_id: u32) -> FsResult<()> {
+        let entry = WorkerLocationPurgeEntry {
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
+            worker_id,
+        };
+        self.send(fs_dir, JournalEntry::WorkerLocationPurge(entry))
+    }
+
     pub fn log_free<P: AsRef<str>>(
         &self,
         fs_dir: &FsDir,

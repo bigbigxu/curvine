@@ -45,6 +45,10 @@ message JournalEntryProto {
         TrashPurgeEntryProto trash_purge = 20;
         WorkerIntentEntryProto worker_intent = 21;
         ReleaseWriterEntryProto release_writer = 22;
+        // CV-70: block locations are journaled, so a promoted follower serves
+        // the location set the previous leader actually applied.
+        BlockLocationDeltaEntryProto block_location_delta = 23;
+        WorkerLocationPurgeEntryProto worker_location_purge = 24;
     }
 }
 
@@ -232,4 +236,43 @@ message TrashPurgeEntryProto {
     required string entry = 3;
     required int64 mtime = 4;
     repeated string paths = 5;
+}
+
+// One block-location add or remove.
+message BlockLocationOpProto {
+    required int64 block_id = 1;
+    required uint32 worker_id = 2;
+    // Only meaningful for `add`; `del` ignores it.
+    optional StorageTypeProto storage_type = 3 [default = STORAGE_TYPE_PROTO_DISK];
+}
+
+// A block-location delta the leader already applied.
+//
+// Upgrade note: a master that predates this entry cannot decode it (prost drops
+// the unknown oneof tag, so the payload fails to parse and the batch is refused
+// unless `ignore_reply_error` skips it). Roll the whole raft group at once; a
+// node-by-node upgrade needs every master on this build beforehand.
+//
+// The entry carries the *result*, never an intent: the leader decides under the
+// filesystem write lock whether a replica add is accepted (block still exists,
+// not already recorded, below the replica target) and only then journals the
+// accepted operations. A follower replays them as plain set operations inside
+// the same critical section, so it never re-decides and never diverges.
+message BlockLocationDeltaEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    repeated BlockLocationOpProto add = 3;
+    repeated BlockLocationOpProto del = 4;
+}
+
+// Drops every location of one worker (lost, force-retired, decommissioned).
+//
+// The block ids are not enumerated: a worker can hold hundreds of thousands of
+// blocks, so replaying the purge as a per-block list would bloat the journal.
+// The follower runs the same `(worker_id, block_id)` prefix scan the leader did,
+// which is deterministic and idempotent.
+message WorkerLocationPurgeEntryProto {
+    required uint64 op_id = 1;
+    required int64 rpc_id = 2;
+    required uint32 worker_id = 3;
 }

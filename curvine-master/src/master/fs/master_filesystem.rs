@@ -4097,6 +4097,152 @@ mod tests {
         );
     }
 
+    /// A filesystem whose journal channel is drained by `take_entries`.
+    ///
+    /// `test_fs` disables the journal, which is right for tests that only read
+    /// metadata back. The CV-70 tests below assert what would be sent to raft,
+    /// so they need the writer to buffer entries instead of dropping them.
+    fn journaled_test_fs(name: &str) -> MasterFilesystem {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = true;
+        conf.master.meta_dir = Utils::test_sub_dir(format!(
+            "master-fs-location-journal/meta-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        conf.journal.journal_dir = Utils::test_sub_dir(format!(
+            "master-fs-location-journal/journal-{}-{}",
+            name,
+            Utils::rand_str(6)
+        ));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        fs.master_monitor
+            .set_role_for_test(curvine_raft::raft::RoleState::Leader);
+        fs
+    }
+
+    fn take_delta(fs: &MasterFilesystem) -> crate::master::journal::BlockLocationDeltaEntry {
+        use crate::master::journal::JournalEntry;
+        let entries = fs.fs_dir.read().take_entries();
+        let mut found = None;
+        for entry in entries {
+            match entry {
+                JournalEntry::BlockLocationDelta(e) => {
+                    assert!(found.is_none(), "one delta per write");
+                    found = Some(e);
+                }
+                other => panic!("unexpected journal entry: {:?}", other.op_id()),
+            }
+        }
+        found.expect("the location write must be journaled")
+    }
+
+    /// CV-70: every block-location write path must journal what it applied.
+    /// This is the regression guard for the root cause: a location edit that
+    /// never reaches the journal is lost on the next leader change.
+    #[test]
+    fn every_location_write_path_is_journaled() {
+        let fs = journaled_test_fs("paths");
+        let block_id = replication_file(&fs, "/journaled-paths.log");
+        fs.fs_dir.read().take_entries();
+
+        // 1. replication finished -> one add
+        assert!(fs
+            .commit_replica_added(block_id, BlockLocation::with_id(200))
+            .unwrap());
+        let delta = take_delta(&fs);
+        assert_eq!(delta.add.len(), 1);
+        assert!(delta.del.is_empty());
+        assert_eq!(delta.add[0].block_id, block_id);
+        assert_eq!(delta.add[0].worker_id, 200);
+
+        // 2. drain move -> add target + del source in the same entry
+        assert!(fs
+            .commit_drain_move_location(block_id, BlockLocation::with_id(300), 200)
+            .unwrap());
+        let delta = take_delta(&fs);
+        assert_eq!(delta.add.len(), 1);
+        assert_eq!(delta.del.len(), 1);
+        assert_eq!(delta.add[0].worker_id, 300);
+        assert_eq!(delta.del[0].worker_id, 200);
+
+        // 3. block report reconciliation -> one entry for the accepted batch
+        let delete_blocks = fs
+            .apply_report_locations(
+                100,
+                vec![(false, block_id, BlockLocation::with_id(100))],
+                false,
+            )
+            .unwrap();
+        assert!(delete_blocks.is_empty());
+        let delta = take_delta(&fs);
+        assert!(delta.add.is_empty());
+        assert_eq!(delta.del.len(), 1);
+        assert_eq!(delta.del[0].worker_id, 100);
+
+        // 4. worker purge -> one worker-level entry, no block id list
+        assert!(fs.purge_worker_locations(300).unwrap().contains(&block_id));
+        use crate::master::journal::JournalEntry;
+        let entries = fs.fs_dir.read().take_entries();
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            JournalEntry::WorkerLocationPurge(e) => assert_eq!(e.worker_id, 300),
+            other => panic!("unexpected journal entry for purge: {:?}", other.op_id()),
+        }
+    }
+
+    /// Replay is a pure set operation: it converges on the leader's set and is
+    /// idempotent, so a re-delivered entry can never double-apply.
+    #[test]
+    fn location_delta_replay_converges_and_is_idempotent() {
+        use crate::master::journal::BlockLocationOp;
+
+        let fs = test_fs("location-replay");
+        let block_id = replication_file(&fs, "/location-replay.log");
+        let workers = |fs: &MasterFilesystem| {
+            let mut ids: Vec<u32> = fs
+                .fs_dir
+                .read()
+                .get_block_locations(block_id)
+                .unwrap()
+                .iter()
+                .map(|l| l.worker_id)
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(workers(&fs), vec![100]);
+
+        let add = vec![
+            BlockLocationOp::new(block_id, BlockLocation::with_id(200)),
+            BlockLocationOp::new(block_id, BlockLocation::with_id(300)),
+        ];
+        let del = vec![BlockLocationOp::without_storage(block_id, 100)];
+
+        for _ in 0..2 {
+            fs.fs_dir
+                .write()
+                .replay_block_location_delta(&add, &del)
+                .unwrap();
+        }
+        assert_eq!(workers(&fs), vec![200, 300], "replay must be idempotent");
+
+        // Purging a worker removes exactly that worker's locations.
+        assert_eq!(
+            fs.fs_dir.write().replay_worker_location_purge(200).unwrap(),
+            vec![block_id]
+        );
+        assert_eq!(workers(&fs), vec![300]);
+        assert!(fs
+            .fs_dir
+            .write()
+            .replay_worker_location_purge(200)
+            .unwrap()
+            .is_empty());
+    }
+
     #[test]
     fn replication_location_update_is_idempotent_and_respects_replica_count() {
         let fs = test_fs("replication-location-guard");
