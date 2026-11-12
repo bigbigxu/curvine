@@ -276,8 +276,7 @@ impl NodeState {
         let before = dir.inode_lens();
         let status = dir
             .lookup(parent, name, caller_status, true)?
-            .status
-            .clone();
+            .clone_status();
         let after = dir.inode_lens();
         drop(dir);
 
@@ -1289,18 +1288,18 @@ impl NodeState {
             Ok(DotTarget {
                 ino: FUSE_ROOT_ID,
                 name: Cow::Borrowed(name),
-                root_status: Some(dir.get_inode_check(FUSE_ROOT_ID, None)?.status.clone()),
+                root_status: Some(dir.get_inode_check(FUSE_ROOT_ID, None)?.clone_status()),
             })
         } else if let Some(parent_inode) = parent_inode {
             Ok(DotTarget {
                 ino: parent_inode.parent,
-                name: Cow::Owned(parent_inode.name.to_owned()),
+                name: Cow::Owned(parent_inode.name.to_string()),
                 root_status: None,
             })
         } else {
             Ok(DotTarget {
                 ino: inode.parent,
-                name: Cow::Owned(inode.name.to_owned()),
+                name: Cow::Owned(inode.name.to_string()),
                 root_status: None,
             })
         }

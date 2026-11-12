@@ -1321,11 +1321,9 @@ impl OpendalFileSystem {
                 } else {
                     pending.user_metadata(metadata.clone())
                 };
-                pending
-                    .await
-                    .map_err(|e| {
-                        opendal_error("Failed to create empty file", path.full_path(), e)
-                    })?;
+                pending.await.map_err(|e| {
+                    opendal_error("Failed to create empty file", path.full_path(), e)
+                })?;
                 Ok(())
             })
             .await?;

@@ -127,7 +127,13 @@ fn raft_peers(ports: &[u16]) -> String {
     ports
         .iter()
         .enumerate()
-        .map(|(i, port)| format!("{{ id = {}, hostname = \"127.0.0.1\", port = {} }}", i + 1, port))
+        .map(|(i, port)| {
+            format!(
+                "{{ id = {}, hostname = \"127.0.0.1\", port = {} }}",
+                i + 1,
+                port
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -285,7 +291,9 @@ fn http_get(port: u16, path: &str) -> Option<(u16, String)> {
         Duration::from_millis(500),
     )
     .ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(20))).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .ok()?;
     stream
         .set_write_timeout(Some(Duration::from_secs(20)))
         .ok()?;
@@ -346,7 +354,10 @@ fn wait_leader(nodes: &mut [Node], only: &[usize], timeout: Duration) -> usize {
         last = round;
         thread::sleep(Duration::from_millis(200));
     }
-    panic!("no active leader within {timeout:?}; last readyz: {last}\n{}", dump(nodes));
+    panic!(
+        "no active leader within {timeout:?}; last readyz: {last}\n{}",
+        dump(nodes)
+    );
 }
 
 /// Prometheus text format, e.g. `journal_applied{cluster_id="x"} 42`.
@@ -382,9 +393,7 @@ fn wait_fully_replayed(port: u16, min_applied: i64, timeout: Duration) -> String
             let ufs_applied = metric_value(&body, "journal_ufs_applied");
             let pending = metric_value(&body, "ufs_replay_pending");
             if let (Some(applied), Some(ufs_applied)) = (applied, ufs_applied) {
-                last = format!(
-                    "applied={applied} ufs_applied={ufs_applied} pending={pending:?}"
-                );
+                last = format!("applied={applied} ufs_applied={ufs_applied} pending={pending:?}");
                 if applied >= min_applied && ufs_applied >= applied && pending == Some(0) {
                     streak += 1;
                     if streak >= 4 {
@@ -522,15 +531,21 @@ fn fs_mode_ufs_replay_completes_on_the_new_leader_after_a_leader_kill() {
         .collect::<Vec<_>>();
 
     // A master only binds the metrics/probe port once its raft role is known.
-    for index in 0..MASTERS {
-        wait_port(master_web[index], "master metrics", Duration::from_secs(120));
+    for &port in master_web.iter().take(MASTERS) {
+        wait_port(port, "master metrics", Duration::from_secs(120));
     }
 
     let mut candidate = (0..MASTERS).collect::<Vec<_>>();
     let leader = wait_leader(&mut nodes, &candidate, Duration::from_secs(120));
     println!("leader before the kill: master-{leader}");
     assert_eq!(
-        wait_probe(master_web[leader], "/recoveryz", 200, Duration::from_secs(60)).trim(),
+        wait_probe(
+            master_web[leader],
+            "/recoveryz",
+            200,
+            Duration::from_secs(60)
+        )
+        .trim(),
         "ok",
         "a fresh cluster must have a caught up UFS watermark"
     );
@@ -572,7 +587,8 @@ fn fs_mode_ufs_replay_completes_on_the_new_leader_after_a_leader_kill() {
     let opts = MountOptions::builder()
         .write_type(WriteType::FsMode)
         .build();
-    rt.block_on(fs.mount(&ufs_path, &cv(CV_MOUNT), opts)).unwrap();
+    rt.block_on(fs.mount(&ufs_path, &cv(CV_MOUNT), opts))
+        .unwrap();
     println!("mounted {} -> {CV_MOUNT}", ufs_path.full_path());
 
     // A mkdir below the mount root is journaled after the mount entry, so the

@@ -1542,9 +1542,10 @@ mod tests {
 
         // Written by the previous leader and committed only after this node won
         // the election: no handler here ever ran, so the entry must apply.
-        rt.block_on(
-            loader.apply(true, ApplyMsg::new_entry(trash_purge_entry(1, vec!["/victim/a/file-a"]))),
-        )?;
+        rt.block_on(loader.apply(
+            true,
+            ApplyMsg::new_entry(trash_purge_entry(1, vec!["/victim/a/file-a"])),
+        ))?;
         assert!(
             !fs.exists("/victim/a/file-a")?,
             "a leader must replay entries carried over from the previous leader"
