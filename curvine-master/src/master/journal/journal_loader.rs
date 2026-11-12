@@ -1552,11 +1552,15 @@ mod tests {
 
         // This leader's own propose: the handler already removed the file and
         // is parked on the acknowledgement, so replaying it would be a no-op.
-        let (tx, _rx) = CallChannel::channel();
+        let (tx, rx) = CallChannel::channel();
         rt.block_on(loader.apply(
             true,
             ApplyMsg::new_entry_with_ack(trash_purge_entry(2, vec!["/victim/b/file-b"]), tx),
         ))?;
+        // `apply` hands an acknowledged entry to the apply worker and returns
+        // before the watermark moves; wait for the acknowledgement so the
+        // assertion below cannot race that worker.
+        rt.block_on(rx.receive())??;
         assert!(
             fs.exists("/victim/b/file-b")?,
             "an acknowledged entry already ran in the handler and must not be replayed"
