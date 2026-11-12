@@ -565,6 +565,13 @@ mod tests {
             task_summary: None,
             task_details_expired: None,
             takeover_count: None,
+            placement_addr: None,
+            owner_addr: None,
+            client_request_id: None,
+            mount_snapshot_attempts: None,
+            planning_attempts: None,
+            overwrite: None,
+            replicas: None,
         };
         let job_status = job_status_from_transfer(status);
         assert_eq!(job_status.state, JobTaskState::Loading);
@@ -621,6 +628,13 @@ mod tests {
             }),
             task_details_expired: None,
             takeover_count: None,
+            placement_addr: None,
+            owner_addr: None,
+            client_request_id: None,
+            mount_snapshot_attempts: None,
+            planning_attempts: None,
+            overwrite: None,
+            replicas: None,
         };
 
         let job_status = job_status_from_transfer(status);
