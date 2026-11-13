@@ -666,7 +666,7 @@ mod tests {
     use super::super::job_store::JobCallback;
     use super::*;
     use curvine_config::ClientConf;
-    use curvine_model::MountInfo;
+    use curvine_model::{JobTaskType, MountInfo};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -686,6 +686,7 @@ mod tests {
             &mount,
             &ClientConf::default(),
             1,
+            JobTaskType::Load,
         );
         job.info.create_time = create_time;
         job.progress.update_time = update_time;

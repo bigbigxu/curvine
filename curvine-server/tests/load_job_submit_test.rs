@@ -15,8 +15,9 @@
 use curvine_config::{ClientConf, ClusterConf, MasterConf};
 use curvine_core_error::CommonResult;
 use curvine_model::{
-    JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobInfo, LoadTaskInfo, MountInfo,
-    MountOptions, OpenFlags, StorageType, TtlAction, WorkerAddress, WorkerInfo, WriteType,
+    JobTaskProgress, JobTaskState, JobTaskType, LoadJobCommand, LoadJobInfo, LoadTaskInfo,
+    MountInfo, MountOptions, OpenFlags, StorageType, TtlAction, WorkerAddress, WorkerInfo,
+    WriteType,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_runtime::common::CommonUtils;
@@ -595,6 +596,7 @@ fn late_task_report_does_not_change_terminal_job_state() -> CommonResult<()> {
         &mount,
         &ClientConf::default(),
         1,
+        JobTaskType::Load,
     );
     job.add_task(load_task(task_id, job_id));
 
@@ -638,6 +640,7 @@ fn stale_task_report_for_running_job_is_ignored() -> CommonResult<()> {
         &mount,
         &ClientConf::default(),
         2,
+        JobTaskType::Load,
     );
     job.add_task(load_task(current_task_id, job_id));
 
