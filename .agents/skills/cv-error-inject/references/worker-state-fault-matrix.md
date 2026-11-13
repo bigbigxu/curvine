@@ -30,6 +30,10 @@ A green `node list` proves nothing. Each round asserts:
 5. **Bytes retained** — `du -sh <worker data dir>` and the block-file count must
    not shrink while a worker is `DECOMMISSIONING`/`DECOMMISSIONED`. Deleting
    bytes is an explicit operator action, not a side effect.
+6. **Location consistency** — the metadata location set is identical before the
+   fault and after a failover, and every listed worker really holds the block
+   (no phantom). See [Location consistency across a leader
+   change](#location-consistency-across-a-leader-change-cv-70).
 
 ## Matrix
 
@@ -59,24 +63,34 @@ Ports/worker addresses assume the layout in
 `S13`/`S14` need privileges. `S11`/`S12` are the leader-failover rows: run them
 after `S1`/`S2` so both journaled intent and block locations are non-trivial.
 
-## Known limitation to watch for (CV-70)
+## Location consistency across a leader change (CV-70)
 
-Block locations are **not journaled**: followers only learn them from journaled
-allocation, so after any leader change the new leader may serve a stale location
-set (reads pointing at a node that no longer holds the block, repair jobs failing
-with `block ... not exists`). CV-60 mitigates the part the state machine must
-guarantee (a `DECOMMISSIONED` host holds no location) and repairs what it drops.
+Block-location edits are journaled since `f840d5fac` (CV-70, in `main-next`
+from 2026-11-13): `BlockLocationDelta` carries the accepted add/del list for
+replication, drain and block-report reconciliation, and `WorkerLocationPurge`
+carries one `worker_id` for lost/retired cleanup. A follower replays them as
+plain set operations, so a promoted leader must serve the same location set the
+old leader served.
 
-When a round shows:
+Until that landed, a leader change could silently serve a stale set; CV-60's
+promotion cleanup only guaranteed that a `DECOMMISSIONED` host holds no
+location. Assert the stronger property now, in every failover row:
 
-- `NoAvailableWorker` in the client, yet `find <data dirs> -name 'blk_<id>'`
-  finds copies elsewhere;
-- `Errors on block replication ... block <id> not exists`;
-- `fsck` under-replicated while the physical copies are ≥ target;
+1. **Snapshot the location set before the fault and after the failover**, then
+   diff the two. They must be identical — a `DECOMMISSIONED` worker's locations
+   are the only allowed removal, and that is what the drain rows already change.
+2. **No phantom location**: every worker listed for a block must really hold
+   `blk_<id>`. Metadata may legitimately be a *subset* of the physical copies
+   (bytes are retained on drained nodes), never a superset.
+3. **Read back + `cmp`** every touched file through the new leader, and grep the
+   master logs for the two old symptoms.
 
-then restart every worker once (each sends a full report), re-check, and record
-it as location drift rather than a state-machine failure. CoMind **CV-70** holds
-the root cause and the fix options.
+If drift does reappear on a build that contains the fix, it is a regression, not
+the old limitation: capture the pre/post snapshots and the `BlockLocationDelta`
+replay lines (`journal_loader.rs`, needs `level = "debug"` on one master) and
+file it. Restarting every worker once (each sends a full report) is still the
+cheap way to tell drift apart from a state-machine fault, because it re-aligns
+the metadata without touching the state machine.
 
 ## Assertion helpers
 
@@ -98,6 +112,21 @@ grep -h 'Worker state changed' $BASE/logs/master-m*.log | tail
 
 # bytes retained on a drained worker
 du -sh $BASE/data/h<N>; find $BASE/data/h<N> -name 'blk_*' | wc -l
+
+# location snapshot: take before the fault and after the failover, then diff
+snapshot_locs(){ for f in $FILES; do echo "$f $($CV fs blocks /r70/$f.bin \
+  | grep -oP '127\.0\.0\.\K\d+' | sort | tr '\n' ',')"; done; }
+snapshot_locs > /tmp/locs-before.txt   # ... inject the fault + failover ...
+diff /tmp/locs-before.txt <(snapshot_locs) && echo "locations identical"
+
+# no phantom location: metadata must be a subset of the physical copies
+# $1 = block id; prints the worker suffixes that really hold blk_<id>
+phys(){ for h in 1 2 3 4 5; do find $BASE/data/h$h -name "blk_$1" 2>/dev/null \
+  | grep -q . && printf '%s,' $((9+h)); done; }
+# for every worker in the metadata list, assert it appears in phys "$block_id"
+
+# replay evidence: restart one master with level="debug" in [master.log] and grep
+grep -E 'BlockLocationDelta:|WorkerLocationPurge:' $BASE/logs/master-m3.log | wc -l
 ```
 
 ## Coverage check

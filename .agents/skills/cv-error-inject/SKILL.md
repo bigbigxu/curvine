@@ -178,7 +178,7 @@ hundred MB and delete it afterwards, or a few rounds will fill the disk.
 
 ## Related
 
-- [worker-state-fault-matrix.md](references/worker-state-fault-matrix.md) — S1-S15 scenario matrix, assertions, known location-drift limitation (CV-70)
+- [worker-state-fault-matrix.md](references/worker-state-fault-matrix.md) — S1-S15 scenario matrix, assertions, location consistency across a leader change (CV-70)
 - [worker-state-topology.md](references/worker-state-topology.md) — topology, config, leader detection, safe kill patterns for the state machine scope
 - [cv-csi-test](../cv-csi-test/SKILL.md) — CSI integration testing
 - [cv-test-report](../cv-test-report/SKILL.md) — publish results
@@ -206,6 +206,7 @@ hundred MB and delete it afterwards, or a few rounds will fill the disk.
 - [ ] State checked after ≥2 heartbeats **and** after a leader failover
 - [ ] Read-back + `cmp` for every touched file; replication delta counted per round
 - [ ] Bytes `du`/block-file count unchanged while `DECOMMISSIONING`/`DECOMMISSIONED`
-- [ ] Location drift (CV-70) ruled out before blaming the state machine: restart
-      all workers once and re-check
+- [ ] Location set identical before the fault and after the failover, with no
+      phantom location (metadata ⊆ physical copies); see the CV-70 section of the
+      matrix for `snapshot_locs` / `phys` helpers
 - [ ] Harness torn down with `teardown.sh` (never `pkill -f "curvine-server"`)
