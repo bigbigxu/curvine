@@ -1005,7 +1005,9 @@ mod tests {
         settings.enabled_tools.push("fs_operate".to_string());
 
         let ok = json!({"action": "create_file", "path": "/a.txt", "content": "hello"});
-        assert!(dispatch(&provider, &settings, "fs_operate", &ok, None).await.is_ok());
+        assert!(dispatch(&provider, &settings, "fs_operate", &ok, None)
+            .await
+            .is_ok());
 
         let too_big = json!({
             "action": "create_file",
