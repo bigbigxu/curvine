@@ -769,3 +769,56 @@ export interface ClusterProbe {
   latency_ms?: number | null
   message?: string | null
 }
+
+// ---------------------------------------------------------------------------
+// CIVI — the AI assistant served by the web backend (`/api/ai/*`).
+//
+// Secrets are masked by the server: `api_key` / `api_token` come back as `***`
+// and posting the mask keeps the stored value. The optional shared token the
+// user types is kept in localStorage (`civi_token`) and sent as `X-CIVI-Token`.
+// ---------------------------------------------------------------------------
+
+/** An external MCP server whose tools merge into the agent toolset. */
+export interface CiviMcpServer {
+  name: string
+  url: string
+}
+
+export interface CiviSettings {
+  enabled: boolean
+  endpoint: string
+  api_key: string
+  model: string
+  temperature: number
+  max_iterations: number
+  rate_limit_per_min: number
+  api_token: string
+  enabled_tools: string[]
+  mcp_servers: CiviMcpServer[]
+}
+
+/** One whitelisted tool with its permission tier and current switch state. */
+export interface CiviToolInfo {
+  name: string
+  description: string
+  perm: string
+  enabled: boolean
+}
+
+/** Curated one-click prompt surfaced as a chip in the chat panel. */
+export interface CiviSkill {
+  id: string
+  title: string
+  title_zh: string
+  prompt: string
+  /** Chinese variant; the console picks by locale. */
+  prompt_zh: string
+  tools: string[]
+}
+
+export interface CiviSettingsPayload {
+  settings: CiviSettings
+  api_key_set: boolean
+  available_tools: CiviToolInfo[]
+  skills: CiviSkill[]
+}

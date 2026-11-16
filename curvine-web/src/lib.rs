@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// The CIVI provider impls on the admin handler hold large futures (whole
+// filesystem listings live inside the async blocks); the default 128-level
+// recursion limit is not enough for the compiler's recursive drop glue.
+#![recursion_limit = "256"]
+
+pub mod ai;
 pub mod cluster;
 pub mod job_display;
 pub mod observability;

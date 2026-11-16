@@ -35,7 +35,7 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 use crate::master::fs::MasterFilesystem;
-use crate::master::{Master, MasterState};
+use crate::master::{Master, MasterAiProvider, MasterState};
 
 #[derive(Clone)]
 struct MasterMetricsHandler {
@@ -188,10 +188,17 @@ async fn update_runtime_config(
 }
 
 fn metrics_router(handler: MasterMetricsHandler) -> Router {
+    // CIVI AI assistant: same whitelisted tool surface as the console, backed
+    // by this master's in-process state. Gated by the optional X-CIVI-Token
+    // (see `curvine_web::ai::auth`).
+    let provider = Arc::new(MasterAiProvider::new(
+        handler.fs.clone(),
+        Arc::clone(&handler.config_view.conf),
+    ));
     // Mounted before the Extension layer: `mount` only adds a route and
     // needs the profiling gate, not the handler state.
     let router = curvine_web::router::profiling::mount(Router::new(), &handler.profiling);
-    router
+    let router = router
         .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -203,7 +210,8 @@ fn metrics_router(handler: MasterMetricsHandler) -> Router {
         // path, so it stays an alias of the full view above.
         .route("/api/v1/master/runtime/config", get(runtime_config))
         .route("/api/update_config", post(update_runtime_config))
-        .layer(Extension(Arc::new(handler)))
+        .layer(Extension(Arc::new(handler)));
+    router.merge(curvine_web::ai::build_router(provider))
 }
 
 /// Minimal HTTP server exposing Prometheus `/metrics`, the `/healthz`

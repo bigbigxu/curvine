@@ -13,6 +13,7 @@ import observability from './modules/observability.zh-CN'
 import operations from './modules/operations.zh-CN'
 import delta from './modules/delta.zh-CN'
 import clusters from './modules/clusters.zh-CN'
+import civi from './modules/civi.zh-CN'
 
 export default {
   ...common,
@@ -29,5 +30,6 @@ export default {
   ...observability,
   ...operations,
   ...delta,
-  ...clusters
+  ...clusters,
+  ...civi
 }

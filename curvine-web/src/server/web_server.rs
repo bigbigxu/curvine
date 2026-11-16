@@ -21,7 +21,7 @@ use axum::error_handling::HandleErrorLayer;
 use axum::http::{header, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::Json;
+use axum::{Json, Router};
 use curvine_core_error::CommonResult;
 use curvine_net::net::{InetAddr, NetUtils};
 use curvine_rpc::server::{ServerConf, ServerMonitor, ServerStateListener};
@@ -100,6 +100,12 @@ fn webui_dir() -> PathBuf {
 pub trait WebHandlerService {
     type Item: RouterHandler + 'static;
     fn get_handler(&self) -> Self::Item;
+
+    /// Optional extra router merged into the web app (e.g. the CIVI AI
+    /// assistant). Servers that do not provide one use the default `None`.
+    fn ai_router(&self) -> Option<Router> {
+        None
+    }
 }
 
 pub struct WebServer<S> {
@@ -274,22 +280,21 @@ where
         let webui_path = webui_dir();
         let serve_dir = ServeDir::new(webui_path.clone())
             .not_found_service(ServeFile::new(webui_path.join("index.html")));
-        let app = self
-            .service
-            .get_handler()
-            .router()
-            .fallback_service(serve_dir)
-            .layer(
-                ServiceBuilder::new()
-                    .layer(TraceLayer::new_for_http())
-                    .layer(middleware::from_fn(no_cache_spa_entry))
-                    .layer(HandleErrorLayer::new(|e| async move {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(json!({"message": format!("internal server error: {e}")})),
-                        )
-                    })),
-            );
+        let mut router = self.service.get_handler().router();
+        if let Some(ai) = self.service.ai_router() {
+            router = router.merge(ai);
+        }
+        let app = router.fallback_service(serve_dir).layer(
+            ServiceBuilder::new()
+                .layer(TraceLayer::new_for_http())
+                .layer(middleware::from_fn(no_cache_spa_entry))
+                .layer(HandleErrorLayer::new(|e| async move {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"message": format!("internal server error: {e}")})),
+                    )
+                })),
+        );
         axum::serve(listener, app).await?;
         Ok(())
     }

@@ -25,6 +25,7 @@ import { Toggle } from '@/components/ui/toggle'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { Spinner } from '@/components/ui/spinner'
 import { useAuth } from '@/auth/auth-context'
+import { CiviChat } from '@/components/civi-chat'
 import { useOptionalCluster } from '@/cluster/cluster-context'
 import type { ClusterStatus } from '@/api/types'
 import { useI18n, localeOptions, type AppLocale } from '@/i18n'
@@ -272,6 +273,10 @@ export function ConsoleLayout() {
             </Suspense>
           </div>
         </main>
+        {/* CIVI AI assistant: floating button + chat drawer, available on
+            every console page. It renders nothing when the backend does not
+            serve `/api/ai/*` (worker/transfer deployments). */}
+        <CiviChat />
       </SidebarInset>
     </SidebarProvider>
   )

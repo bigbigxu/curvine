@@ -24,6 +24,9 @@ pub(crate) use self::metadata_codec::MetadataCodec;
 
 pub mod meta;
 
+pub mod ai_provider;
+pub use self::ai_provider::MasterAiProvider;
+
 mod job;
 pub use self::job::*;
 

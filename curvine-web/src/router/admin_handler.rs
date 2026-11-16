@@ -18,8 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::{timeout, Duration};
 
+use async_trait::async_trait;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path, Query, Request};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -30,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::ai::AiDataProvider;
 use crate::cluster::{
     clusters_dir_for, is_cluster_api_path, ClusterCtx, ClusterRegistry, CLUSTER_HEADER,
 };
@@ -757,11 +759,17 @@ fn expired_session_cookie() -> String {
 }
 
 fn is_authenticated(instance: &AdminRouterHandler, headers: &HeaderMap) -> bool {
+    is_authenticated_sessions(&instance.auth_sessions, headers)
+}
+
+/// Cookie check against a bare session map — shared by the admin router's
+/// `require_auth` layer and the CIVI session gate (`require_ai_session_auth`).
+fn is_authenticated_sessions(sessions: &Mutex<HashMap<String, i64>>, headers: &HeaderMap) -> bool {
     let Some(token) = cookie_value(headers, AUTH_COOKIE_NAME) else {
         return false;
     };
     let now = now_secs();
-    match instance.auth_sessions.lock() {
+    match sessions.lock() {
         Ok(mut sessions) => {
             sessions.retain(|_, expires_at| *expires_at > now);
             sessions
@@ -1911,6 +1919,19 @@ impl AdminRouterHandler {
     /// Used by the standalone `curvine-web` binary, which knows the config file
     /// path and can therefore default `clusters_dir` to `<conf dir>/clusters`.
     pub fn with_registry(rt: Arc<Runtime>, registry: Arc<ClusterRegistry>) -> Self {
+        Self::with_registry_and_auth(rt, registry, Arc::new(Mutex::new(HashMap::new())))
+    }
+
+    /// Same as [`with_registry`] but with an explicit session map.
+    ///
+    /// The console web service shares one map between the main router and the
+    /// CIVI AI router, so a session issued by `/api/v1/auth/login` also grants
+    /// `/api/ai/*`.
+    pub fn with_registry_and_auth(
+        rt: Arc<Runtime>,
+        registry: Arc<ClusterRegistry>,
+        auth_sessions: Arc<Mutex<HashMap<String, i64>>>,
+    ) -> Self {
         let default = registry.default_ctx();
         Self {
             conf: default.conf.clone(),
@@ -1922,7 +1943,7 @@ impl AdminRouterHandler {
             transfer_services: Arc::clone(&default.transfer_services),
             rt,
             start_time: LocalTime::now_datetime(),
-            auth_sessions: Arc::new(Mutex::new(HashMap::new())),
+            auth_sessions,
             registry,
         }
     }
@@ -2189,71 +2210,171 @@ async fn report(Extension(instance): Extension<Arc<AdminRouterHandler>>) -> Stri
     }
 }
 
+impl AdminRouterHandler {
+    /// Cluster overview payload shared by the web API and the CIVI AI
+    /// assistant. Lives on the handler (not the free `overview` fn) so the
+    /// AI provider can reuse it verbatim.
+    pub(crate) async fn overview_value(&self) -> FsResult<Value> {
+        let conf = &self.conf;
+        let web_start_time = &self.start_time;
+        let master_info = current_master_info(self).await?;
+
+        let expected_capacity = master_info.available + master_info.fs_used;
+        if master_info.capacity != expected_capacity {
+            log::warn!(
+                "Capacity inconsistency detected: capacity={}, available={}, fs_used={}, expected_capacity={}",
+                master_info.capacity,
+                master_info.available,
+                master_info.fs_used,
+                expected_capacity
+            );
+        }
+
+        let active_master = master_info.active_master.trim().to_string();
+        let master_state = if active_master.is_empty() {
+            "Unknown"
+        } else {
+            "Active"
+        };
+        let runtime =
+            fetch_master_runtime_info(conf, &active_master, master_info.active_raft_id).await;
+        let start_time_source = if runtime.start_time.is_some() {
+            "active_master"
+        } else {
+            "unavailable"
+        };
+
+        Ok(json!({
+            "cluster_id": conf.cluster_id,
+            "master_addr": display_master_endpoint(conf, &active_master),
+            "active_master": active_master,
+            "active_master_display": if active_master.is_empty() {
+                String::new()
+            } else {
+                display_addr_text_for_cluster(&active_master, conf, &active_master)
+            },
+            "local_hostname": resolve_display_hostname(conf, &active_master),
+            // Host + port of the active master's `web_port`, where its `/metrics`
+            // and profiling endpoint listen. Reported explicitly because it is
+            // not derivable from `master_addr`, which carries the RPC port.
+            "master_metrics_host": resolve_display_hostname(conf, &active_master),
+            "master_web_port": conf.master.web_port,
+            "journal_nodes": master_info.journal_nodes.clone(),
+            "version": runtime.version_json(),
+            "version_commit": runtime.version_commit_json(),
+            "start_time": runtime.start_time_json(),
+            "start_time_ms": runtime.start_time_ms_json(),
+            "start_time_source": start_time_source,
+            "web_start_time": web_start_time,
+            "live_workers": master_info.live_workers.len(),
+            "lost_workers": master_info.lost_workers.len(),
+            "available": master_info.available,
+            "capacity": master_info.capacity,
+            "fs_used": master_info.fs_used,
+            "reserved_bytes": master_info.reserved_bytes,
+            "files_total": master_info.inode_file_num.max(0),
+            "dir_total": master_info.inode_dir_num.max(0),
+            "block_total": master_info.block_num.max(0),
+            "master_state": master_state,
+        }))
+    }
+
+    /// The handler snapshot bound to the cluster the CIVI conversation
+    /// targets. `None`/empty resolves to the default cluster, matching the
+    /// `X-Curvine-Cluster` semantics of the data routes.
+    pub(crate) fn civi_snapshot(&self, cluster: Option<&str>) -> Result<Self, String> {
+        let ctx = self.registry.resolve(cluster).map_err(|e| e.to_string())?;
+        Ok(snapshot(self, &ctx))
+    }
+}
+
+/// CIVI AI assistant data source for the admin console: reuses the exact
+/// handlers that back the web API, bound to the selected cluster through the
+/// same snapshot the `X-Curvine-Cluster` middleware installs.
+///
+/// Client session summaries are master-local state the console never sees, so
+/// that tool reports "not supported" (the trait default). The decommission
+/// write goes through the same RPC as the workers page, one worker at a time.
+#[async_trait]
+impl AiDataProvider for AdminRouterHandler {
+    async fn cluster_overview(&self, cluster: Option<&str>) -> Result<Value, String> {
+        let snap = self.civi_snapshot(cluster)?;
+        snap.overview_value().await.map_err(|e| e.to_string())
+    }
+
+    async fn list_dir(&self, cluster: Option<&str>, path: &str) -> Result<Value, String> {
+        let snap = self.civi_snapshot(cluster)?;
+        let fs_path = FsPath::from_str(path).map_err(|e| e.to_string())?;
+        let files = snap
+            .unified_fs
+            .list_status(&fs_path)
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(files).map_err(|e| e.to_string())
+    }
+
+    async fn worker_status(&self, cluster: Option<&str>) -> Result<Value, String> {
+        let snap = self.civi_snapshot(cluster)?;
+        let master_info = current_master_info(&snap)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut workers = HashMap::new();
+        workers.insert("live_workers".to_string(), master_info.live_workers);
+        workers.insert("lost_workers".to_string(), master_info.lost_workers);
+        serde_json::to_value(workers).map_err(|e| e.to_string())
+    }
+
+    async fn cluster_config(&self, cluster: Option<&str>) -> Result<Value, String> {
+        let snap = self.civi_snapshot(cluster)?;
+        let conf = serde_json::to_value(&snap.conf).map_err(|e| e.to_string())?;
+        Ok(crate::ai::redact_secrets(&conf))
+    }
+
+    async fn add_dcm(&self, cluster: Option<&str>, workers: &[String]) -> Result<Value, String> {
+        let snap = self.civi_snapshot(cluster)?;
+        let mut updated = Vec::new();
+        for worker in workers.iter().map(|w| w.trim()).filter(|w| !w.is_empty()) {
+            match snap
+                .unified_fs
+                .fs_client()
+                .set_worker_status(worker, "decommission")
+                .await
+            {
+                Ok(_) => updated.push(worker.to_string()),
+                Err(err) => log::warn!(
+                    "CIVI: failed to set worker {} status to decommission: {}",
+                    worker,
+                    err
+                ),
+            }
+        }
+        Ok(json!(updated))
+    }
+}
+
+/// Session gate for the CIVI routes merged into the console web app.
+///
+/// The CIVI router arrives at `WebServer` through `ai_router()` and therefore
+/// bypasses the admin router's own `require_auth` layer (merged routers keep
+/// their layers). This middleware restores console parity: a valid session
+/// cookie is required, exactly like every other `/api/` route. The optional
+/// `X-CIVI-Token` (AI settings) stays as a second, independent gate on top.
+pub(crate) async fn require_ai_session_auth(
+    State(sessions): State<Arc<Mutex<HashMap<String, i64>>>>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    if is_authenticated_sessions(&sessions, &headers) {
+        return next.run(request).await;
+    }
+    unauthorized_response()
+}
+
 async fn overview(
     Extension(instance): Extension<Arc<AdminRouterHandler>>,
 ) -> FsResult<Json<Value>> {
-    let conf = &instance.conf;
-    let web_start_time = &instance.start_time;
-    let master_info = current_master_info(&instance).await?;
-
-    let expected_capacity = master_info.available + master_info.fs_used;
-    if master_info.capacity != expected_capacity {
-        log::warn!(
-            "Capacity inconsistency detected: capacity={}, available={}, fs_used={}, expected_capacity={}",
-            master_info.capacity,
-            master_info.available,
-            master_info.fs_used,
-            expected_capacity
-        );
-    }
-
-    let active_master = master_info.active_master.trim().to_string();
-    let master_state = if active_master.is_empty() {
-        "Unknown"
-    } else {
-        "Active"
-    };
-    let runtime = fetch_master_runtime_info(conf, &active_master, master_info.active_raft_id).await;
-    let start_time_source = if runtime.start_time.is_some() {
-        "active_master"
-    } else {
-        "unavailable"
-    };
-
-    let res = Json(json!({
-        "cluster_id": conf.cluster_id,
-        "master_addr": display_master_endpoint(conf, &active_master),
-        "active_master": active_master,
-        "active_master_display": if active_master.is_empty() {
-            String::new()
-        } else {
-            display_addr_text_for_cluster(&active_master, conf, &active_master)
-        },
-        "local_hostname": resolve_display_hostname(conf, &active_master),
-        // Host + port of the active master's `web_port`, where its `/metrics`
-        // and profiling endpoint listen. Reported explicitly because it is
-        // not derivable from `master_addr`, which carries the RPC port.
-        "master_metrics_host": resolve_display_hostname(conf, &active_master),
-        "master_web_port": conf.master.web_port,
-        "journal_nodes": master_info.journal_nodes.clone(),
-        "version": runtime.version_json(),
-        "version_commit": runtime.version_commit_json(),
-        "start_time": runtime.start_time_json(),
-        "start_time_ms": runtime.start_time_ms_json(),
-        "start_time_source": start_time_source,
-        "web_start_time": web_start_time,
-        "live_workers": master_info.live_workers.len(),
-        "lost_workers": master_info.lost_workers.len(),
-        "available": master_info.available,
-        "capacity": master_info.capacity,
-        "fs_used": master_info.fs_used,
-        "reserved_bytes": master_info.reserved_bytes,
-        "files_total": master_info.inode_file_num.max(0),
-        "dir_total": master_info.inode_dir_num.max(0),
-        "block_total": master_info.block_num.max(0),
-        "master_state": master_state,
-    }));
-    Ok(res)
+    Ok(Json(instance.overview_value().await?))
 }
 
 async fn browse(

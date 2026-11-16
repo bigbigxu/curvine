@@ -37,6 +37,8 @@ curvine-job-client = { workspace = true }
 curvine-unified-fs = { workspace = true }
 curvine-ufs-api = { workspace = true }
 curvine-web = { workspace = true }
+# CIVI AI provider trait (async, dyn-dispatched).
+async-trait = { workspace = true }
 curvine-fault = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }

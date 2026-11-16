@@ -2761,6 +2761,7 @@ dependencies = [
 name = "curvine-master"
 version = "0.2.2"
 dependencies = [
+ "async-trait",
  "axum 0.7.9",
  "bincode",
  "bytes",
@@ -3326,6 +3327,8 @@ dependencies = [
 name = "curvine-web"
 version = "0.2.2"
 dependencies = [
+ "async-stream",
+ "async-trait",
  "axum 0.7.9",
  "bytes",
  "chrono",
