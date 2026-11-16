@@ -399,6 +399,7 @@ fn mysql_cluster_e2e_batch_segment_load() -> CommonResult<()> {
             cluster.cluster_conf.client.clone(),
             Arc::new(TransferRuntimeConfig::with_limits(1, 100_000, 500_000)),
             32,
+            curvine_config::LoadTransferDefaults::from_job(&curvine_config::JobConf::default()),
         );
 
         let command = TransferCommand {
@@ -590,6 +591,7 @@ fn mysql_cluster_e2e_batch_segment_load() -> CommonResult<()> {
             cluster.cluster_conf.client.clone(),
             Arc::new(TransferRuntimeConfig::with_limits(1, 1, 500_000)),
             32,
+            curvine_config::LoadTransferDefaults::from_job(&curvine_config::JobConf::default()),
         );
         // Fresh cache without refresh => mount snapshot missing => plan errs
         // before touching the victim; either way the victim must survive.
@@ -761,6 +763,7 @@ fn s3_cluster_e2e_s3_source() -> CommonResult<()> {
             cluster.cluster_conf.client.clone(),
             Arc::new(TransferRuntimeConfig::with_limits(1, 100_000, 500_000)),
             32,
+            curvine_config::LoadTransferDefaults::from_job(&curvine_config::JobConf::default()),
         );
         let command = TransferCommand {
             kind: TransferKind::Load,

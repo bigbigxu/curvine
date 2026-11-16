@@ -203,6 +203,7 @@ impl TransferServer {
             conf.client.clone(),
             runtime_state.clone(),
             conf.transfer.ufs_max_concurrency_per_endpoint,
+            curvine_config::LoadTransferDefaults::from_job(&conf.job),
         );
         // One cache shared by the scheduler (dispatch) and the service
         // (reports/reads): file-level tasks exist only here.

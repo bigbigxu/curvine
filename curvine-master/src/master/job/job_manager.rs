@@ -81,6 +81,7 @@ pub struct JobManager {
     job_max_files: usize,
     run_seq: Arc<AtomicCounter>,
     load_job_semaphore: Arc<Semaphore>,
+    transfer_defaults: curvine_config::LoadTransferDefaults,
 }
 
 impl JobManager {
@@ -120,6 +121,7 @@ impl JobManager {
             job_max_files: conf.job.job_max_files,
             run_seq: Arc::new(AtomicCounter::new(0)),
             load_job_semaphore: Arc::new(Semaphore::new(conf.job.master_max_concurrent_load_jobs)),
+            transfer_defaults: curvine_config::LoadTransferDefaults::from_job(&conf.job),
         }
     }
 
@@ -373,6 +375,7 @@ impl JobManager {
             self.factory.clone(),
             self.job_max_files,
             self.run_seq.clone(),
+            self.transfer_defaults,
         )
     }
 

@@ -34,10 +34,12 @@ use curvine_model::{
 };
 use curvine_model::{FileGen, JobSourceType, LoadTaskInfo, CV_GEN_METADATA_KEY};
 use curvine_runtime::common::{LocalTime, TimeSpent, Utils};
+use curvine_runtime::runtime::{JoinHandle, RpcRuntime};
 use curvine_unified_fs::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -304,7 +306,33 @@ impl LoadTaskRunner {
             TransferPlanKind::Batch => return self.run_batch().await,
             TransferPlanKind::Segment => return self.run_segment().await,
             TransferPlanKind::SegmentGroup => return self.run_segment_group().await,
-            TransferPlanKind::Plain => {}
+            TransferPlanKind::Plain => {
+                let source_path = Path::from_str(&self.task.info.source_path)?;
+                let target_path = Path::from_str(&self.task.info.target_path)?;
+                // The fan-out path writes the final path directly and has no commit
+                // protocol, temp-file cleanup or retry markers. A transfer-service task
+                // depends on all three (temp path + rename + `AlreadyCommitted`), so it
+                // keeps the single-stream `create_stream`/`copy_and_commit_stream` path;
+                // only load-job tasks (no transfer report) use the parallel readers.
+                let transfer_task = self.task.info.transfer_report.is_some();
+                if !transfer_task
+                    && !source_path.is_cv()
+                    && target_path.is_cv()
+                    && self.max_parallel_streams() > 1
+                {
+                    let initial_source = self.get_ufs()?.get_status(&source_path).await?;
+                    // Segments are block aligned, so the requested stream count is only
+                    // an upper bound: a file that fits in one block cannot be split. Take
+                    // the parallel path only when it really produces more than one
+                    // reader, otherwise the resize/reopen dance buys nothing.
+                    let (_, segments) = self.parallel_segments(initial_source.len);
+                    if segments > 1 {
+                        return self
+                            .run_parallel(&source_path, &target_path, &initial_source)
+                            .await;
+                    }
+                }
+            }
         }
 
         let mut stream = self.create_stream().await?;
@@ -1948,6 +1976,303 @@ impl LoadTaskRunner {
     }
 
     const READ_CHUNK_BYTES: i64 = 16 * 1024 * 1024;
+
+    /// Upper bound on the number of independent reader+writer streams a large
+    /// UFS->CV load may fan out into.
+    fn max_parallel_streams(&self) -> usize {
+        self.task
+            .info
+            .job
+            .mount_info
+            .properties
+            .get("load_task.parallel_streams")
+            .and_then(|v| v.parse::<usize>().ok())
+            // Keep the fallback equal to the `[job]` default so a task that
+            // arrives without the property (old master, replayed task) does not
+            // silently use a different policy.
+            .unwrap_or(curvine_config::JobConf::DEFAULT_LOAD_PARALLEL_STREAMS)
+            .max(1)
+    }
+
+    fn min_bytes_per_stream(&self) -> i64 {
+        self.task
+            .info
+            .job
+            .mount_info
+            .properties
+            .get("load_task.min_bytes_per_stream")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(curvine_config::JobConf::DEFAULT_LOAD_MIN_BYTES_PER_STREAM_BYTES)
+            .max(1)
+    }
+
+    fn effective_streams(&self, src_len: i64) -> usize {
+        Self::stream_count(
+            src_len,
+            self.min_bytes_per_stream(),
+            self.max_parallel_streams(),
+        )
+    }
+
+    fn stream_count(src_len: i64, min_bytes: i64, cap: usize) -> usize {
+        let min_bytes = min_bytes.max(1);
+        let cap = cap.max(1);
+        let by_size = (src_len / min_bytes).max(0) as usize;
+        by_size.clamp(1, cap)
+    }
+
+    fn parallel_segments(&self, src_len: i64) -> (i64, usize) {
+        Self::parallel_segments_for(
+            src_len,
+            self.effective_streams(src_len),
+            self.task.info.job.block_size,
+        )
+    }
+
+    /// Segment length and the number of non-empty segments a fan-out of
+    /// `src_len` bytes really produces. `segment_len` rounds up to a whole block,
+    /// so a small file (or a large `block_size`) collapses to a single segment
+    /// and must not take the parallel path.
+    fn parallel_segments_for(src_len: i64, streams: usize, block_size: i64) -> (i64, usize) {
+        let streams = streams.max(1);
+        let block_size = block_size.max(1);
+        let seg = Self::segment_len(src_len, streams, block_size);
+        let segments = if src_len <= 0 {
+            1
+        } else {
+            ((src_len + seg - 1) / seg).max(1) as usize
+        };
+        (seg, segments.min(streams))
+    }
+
+    fn segment_len(src_len: i64, streams: usize, block_size: i64) -> i64 {
+        let streams = streams.max(1) as i64;
+        let block_size = block_size.max(1);
+        let raw = (src_len + streams - 1) / streams;
+        let aligned = ((raw + block_size - 1) / block_size) * block_size;
+        aligned.max(block_size)
+    }
+
+    /// Progress to report while the segments are still running.
+    ///
+    /// The counter only ever grows, but a segment can be ahead of the bytes that
+    /// landed, so it is capped at the source length and never reported negative.
+    fn parallel_progress(copied: i64, src_len: i64) -> i64 {
+        copied.clamp(0, src_len.max(0))
+    }
+
+    async fn run_parallel(
+        &self,
+        source_path: &Path,
+        target_path: &Path,
+        initial_source: &FileStatus,
+    ) -> FsResult<bool> {
+        let src_len = initial_source.len;
+        let (seg, streams) = self.parallel_segments(src_len);
+        let spend = TimeSpent::new();
+        let deadline_ms = LocalTime::mills() + self.task_timeout_ms;
+
+        {
+            let mut owner = self.create_unified(target_path).await?;
+            owner.resize(FileAllocOpts::with_truncate(src_len)).await?;
+            drop(owner);
+        }
+
+        let task_timeout_ms = self.task_timeout_ms;
+        // Bytes copied so far, shared with the segments: the parent reports it on
+        // `progress_interval_ms` instead of only when a whole segment joins.
+        // Segments are block aligned (>= one block), so waiting for a join leaves
+        // a gap far longer than the scheduler's staleness window and a slow
+        // stream gets re-dispatched while it is still writing.
+        let copied = Arc::new(AtomicI64::new(0));
+        let mut handles = Vec::with_capacity(streams);
+        for i in 0..streams {
+            let off = i as i64 * seg;
+            if off >= src_len {
+                break;
+            }
+            let len = seg.min(src_len - off);
+            let ufs = self.get_ufs()?;
+            let fs = self.fs.clone();
+            let src = source_path.clone();
+            let dst = target_path.clone();
+            let rt = self.fs.clone_runtime();
+            let task = self.task.clone();
+            let copied = copied.clone();
+            handles.push(rt.spawn(async move {
+                let mut reader = ufs.open(&src).await?;
+                reader.seek(off).await?;
+                let mut writer = fs.open_for_write(&dst, false).await?;
+                writer.seek(off).await?;
+
+                crate::fault_point! {
+                    async,
+                    name: "worker.load_task.parallel.before_segment_copy",
+                    description: "After a parallel load segment opens its streams and before it copies data",
+                    context: {
+                        "task_id" => task.info.task_id.clone(),
+                        "stream_index" => i as i64,
+                        "segment_offset" => off,
+                        "segment_len" => len,
+                    },
+                }
+
+                let mut remaining = len;
+                while remaining > 0 {
+                    if task.is_cancel() {
+                        let _ = writer.cancel().await;
+                        return FsResult::Ok(0);
+                    }
+                    if LocalTime::mills() > deadline_ms {
+                        let _ = writer.cancel().await;
+                        return err_box!(
+                            "Task {} exceed timeout {} ms (segment [{}, {}))",
+                            task.info.task_id,
+                            task_timeout_ms,
+                            off,
+                            off + len
+                        );
+                    }
+                    let want = remaining.min(Self::READ_CHUNK_BYTES) as usize;
+                    let chunk = reader.async_read(Some(want)).await?;
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    remaining -= chunk.len() as i64;
+                    let written_now = chunk.len() as i64;
+                    writer.async_write(chunk).await?;
+                    copied.fetch_add(written_now, Ordering::Relaxed);
+                }
+                if remaining != 0 {
+                    let _ = writer.cancel().await;
+                    return err_box!(
+                        "short read on segment [{}, {}): {} bytes missing (source shorter than stat len?)",
+                        off,
+                        off + len,
+                        remaining
+                    );
+                }
+                writer.complete().await?;
+                reader.complete().await?;
+                FsResult::Ok(len)
+            }));
+        }
+
+        let mut written: i64 = 0;
+        for idx in 0..handles.len() {
+            if self.task.is_cancel() {
+                info!(
+                    "transfer task canceled during parallel load: {}",
+                    self.log_context()
+                );
+                Self::abort_remaining(&handles, idx);
+                return self.finish_canceled().await;
+            }
+            crate::fault_point! {
+                async,
+                name: "worker.load_task.parallel.before_join_await",
+                description: "After the parent cancellation check and before awaiting a parallel load stream",
+                context: {
+                    "task_id" => self.task.info.task_id.clone(),
+                    "stream_index" => idx as i64,
+                },
+            }
+            let joined = loop {
+                tokio::select! {
+                    joined = &mut handles[idx] => break joined,
+                    _ = tokio::time::sleep(Duration::from_millis(self.progress_interval_ms)) => {
+                        let done = Self::parallel_progress(copied.load(Ordering::Relaxed), src_len);
+                        if done > 0 {
+                            self.update_progress(done, src_len, false).await;
+                        }
+                    }
+                }
+            };
+            match joined {
+                Ok(Ok(n)) => {
+                    written += n;
+                    let done = Self::parallel_progress(copied.load(Ordering::Relaxed), src_len);
+                    self.update_progress(done, src_len, false).await;
+                }
+                Ok(Err(e)) => {
+                    Self::abort_remaining(&handles, idx + 1);
+                    return Err(e);
+                }
+                Err(e) => {
+                    Self::abort_remaining(&handles, idx + 1);
+                    return err_box!("parallel load join error: {}", e);
+                }
+            }
+            if spend.used_ms() > self.task_timeout_ms {
+                Self::abort_remaining(&handles, idx + 1);
+                return err_box!(
+                    "Task {} exceed timeout {} ms",
+                    self.task.info.task_id,
+                    self.task_timeout_ms
+                );
+            }
+        }
+
+        if self.task.is_cancel() {
+            info!(
+                "transfer task canceled after parallel load: {}",
+                self.log_context()
+            );
+            return self.finish_canceled().await;
+        }
+        if written != src_len {
+            return err_box!(
+                "Task {} parallel load incomplete: wrote {} of {} bytes; refusing to mark cache valid",
+                self.task.info.task_id,
+                written,
+                src_len
+            );
+        }
+
+        let final_source = self.get_ufs()?.get_status(source_path).await?;
+        if final_source.len != initial_source.len || final_source.mtime != initial_source.mtime {
+            return err_box!(format!(
+                "Task {} parallel load source changed during transfer (initial len={}, initial mtime={}, final len={}, final mtime={}); refusing to mark cache valid",
+                self.task.info.task_id,
+                initial_source.len,
+                initial_source.mtime,
+                final_source.len,
+                final_source.mtime,
+            ));
+        }
+        let ufs_mtime = initial_source.mtime;
+        let attr_opts = SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime).build();
+        self.fs.set_attr(target_path, attr_opts).await?;
+
+        if let Err(err) = self.update_progress0(written, src_len, true).await {
+            if self.task.info.transfer_report.is_some() {
+                warn!(
+                    "final transfer task report failed, keep task for scheduler probe: {} err={}",
+                    self.log_context(),
+                    err
+                );
+                return Ok(false);
+            }
+            return Err(err);
+        }
+
+        info!(
+            "transfer task completed (parallel x{}): {} ufs_mtime={} copied_bytes={} task_cost_ms={}",
+            streams,
+            self.log_context(),
+            ufs_mtime,
+            written,
+            spend.used_ms(),
+        );
+
+        Ok(true)
+    }
+
+    fn abort_remaining(handles: &[JoinHandle<FsResult<i64>>], from: usize) {
+        for h in handles.iter().skip(from) {
+            h.abort();
+        }
+    }
 }
 
 async fn rename_ufs_output(
@@ -2023,8 +2348,8 @@ fn outcome_failed_reason(task: &TaskContext, _remove_task: bool) -> Option<&'sta
 #[cfg(test)]
 mod tests {
     use super::{
-        outcome_failed_reason, rename_ufs_output, TaskContext, TRANSFER_COMMIT_MARKER_SEP,
-        TRANSFER_COMMIT_TASK_XATTR,
+        outcome_failed_reason, rename_ufs_output, LoadTaskRunner, TaskContext,
+        TRANSFER_COMMIT_MARKER_SEP, TRANSFER_COMMIT_TASK_XATTR,
     };
     use curvine_fs_api::Path;
     use curvine_model::{
@@ -2032,6 +2357,25 @@ mod tests {
         WorkerAddress,
     };
     use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
+
+    const MB: i64 = 1024 * 1024;
+
+    // Reproduce the exact planning loop run_parallel uses, so tests exercise the
+    // real offset/len math (block alignment + last-segment clamp), which is the
+    // most error-prone part of the fan-out.
+    fn plan(src_len: i64, streams: usize, block_size: i64) -> Vec<(i64, i64)> {
+        let seg = LoadTaskRunner::segment_len(src_len, streams, block_size);
+        let mut ranges = Vec::new();
+        for i in 0..streams {
+            let off = i as i64 * seg;
+            if off >= src_len {
+                break;
+            }
+            let len = seg.min(src_len - off);
+            ranges.push((off, len));
+        }
+        ranges
+    }
     use curvine_unified_fs::UfsFileSystem;
     use std::collections::HashMap;
     use std::fs;
@@ -2143,6 +2487,49 @@ mod tests {
             2
         );
         assert!(TRANSFER_COMMIT_TASK_XATTR.starts_with("curvine.transfer."));
+    }
+
+    #[test]
+    fn parallel_segments_requires_more_than_one_block() {
+        // 128 MiB object, 128 MiB block: four requested streams still produce a
+        // single segment, so the parallel path must not run.
+        assert_eq!(
+            LoadTaskRunner::parallel_segments_for(128 * MB, 4, 128 * MB),
+            (128 * MB, 1)
+        );
+        assert_eq!(
+            LoadTaskRunner::parallel_segments_for(200 * MB, 8, 128 * MB),
+            (128 * MB, 2)
+        );
+        assert_eq!(LoadTaskRunner::parallel_segments_for(MB, 8, 128 * MB).1, 1);
+    }
+
+    #[test]
+    fn parallel_segments_matches_the_plan_it_produces() {
+        for &(src_len, streams, block_size) in &[
+            (1024 * MB, 8, 128 * MB),
+            (200 * MB, 6, 64 * MB),
+            (3 * 1024 * MB + 7, 4, 128 * MB),
+            (4 * MB, 8, 4 * MB),
+        ] {
+            let (seg, segments) =
+                LoadTaskRunner::parallel_segments_for(src_len, streams, block_size);
+            let ranges = plan(src_len, streams, block_size);
+            assert_eq!(segments, ranges.len(), "segment count must match the plan");
+            for (_, len) in &ranges {
+                assert!(*len <= seg, "segment longer than the planned segment size");
+            }
+            assert!(segments <= streams.max(1));
+        }
+    }
+
+    #[test]
+    fn parallel_progress_is_capped_and_never_negative() {
+        assert_eq!(LoadTaskRunner::parallel_progress(0, 1024), 0);
+        assert_eq!(LoadTaskRunner::parallel_progress(512, 1024), 512);
+        assert_eq!(LoadTaskRunner::parallel_progress(2048, 1024), 1024);
+        assert_eq!(LoadTaskRunner::parallel_progress(-1, 1024), 0);
+        assert_eq!(LoadTaskRunner::parallel_progress(7, 0), 0);
     }
 }
 

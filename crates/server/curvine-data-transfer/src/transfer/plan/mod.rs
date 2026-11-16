@@ -17,7 +17,7 @@ use crate::transfer::{
     job_mount_snapshot_async, ClusterMetadataCache, TransferMetrics, TransferRuntimeConfig,
 };
 use curvine_client_core::file::CurvineFileSystem;
-use curvine_config::{ClientConf, TransferConf};
+use curvine_config::{ClientConf, LoadTransferDefaults, TransferConf};
 use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
@@ -356,6 +356,7 @@ pub struct TransferPlanner {
     /// value applies to the next planning pass without a restart.
     runtime: Arc<TransferRuntimeConfig>,
     ufs_limiter: Arc<UfsEndpointLimiter>,
+    transfer_defaults: LoadTransferDefaults,
 }
 
 impl TransferPlanner {
@@ -457,6 +458,7 @@ impl TransferPlanner {
         client_conf: ClientConf,
         runtime: Arc<TransferRuntimeConfig>,
         ufs_max_concurrency_per_endpoint: usize,
+        transfer_defaults: LoadTransferDefaults,
     ) -> Self {
         Self {
             master_fs,
@@ -465,6 +467,7 @@ impl TransferPlanner {
             client_conf,
             runtime,
             ufs_limiter: Arc::new(UfsEndpointLimiter::new(ufs_max_concurrency_per_endpoint)),
+            transfer_defaults,
         }
     }
 
@@ -604,8 +607,12 @@ impl TransferPlanner {
     async fn plan_once(
         &self,
         job: &TransferJobRecord,
-        mount: MountInfo,
+        mut mount: MountInfo,
     ) -> FsResult<PlannedTransfer> {
+        // Transfer-service jobs are planned here, not by the master load planner,
+        // so the `[job]` transfer tuning has to be injected before the mount is
+        // handed to the UFS reader and to every task info.
+        self.transfer_defaults.apply(&mut mount.properties);
         // fs_mode export batches bypass the directory walk entirely: each entry
         // is an independent single-file copy with its own generation.
         let command = transfer_command(job)?;
@@ -1284,12 +1291,16 @@ impl TransferPlanner {
         job: &TransferJobRecord,
         mount: &MountInfo,
     ) -> FsResult<LoadJobInfo> {
+        // Scheduler-built tasks come through here with a mount snapshot, which
+        // may not have been through plan_once().
+        let mut mount = mount.clone();
+        self.transfer_defaults.apply(&mut mount.properties);
         let mount_dir_replicas = if job.kind == TransferKind::Load {
-            self.mount_dir_replicas(mount).await?
+            self.mount_dir_replicas(&mount).await?
         } else {
             None
         };
-        load_job_info(job, mount, mount_dir_replicas, &self.client_conf)
+        load_job_info(job, &mount, mount_dir_replicas, &self.client_conf)
     }
 
     /// Real replica count of the mount-point directory inode, read from master

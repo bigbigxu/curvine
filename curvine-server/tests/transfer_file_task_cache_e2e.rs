@@ -143,6 +143,7 @@ fn small_file_job_transfers_without_task_rows() -> CommonResult<()> {
                 ),
             ),
             32,
+            curvine_config::LoadTransferDefaults::from_job(&curvine_config::JobConf::default()),
         );
 
         let source = format!("file://{ufs_dir}");

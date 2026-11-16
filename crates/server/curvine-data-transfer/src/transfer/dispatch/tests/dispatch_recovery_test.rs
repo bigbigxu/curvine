@@ -33,6 +33,7 @@ fn scheduler_with_state(
         conf.client.clone(),
         runtime_config.clone(),
         1,
+        curvine_config::LoadTransferDefaults::from_job(&conf.job),
     );
     TransferScheduler::new(
         store,
@@ -338,6 +339,7 @@ fn scheduler_with_placement(
         conf.client.clone(),
         runtime_config.clone(),
         1,
+        curvine_config::LoadTransferDefaults::from_job(&conf.job),
     );
     let clients = Arc::new(curvine_rpc::client::ClientFactory::with_rt(
         conf.client_rpc_conf(),
