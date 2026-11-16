@@ -488,17 +488,15 @@ mod tests {
         page.mark_dirty(0, 4096);
 
         let taken = page.take_dirty(4096).unwrap().unwrap();
-        let before = FuseMetrics::get().write_back_cache_page_num.get();
-        drop(taken);
-        assert_eq!(
-            FuseMetrics::get().write_back_cache_page_num.get(),
-            before,
-            "snapshot drop must not undercount the gauge"
-        );
+        // The gauge is process-global and every other test in this binary runs
+        // in parallel, so its absolute value cannot be asserted here. Assert
+        // the invariant that drives it instead: `Drop for Page` decrements only
+        // when `counted` is set, and a snapshot is built with `counted: false`.
+        assert!(!taken.counted, "a snapshot must not own a gauge slot");
+        assert!(page.counted, "the owning page must hold the slot");
 
-        let base = before - 1;
+        drop(taken);
         drop(page);
-        assert_eq!(FuseMetrics::get().write_back_cache_page_num.get(), base);
     }
 
     #[test]

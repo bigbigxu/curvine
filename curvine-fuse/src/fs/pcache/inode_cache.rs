@@ -382,7 +382,7 @@ impl InodeCache {
         if page_ids.is_empty() {
             return;
         }
-        let mut state = self.state.write();
+        let mut state = self.state.write_unpoisoned();
         for &page_id in page_ids {
             if let Some(page) = state.pages.get_mut(&page_id) {
                 page.finish_flush();
@@ -440,17 +440,17 @@ impl InodeCache {
         Ok(())
     }
 
-    pub async fn flush_dirty(
-        self: &Arc<InodeCache>,
-        sync: bool,
-    ) -> FuseResult<(Arc<FuseWriter>, u64)> {
+    pub async fn flush_dirty(self: &Arc<InodeCache>, sync: bool) -> FuseResult<u64> {
         let _gate = self.flush_gate.lock().await;
         let pages = self.take_dirty_pages()?;
+        if pages.is_empty() {
+            return Ok(0);
+        }
         let (writer, total) = self.flush_inner(pages, sync).await?;
         if sync {
             self.publish_writer(&writer).await?;
         }
-        Ok((writer, total))
+        Ok(total)
     }
 
     pub async fn publish_read_range(
@@ -570,22 +570,40 @@ impl InodeCache {
     }
 
     pub async fn flush(self: &Arc<Self>) -> FuseResult<()> {
+        if self.writer_ver.get() <= self.all_ver.get() {
+            return Ok(());
+        }
         self.flush_all().await?;
         Ok(())
     }
 
     pub async fn ensure_flushed(self: &Arc<Self>) -> FuseResult<u64> {
         self.check_error()?;
+        if self.writer_ver.get() <= self.all_ver.get() {
+            return Ok(self.all_ver.get());
+        }
         self.flush_all().await.map(|(_, len)| len)
     }
 
     pub async fn queue_complete(self: &Arc<Self>) -> FuseResult<()> {
-        self.check_error()?;
-        self.cm.send(DirtyMessage::new_complete(self.ino)).await?;
-        Ok(())
+        let recorded = self.check_error().err();
+        if let Err(e) = self.cm.send(DirtyMessage::new_complete(self.ino)).await {
+            let _ = self.cm.release_cache(self).await;
+            return Err(e);
+        }
+
+        match recorded {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     pub async fn complete(self: &Arc<Self>, opts: Option<SetAttrOpts>) -> FuseResult<()> {
+        if self.is_deleted() {
+            self.free_pages(true);
+            return Ok(());
+        }
+
         let fut = async {
             let (writer, _) = self.flush_all().await?;
             writer.complete_with_attr(None, opts).await?;
@@ -610,7 +628,7 @@ impl InodeCache {
     }
 
     pub fn free_pages(self: &Arc<Self>, force: bool) -> u64 {
-        let mut state = self.state.write();
+        let mut state = self.state.write_unpoisoned();
         let mut freed = 0;
 
         state.pages.retain(|_, page| {
@@ -641,7 +659,7 @@ impl InodeCache {
     }
 
     fn take_dirty_pages_inner(self: &Arc<Self>, full_only: bool) -> FuseResult<Vec<Page>> {
-        let mut state = self.state.write();
+        let mut state = self.state.write_unpoisoned();
         let mut result = Vec::new();
 
         for page in state.pages.values_mut() {
@@ -663,7 +681,7 @@ impl InodeCache {
             return Ok(Vec::new());
         }
 
-        let mut state = self.state.write();
+        let mut state = self.state.write_unpoisoned();
         let end = off.saturating_add(len as u64).saturating_sub(1);
         let last = self.cm.page_id(end);
         let first = self.cm.page_id(off);
@@ -680,11 +698,14 @@ impl InodeCache {
 
 impl Drop for InodeCache {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.state.try_write() {
-            for page in state.pages.values_mut() {
-                page.clear();
-                self.cm.release_usage(self.page_size);
-            }
+        let mut state = match self.state.try_write() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        for page in state.pages.values_mut() {
+            page.clear();
+            self.cm.release_usage(self.page_size);
         }
     }
 }
@@ -1039,6 +1060,128 @@ mod tests {
         // otherwise it would error trying to reach the master.
         cache.complete(None).await.unwrap();
         assert_eq!(cache.page_len(), 0);
+        assert_eq!(cache.cm.used(), 0);
+    }
+
+    /// A poisoned cache (any background flush failure calls `set_error`) must
+    /// still queue the release: `queue_complete` is the only thing that makes the
+    /// write-back thread call `release_cache`, which is the only path that drops
+    /// the `caches` entry. Skipping it leaked one entry, its pages and its
+    /// backend writer per failed inode with no cleanup path.
+    #[tokio::test]
+    async fn queue_complete_queues_release_after_flush_error() {
+        let conf = test_conf(4096);
+        let (sender, mut receiver) = AsyncChannel::<DirtyMessage>::new(0).split();
+        let cm = Arc::new(CacheManager::new(&conf, sender).unwrap());
+        let cache = Arc::new(InodeCache::new(
+            cm.clone(),
+            TEST_INO,
+            cm.page_size,
+            OpenFlags::RDWR,
+            CreateFileOpts::with_create(false),
+            0,
+        ));
+        cache.set_error(FuseError::from_errno_msg(
+            libc::EIO,
+            "simulated flush failure".to_string().into(),
+        ));
+
+        // The recorded error still reaches the caller (RELEASE keeps reporting
+        // the failure), but the release must be queued anyway.
+        let res = cache.queue_complete().await;
+        assert!(
+            res.is_err(),
+            "a poisoned cache must keep reporting its error"
+        );
+        assert_eq!(cache.cm.used(), 0);
+
+        match receiver.recv().await {
+            Some(DirtyMessage::Complete(ino)) => assert_eq!(ino, TEST_INO),
+            Some(_) => panic!("expected a queued Complete, got another message"),
+            None => panic!("expected a queued Complete, got a closed channel"),
+        }
+    }
+
+    /// A deleted inode's pages are dropped on purpose: keeping them dirty
+    /// would pin cache usage that nothing is allowed to flush any more.
+    #[tokio::test]
+    async fn flush_after_delete_does_not_restore_pages() {
+        let cache = test_cache(&test_conf(4096));
+        cache.write(0, bytes(&vec![7u8; 4096])).await.unwrap();
+        cache.mark_deleted();
+
+        assert!(cache.flush_dirty(false).await.is_err());
+        assert!(
+            !cache.state.read().pages.values().any(|p| p.is_dirty()),
+            "a deleted inode has no data worth retrying"
+        );
+        assert_eq!(cache.free_pages(false), 4096);
+    }
+
+    /// When the write-back worker is already gone, `send` fails and nothing will
+    /// consume the Complete message, so the reference is released inline.
+    /// A missing `NodeState` is a hard failure (the mount is unusable), so this
+    /// path is only exercised with a bound state.
+    #[tokio::test]
+    async fn queue_complete_releases_entry_after_worker_shutdown() {
+        let conf = test_conf(4096);
+        let (sender, receiver) = AsyncChannel::<DirtyMessage>::new(0).split();
+        let cm = Arc::new(CacheManager::new(&conf, sender).unwrap());
+        let cache = cm
+            .get_or_create(
+                TEST_INO,
+                OpenFlags::RDWR,
+                CreateFileOpts::with_create(false),
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cm.len(), 1);
+
+        // The worker loop has exited, so the queue is gone.
+        drop(receiver);
+
+        // Without a bound state the inline release cannot complete; the send
+        // failure is still surfaced to the caller.
+        assert!(cache.queue_complete().await.is_err());
+    }
+
+    /// A panicking writer poisons the page lock; `drop` must still release the
+    /// pages, since it is the last chance to free their files and accounting.
+    #[tokio::test]
+    async fn drop_releases_pages_after_lock_poison() {
+        let cache = test_cache(&test_conf(4096));
+        cache.write(0, bytes(&vec![3u8; 4096])).await.unwrap();
+        assert_eq!(cache.cm.used(), 4096);
+        let cm = cache.cm.clone();
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.state.write();
+            panic!("simulated writer panic");
+        }));
+        assert!(poisoned.is_err());
+        assert!(cache.state.try_write().is_err());
+
+        drop(cache);
+        assert_eq!(cm.used(), 0, "a poisoned drop must still reclaim pages");
+    }
+
+    /// `free_pages` runs inside the release cleanup: a poisoned page lock must
+    /// not panic there, or `release_with_cleanup` unwinds before decrementing
+    /// refs and the entry is never removed.
+    #[tokio::test]
+    async fn free_pages_reclaims_pages_after_lock_poison() {
+        let cache = test_cache(&test_conf(4096));
+        cache.write(0, bytes(&vec![3u8; 4096])).await.unwrap();
+        assert_eq!(cache.cm.used(), 4096);
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.state.write();
+            panic!("simulated writer panic");
+        }));
+        assert!(poisoned.is_err());
+
+        assert_eq!(cache.free_pages(true), 4096);
         assert_eq!(cache.cm.used(), 0);
     }
 }

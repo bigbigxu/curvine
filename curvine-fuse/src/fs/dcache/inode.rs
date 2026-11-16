@@ -372,6 +372,14 @@ impl Inode {
         Ok(())
     }
 
+    pub fn mark_dirty_commit(&mut self) {
+        if matches!(self.lifecycle, Lifecycle::Dirty) {
+            self.lifecycle = Lifecycle::Cached;
+            self.invalidate_file_blocks();
+        }
+        self.last_access = LocalTime::mills();
+    }
+
     pub fn dirty_set_attr(&mut self, opts: SetAttrOpts) -> FuseResult<FileStatus> {
         if !self.is_dirty() {
             return err_fuse!(libc::EIO, "inode {} is not dirty", self.ino);

@@ -75,6 +75,10 @@ impl<T> StdRwLock<T> {
         self.0.write().unwrap()
     }
 
+    pub fn write_unpoisoned(&self) -> std::sync::RwLockWriteGuard<'_, T> {
+        self.0.write().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn read(&self) -> std::sync::RwLockReadGuard<'_, T> {
         self.0.read().unwrap()
     }

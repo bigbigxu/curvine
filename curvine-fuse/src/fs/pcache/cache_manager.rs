@@ -75,6 +75,9 @@ impl CacheManager {
         if conf.write_back_page_size.as_byte() == 0 {
             return err_box!("write_back_page_size must be > 0");
         }
+        if conf.write_back_tick_interval.as_duration().is_zero() {
+            return err_box!("write_back_tick_interval must be > 0");
+        }
         let flush_delay = conf.write_back_flush_delay.as_millis() as u128;
         let meta_cache_ttl = conf.effective_meta_cache_ttl().as_millis();
         if flush_delay > meta_cache_ttl / 2 {
@@ -338,7 +341,7 @@ mod tests {
     use bytes::Bytes;
     use curvine_config::FuseConf;
     use curvine_model::{CreateFileOpts, OpenFlags};
-    use curvine_runtime::common::ByteUnit;
+    use curvine_runtime::common::{ByteUnit, DurationUnit};
     use curvine_runtime::sync::channel::AsyncChannel;
 
     const PAGE_SIZE: u64 = 4096;
@@ -445,6 +448,30 @@ mod tests {
     async fn free_target_is_free_ratio_of_capacity() {
         let cm = test_cm(&test_conf(PAGE_SIZE, 1000, 0.1));
         assert_eq!(cm.free_target(), 100);
+    }
+
+    /// A zero tick makes `tokio::time::interval` panic inside the write-back
+    /// task. The panic kills the worker silently while the (unbounded by
+    /// default) dirty channel keeps accepting Complete messages, so no release
+    /// is ever processed and every cache entry, page and backend writer is
+    /// pinned for the life of the mount. Reject the config instead.
+    #[test]
+    fn zero_tick_interval_is_rejected() {
+        let mut conf = test_conf(PAGE_SIZE, PAGE_SIZE * 16, 0.1);
+        conf.enable_write_back = true;
+        conf.enable_meta_cache = Some(true);
+        conf.write_back_tick_interval = DurationUnit::new(0);
+
+        let (sender, _receiver) = AsyncChannel::new(0).split();
+        let err = match CacheManager::new(&conf, sender) {
+            Ok(_) => panic!("a zero tick interval must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("write_back_tick_interval"),
+            "expected a tick_interval error, got: {}",
+            err
+        );
     }
 
     #[tokio::test]

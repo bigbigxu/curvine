@@ -53,7 +53,7 @@ impl WriteBackWork {
         };
 
         let flushed = match cache.flush_dirty(false).await {
-            Ok((_, len)) => len,
+            Ok(len) => len,
             Err(e) => {
                 FuseMetrics::with(|m| {
                     m.write_back_error_count.with_label_values(&["flush"]).inc();
@@ -64,6 +64,7 @@ impl WriteBackWork {
                 } else {
                     warn!("write_back flush ino={} error: {}", ino, e);
                 }
+
                 cache.set_error(e);
 
                 0
@@ -148,6 +149,11 @@ impl WriteBackWork {
             let Some(cache) = cm.get_cache(inode.ino).await else {
                 continue;
             };
+
+            if let Err(e) = cache.flush_dirty(false).await {
+                warn!("write_back evict ino={} error: {}", inode.ino, e);
+                cache.set_error(e);
+            }
 
             let bytes = cache.free_pages(false);
             debug!(
@@ -306,6 +312,43 @@ mod tests {
         let (cm, _receiver) = test_cm(&conf);
         write_cache(&cm, 100, b"partial").await;
         assert_eq!(WriteBackWork::execute(&cm, 100, 0).await, 0);
+    }
+
+    /// A cache entry that was never written must not reach the backend: evict
+    /// would otherwise open a writer for every read-only inode in the map.
+    #[tokio::test]
+    async fn evict_skips_flush_without_dirty_pages() {
+        let conf = test_conf(4096);
+        let (cm, _receiver) = test_cm(&conf);
+        let cache = cm
+            .get_or_create(100, OpenFlags::RDWR, CreateFileOpts::with_create(false), 0)
+            .await
+            .unwrap();
+
+        WriteBackWork::evict_inodes(&cm).await;
+
+        assert!(
+            cache.check_error().is_ok(),
+            "an evict without dirty pages must not touch the backend"
+        );
+    }
+
+    /// The error must be latched: `flush_inner` drops the drained ranges before
+    /// returning, so the following `free_pages` reclaims them and nothing would
+    /// ever surface the loss.
+    #[tokio::test]
+    async fn evict_flush_failure_records_error() {
+        let conf = test_conf(4096);
+        let (cm, _receiver) = test_cm(&conf);
+        let cache = write_cache(&cm, 100, &[0u8; 4096]).await;
+
+        WriteBackWork::evict_inodes(&cm).await;
+
+        assert!(
+            cache.check_error().is_err(),
+            "a failed evict flush must latch the error"
+        );
+        assert_eq!(cm.used(), 0, "the drained pages must still be reclaimed");
     }
 
     #[tokio::test]
