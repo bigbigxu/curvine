@@ -36,8 +36,8 @@ use curvine_error::MAX_FILE_SIZE;
 use curvine_fs_api::{Path, RpcCode};
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_model::{
-    is_special_file_type, FileAllocMode, FileAllocOpts, FileLock, FileStatus, FileType, LockFlags,
-    LockType, OpenFlags, RenameFlags, SetAttrOpts,
+    is_special_file_type, CreateCallerCreds, CreateMode, FileAllocMode, FileAllocOpts, FileLock,
+    FileStatus, FileType, LockFlags, LockType, OpenFlags, RenameFlags, SetAttrOpts,
 };
 use curvine_runtime::common::{ByteUnit, TimeSpent};
 use curvine_runtime::runtime::Runtime;
@@ -73,29 +73,42 @@ impl CurvineFileSystem {
         header: &fuse_in_header,
         requested_mode: u32,
         umask: u32,
-    ) -> FuseResult<u32> {
+    ) -> FuseResult<(u32, CreateCallerCreds)> {
+        let requested_mode = requested_mode & 0o7777;
+        let umask = umask & 0o7777;
         let requested_setgid_exec = requested_mode & (libc::S_ISGID as u32 | libc::S_IXGRP as u32)
             == (libc::S_ISGID as u32 | libc::S_IXGRP as u32);
         if !requested_setgid_exec {
-            return Ok(requested_mode & 0o7777 & !umask);
+            return Ok((
+                requested_mode,
+                CreateCallerCreds {
+                    gids: vec![header.gid],
+                    umask,
+                    cap_fsetid: false,
+                    parent_group_gid: None,
+                    parent_group: None,
+                },
+            ));
         }
 
-        let parent = self.state.fs_stat(header.nodeid, None).await?;
-        let created_gid = if parent.mode & libc::S_ISGID as u32 != 0 {
-            FuseUtils::resolve_group_gid(&parent.group)
-        } else {
-            Some(header.gid)
-        };
         let caller_status = FuseUtils::caller_process_status(header.pid).await;
-        let caller_in_created_group =
-            created_gid.is_some_and(|gid| caller_status.in_group(header.gid, gid));
-
-        Ok(FuseUtils::normalize_create_mode(
-            requested_mode,
+        let mut creds = CreateCallerCreds {
+            gids: caller_status.gids_with_effective(header.gid),
             umask,
-            caller_in_created_group,
-            FuseUtils::caller_has_cap_fsetid(&caller_status),
-        ))
+            cap_fsetid: FuseUtils::caller_has_cap_fsetid(&caller_status),
+            parent_group_gid: None,
+            parent_group: None,
+        };
+
+        if let Ok(parent) = self.state.fs_stat(header.nodeid, None).await {
+            if parent.mode & CreateMode::SETGID != 0 {
+                creds.parent_group_gid =
+                    CreateMode::created_group_gid(parent.mode, &parent.group, header.gid);
+                creds.parent_group = Some(parent.group.clone());
+            }
+        }
+
+        Ok((requested_mode, creds))
     }
 
     fn is_ofd_lock_pid(pid: u32) -> bool {
@@ -1760,39 +1773,27 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn open(&self, op: Open<'_>) -> FuseResult<fuse_open_out> {
         let action = OpenAction::try_from(op.arg.flags)?;
         let path = self.state.get_path(op.header.nodeid)?;
-        let status = self.state.fs_stat(op.header.nodeid, None).await?;
-        if is_special_file_type(status.file_type) {
-            let truncate = (op.arg.flags & libc::O_TRUNC as u32) != 0;
-            if action.write() || truncate {
-                return err_fuse!(libc::EACCES, "special file nodes are read-only metadata");
-            }
-            let ino = op.header.nodeid;
-            let handle = self.state.new_meta_handle(ino, status).await?;
-            let open_flags = FuseUtils::file_open_flags(&self.conf, false);
-            return Ok(fuse_open_out {
-                fh: handle.fh(),
-                open_flags,
-                padding: 0,
-            });
-        }
+        let ino = op.header.nodeid;
         let truncate = (op.arg.flags & libc::O_TRUNC as u32) != 0;
-        if action.write() || truncate {
+        let wants_write = action.write() || truncate;
+
+        if wants_write {
             self.ensure_writable_path(&path)?;
         }
         if let Some(mask) = Self::open_userspace_acl_mask(action) {
             self.check_permissions(op.header, mask).await?;
         }
-        let ino = op.header.nodeid;
         let opts = FuseUtils::open_opts(&self.fs);
 
         let handle = self.state.fs_open(ino, op.arg.flags, opts).await?;
 
+        let status = handle.status();
         let keep_cache = if self.conf.direct_io {
             false
         } else {
             // Page cache consistency is handled by open flags; explicit inode
             // invalidation can deadlock inside send_inode_out on some older kernels.
-            self.state.keep_cache(ino, &handle.status())
+            !is_special_file_type(status.file_type) && self.state.keep_cache(ino, &status)
         };
         let open_flags = FuseUtils::file_open_flags(&self.conf, keep_cache);
 
@@ -1819,10 +1820,11 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path_common(ino, Some(name))?;
         self.ensure_writable_path(&path)?;
 
-        let mode = self
+        let (mode, caller_creds) = self
             .normalize_file_creation_mode(op.header, op.arg.mode, op.arg.umask)
             .await?;
-        let opts = FuseUtils::create_opts(&op, &self.fs, mode);
+        let mut opts = FuseUtils::create_opts(&op, &self.fs, mode);
+        opts.caller_creds = Some(caller_creds);
         let handle = self.state.fs_create(ino, name, op.arg.flags, opts).await?;
         let attr = FuseUtils::status_to_attr(&self.conf, &handle.status())?;
 
@@ -2334,10 +2336,11 @@ impl fs::FileSystem for CurvineFileSystem {
         } else if let Some(file_type) = FuseUtils::special_file_type_from_mode(op.arg.mode) {
             let path = self.state.get_path_name(op.header.nodeid, name)?;
             self.ensure_writable_path(&path)?;
-            let mode = self
+            let (mode, caller_creds) = self
                 .normalize_file_creation_mode(op.header, op.arg.mode, op.arg.umask)
                 .await?;
-            let opts = FuseUtils::mknod_opts(&op, &self.fs, file_type, mode);
+            let mut opts = FuseUtils::mknod_opts(&op, &self.fs, file_type, mode);
+            opts.caller_creds = Some(caller_creds);
             self.fs.create_special_node(&path, opts).await?;
             let attr = self.state.lookup_common(op.header.nodeid, name).await?;
             Ok(FuseUtils::create_entry_out(&self.conf, attr))

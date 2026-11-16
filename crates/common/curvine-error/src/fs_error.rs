@@ -124,6 +124,7 @@ pub enum ErrorKind {
     /// A worker cannot take new writes (unhealthy storage / fenced node).
     /// Distinct from `DiskOutOfSpace`: the fix is to move, not to add capacity.
     StorageUnavailable = 40,
+    PermissionDenied = 41,
 
     #[num_enum(default)]
     Common = 10000,
@@ -294,6 +295,9 @@ pub enum FsError {
     #[error("{0}")]
     Decode(ErrorImpl<StringError>),
 
+    #[error("{0}")]
+    PermissionDenied(ErrorImpl<StringError>),
+
     // Other errors that are not defined.
     #[error("{0}")]
     Common(ErrorImpl<StringError>),
@@ -406,6 +410,13 @@ impl FsError {
 
     pub fn decode_err(msg: impl Into<String>) -> Self {
         Self::Decode(ErrorImpl::with_source(msg.into().into()))
+    }
+
+    pub fn permission_denied(msg: impl Into<String>) -> Self {
+        let msg = msg.into();
+        Self::PermissionDenied(ErrorImpl::with_source(
+            format!("permission denied: {msg}").into(),
+        ))
     }
 
     pub fn file_exists(path: impl AsRef<str>) -> Self {
@@ -583,6 +594,7 @@ impl FsError {
             FsError::SnapshotNotReady(_) => ErrorKind::SnapshotNotReady,
             FsError::Encode(_) => ErrorKind::Encode,
             FsError::Decode(_) => ErrorKind::Decode,
+            FsError::PermissionDenied(_) => ErrorKind::PermissionDenied,
             FsError::Common(_) => ErrorKind::Common,
         }
     }
@@ -741,6 +753,7 @@ impl ErrorExt for FsError {
             FsError::SnapshotNotReady(e) => FsError::SnapshotNotReady(e.ctx(ctx)),
             FsError::Encode(e) => FsError::Encode(e.ctx(ctx)),
             FsError::Decode(e) => FsError::Decode(e.ctx(ctx)),
+            FsError::PermissionDenied(e) => FsError::PermissionDenied(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
     }
@@ -787,6 +800,7 @@ impl ErrorExt for FsError {
             FsError::SnapshotNotReady(e) => e.encode(ErrorKind::SnapshotNotReady),
             FsError::Encode(e) => e.encode(ErrorKind::Encode),
             FsError::Decode(e) => e.encode(ErrorKind::Decode),
+            FsError::PermissionDenied(e) => e.encode(ErrorKind::PermissionDenied),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
     }
@@ -838,6 +852,7 @@ impl ErrorExt for FsError {
             ErrorKind::SnapshotNotReady => FsError::SnapshotNotReady(de.into_string()),
             ErrorKind::Encode => FsError::Encode(de.into_string()),
             ErrorKind::Decode => FsError::Decode(de.into_string()),
+            ErrorKind::PermissionDenied => FsError::PermissionDenied(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
     }
@@ -993,6 +1008,20 @@ mod tests {
         let decoded = FsError::decode(bytes);
         assert!(matches!(decoded, FsError::TransferAlreadyRunning(_)));
         assert!(decoded.to_string().contains("different command"));
+    }
+
+    #[test]
+    pub fn permission_denied_round_trip_test() {
+        let error = FsError::permission_denied("/a: special file nodes are read-only metadata");
+
+        assert!(matches!(error.kind(), ErrorKind::PermissionDenied));
+        let decoded = FsError::decode(error.encode());
+        assert!(matches!(decoded.kind(), ErrorKind::PermissionDenied));
+        assert!(matches!(decoded, FsError::PermissionDenied(_)));
+        assert!(decoded.to_string().contains("read-only metadata"));
+        // Legacy clients decode unknown error kinds as Common and recover the
+        // errno from the text; keep the token they match on.
+        assert!(decoded.to_string().contains("permission denied"));
     }
 
     #[test]

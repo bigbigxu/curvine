@@ -25,10 +25,10 @@ use curvine_core_error::{err_box, err_ext, try_option, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
-    BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileGen, FileLock,
-    FileStatus, FreeResult, LeaderSnapshotInfo, ListOptions, MkdirOpts, MountInfo, RenameFlags,
-    SetAttrOpts, StorageState, TrashEntry, TtlAction, TtlType, WorkerAddress, INTERNAL_CTIME_XATTR,
-    INTERNAL_TTL_TYPE_XATTR,
+    BlockLocation, CommitBlock, CreateFileOpts, CreateMode, ExtendedBlock, FileAllocOpts, FileGen,
+    FileLock, FileStatus, FreeResult, LeaderSnapshotInfo, ListOptions, MkdirOpts, MountInfo,
+    RenameFlags, SetAttrOpts, StorageState, TrashEntry, TtlAction, TtlType, WorkerAddress,
+    INTERNAL_CTIME_XATTR, INTERNAL_TTL_TYPE_XATTR,
 };
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::AtomicCounter;
@@ -36,8 +36,6 @@ use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet, LinkedList};
 use std::mem;
 use std::sync::Arc;
-
-const MODE_SETGID: u32 = 0o2000;
 
 /// Note: The modification operation uses &mut self, which is a necessary improvement. We use the unsafe API to perform modifications.
 pub struct FsDir {
@@ -263,7 +261,7 @@ impl FsDir {
 
         if let Some(group) = Self::setgid_parent_group(&inp)? {
             opts.group = group;
-            opts.mode |= MODE_SETGID;
+            opts.mode |= CreateMode::SETGID;
         }
 
         let dir = InodeDir::with_opts(self.next_inode_id()?, LocalTime::mills() as i64, opts);
@@ -286,7 +284,7 @@ impl FsDir {
             None => return Ok(None),
         };
         let acl = parent.as_ref().acl()?;
-        if acl.mode & MODE_SETGID != 0 {
+        if acl.mode & CreateMode::SETGID != 0 {
             Ok(Some(acl.group.clone()))
         } else {
             Ok(None)
@@ -1581,10 +1579,25 @@ impl FsDir {
             return err_ext!(FsError::file_exists(inp.path()));
         }
 
-        // Create a directory that does not exist.
-        inp = self.create_parent_dir(inp, opts.dir_opts())?;
+        let mut dir_opts = opts.dir_opts();
+        if let Some(creds) = &opts.caller_creds {
+            dir_opts.mode = (dir_opts.mode & !(creds.umask & 0o777)) & 0o777;
+        }
 
-        if let Some(group) = Self::setgid_parent_group(&inp)? {
+        // Create a directory that does not exist.
+        inp = self.create_parent_dir(inp, dir_opts)?;
+
+        let inherited_group = Self::setgid_parent_group(&inp)?;
+        if let Some(creds) = &opts.caller_creds {
+            opts.mode = CreateMode::normalize_create_mode(
+                opts.mode,
+                creds.umask & 0o777,
+                CreateMode::caller_in_created_group(creds, inherited_group.as_deref()),
+                creds.cap_fsetid,
+            );
+        }
+
+        if let Some(group) = inherited_group {
             opts.group = group;
         }
 

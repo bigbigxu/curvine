@@ -151,6 +151,9 @@ pub use self::trash_entry::*;
 mod proto_utils;
 pub use self::proto_utils::ProtoUtils;
 
+mod create_mode;
+pub use self::create_mode::CreateMode;
+
 mod compatibility;
 pub use self::compatibility::{
     feature_enabled, CompatibilityMode, CompatibilityPolicy, CompatibilityVerdict,

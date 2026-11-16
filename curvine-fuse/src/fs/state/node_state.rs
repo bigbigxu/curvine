@@ -36,8 +36,8 @@ use curvine_core_error::err_box;
 use curvine_error::{FsError, FsResult};
 use curvine_fs_api::{FileSystem, ListStream, Path, StateReader, StateWriter};
 use curvine_model::{
-    CreateFileOpts, DeleteResult, FileAllocOpts, FileBlocks, FileStatus, ListOptions, MkdirOpts,
-    OpenFlags, RenameFlags, SetAttrOpts,
+    is_special_file_type, CreateFileOpts, DeleteResult, FileAllocOpts, FileBlocks, FileStatus,
+    ListOptions, MkdirOpts, OpenFlags, RenameFlags, SetAttrOpts,
 };
 use curvine_runtime::common::{FastHashMap, LocalTime};
 use curvine_runtime::runtime::RpcRuntime;
@@ -1597,8 +1597,43 @@ impl NodeState {
             }
         }
 
+        if !flags.read_only() {
+            let path = self.get_path(ino)?;
+            return self.new_handle(Some(ino), &path, flags, opts).await;
+        }
+
         let path = self.get_path(ino)?;
-        self.new_handle(Some(ino), &path, flags, opts).await
+        let reader = match self.new_reader(&path).await {
+            Ok(reader) => reader,
+            Err(e) => {
+                let tombstone = self
+                    .unlinked_status(ino)
+                    .filter(|status| is_special_file_type(status.file_type));
+                if let Some(status) = tombstone {
+                    if flags.truncate() {
+                        return err_fuse!(
+                            libc::EACCES,
+                            "special file nodes are read-only metadata"
+                        );
+                    }
+                    return self.new_meta_handle(ino, status).await;
+                }
+                return Err(e);
+            }
+        };
+        let mut status = reader.status().clone();
+        if is_special_file_type(status.file_type) {
+            drop(reader);
+            if flags.truncate() {
+                return err_fuse!(libc::EACCES, "special file nodes are read-only metadata");
+            }
+            return self.new_meta_handle(ino, status).await;
+        }
+
+        status.id = ino as i64;
+        Ok(self
+            .insert_handle_with_writer(ino, Some(Arc::new(reader)), None, status)
+            .await)
     }
 
     pub async fn new_meta_handle(
