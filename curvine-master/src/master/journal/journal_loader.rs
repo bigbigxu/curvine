@@ -21,7 +21,7 @@ use crate::master::meta::inode::InodeView::File;
 use crate::master::meta::inode::{InodePath, InodeView};
 use crate::master::meta::InodeId;
 use crate::master::{
-    JobManager, Master, MasterMetrics, MountManager, SyncFsDir, SyncWorkerManager,
+    JobManager, Master, MasterMetrics, MountManager, ProgressView, SyncFsDir, SyncWorkerManager,
 };
 use curvine_config::JournalConf;
 use curvine_core_error::{err_box, CommonResult, ErrorExt};
@@ -62,6 +62,8 @@ pub struct JournalLoader {
     /// Shared raft-term handle, so the session lease epoch follows election
     /// instead of process start (#1883 review).
     term: Arc<AtomicU64>,
+    /// Replay watermarks shared with the read-only observability plane (#CV-94).
+    progress: ProgressView,
 }
 
 impl JournalLoader {
@@ -91,6 +93,7 @@ impl JournalLoader {
             recovery,
             true,
             Arc::new(AtomicU64::new(0)),
+            ProgressView::new(),
         )
     }
 
@@ -106,6 +109,7 @@ impl JournalLoader {
         worker_manager: SyncWorkerManager,
         recovery: RecoveryGate,
         term: Arc<AtomicU64>,
+        progress: ProgressView,
     ) -> CommonResult<Self> {
         Self::build(
             rt,
@@ -119,6 +123,7 @@ impl JournalLoader {
             recovery,
             false,
             term,
+            progress,
         )
     }
 
@@ -135,6 +140,7 @@ impl JournalLoader {
         recovery: RecoveryGate,
         testing: bool,
         term: Arc<AtomicU64>,
+        progress: ProgressView,
     ) -> CommonResult<Self> {
         // Install the fs_mode release gate before anything can serve a release:
         // with transfer enabled the replayer no longer waits for exports, so an
@@ -155,6 +161,7 @@ impl JournalLoader {
             journal_writer.clone(),
             recovery.clone(),
             fsm_state.clone(),
+            progress.clone(),
         )?;
         let (sender, receiver) = AsyncChannel::new(conf.writer_channel_size).split();
         let loader = Self {
@@ -173,6 +180,7 @@ impl JournalLoader {
             metrics: Master::get_metrics()?,
             has_apply_worker: !testing,
             term,
+            progress,
         };
 
         loader.refresh_metrics()?;
@@ -245,6 +253,10 @@ impl JournalLoader {
         self.metrics
             .journal_ufs_applied
             .set(state.ufs_applied.index as i64);
+        // Same numbers, published for the observability plane, which must be
+        // able to answer while this worker is busy (#CV-94).
+        self.progress
+            .set_watermarks(state.applied.index, state.ufs_applied.index);
     }
 
     /// Refresh gauges only: never advance metadata/UFS replay watermarks just
@@ -685,6 +697,10 @@ impl JournalLoader {
         self.mnt_mgr.restore_best_effort();
         let mount_ms = spend.used_ms();
 
+        // Installing a snapshot moves the start of the replay episode: a
+        // progress percentage computed from zero would overstate the work left.
+        self.progress
+            .set_replay_base(snapshot.fsm_state.applied.index);
         // Restore both watermarks as the snapshot recorded them. `ufs_applied`
         // may lag `applied`, and that owed range is replayed from the entries
         // the log store keeps, so it must not be clamped to the snapshot index.
@@ -1102,6 +1118,11 @@ impl JournalLoader {
                 term: entry.term,
                 index: entry.index,
             };
+            // The UFS watermark moves here, not through `set_applied`, so the
+            // published view has to be refreshed here too -- otherwise /phase
+            // keeps reporting the old gap while the gate says caught up
+            // (#CV-94 e2e finding).
+            self.refresh_fsm_metrics(&lock);
             let gate = Self::ufs_gate(&lock);
             drop(lock);
             gate
@@ -1207,6 +1228,7 @@ impl AppStorage for JournalLoader {
     fn hard_state_changed(&self, state: &raft::eraftpb::HardState) {
         self.metrics.journal_committed.set(state.commit as i64);
         self.metrics.journal_term.set(state.term as i64);
+        self.progress.set_commit(state.commit);
         // Every persisted term moves the lease epoch forward; a promotion always
         // carries a higher term than the leadership it replaces.
         self.term.store(state.term, Ordering::Release);
@@ -1419,6 +1441,41 @@ mod tests {
     }
 
     #[test]
+    /// `/phase` and `/recoveryz` must not disagree: the UFS watermark moves on
+    /// the marker path, which never goes through `set_applied` (#CV-94 e2e).
+    #[test]
+    fn ufs_marker_advances_the_published_view() -> FsResult<()> {
+        let (conf, root) = ignore_reply_error_conf("ufs-visible", true);
+        let js = JournalSystem::from_conf(&conf)?;
+        let loader = js.journal_loader();
+
+        loader.set_applied(AppliedIndex {
+            index: 5,
+            term: 1,
+            ..Default::default()
+        })?;
+        assert_eq!(loader.progress.ufs_applied(), 0);
+
+        loader.ufs_applied(UfsAppliedEntry {
+            op_id: 1,
+            rpc_id: 0,
+            term: 1,
+            index: 5,
+        })?;
+
+        assert_eq!(
+            loader.progress.ufs_applied(),
+            5,
+            "the observability view must follow the marker"
+        );
+        assert_eq!(loader.progress.ufs_lag(), 0);
+
+        drop(loader);
+        drop(js);
+        FileUtils::delete_path(root, true)?;
+        Ok(())
+    }
+
     fn ufs_replayer_advances_its_own_watermark() -> FsResult<()> {
         let (conf, root) = ignore_reply_error_conf("ufs-replay", true);
         let js = JournalSystem::from_conf(&conf)?;

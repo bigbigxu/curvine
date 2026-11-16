@@ -14,10 +14,12 @@
 
 mod config;
 mod dir_space;
+mod master;
 
 use clap::{Parser, Subcommand};
 pub use config::ConfigCommand;
 pub use dir_space::DirSpaceCommand;
+pub use master::MasterCommand;
 
 #[derive(Parser, Debug)]
 pub struct AdminCommand {
@@ -32,4 +34,7 @@ pub enum AdminSubCommand {
     /// Directory statistics switch and explicit path list
     #[command(name = "dir-space")]
     DirSpace(DirSpaceCommand),
+    /// Read-only master state over the observability plane
+    #[command(name = "master")]
+    Master(MasterCommand),
 }

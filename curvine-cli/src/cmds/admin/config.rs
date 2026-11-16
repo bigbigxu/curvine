@@ -93,7 +93,7 @@ mod tests {
             AdminSubCommand::Config(cfg) => {
                 assert!(matches!(cfg.action, ConfigSubCommand::Set { .. }));
             }
-            AdminSubCommand::DirSpace(_) => panic!("expected config"),
+            other => panic!("expected config, got {other:?}"),
         }
     }
 }

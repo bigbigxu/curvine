@@ -252,8 +252,9 @@ fn run() -> CommonResult<()> {
             Some(Commands::Admin(cmd)) => match cmd.action {
                 cmds::AdminSubCommand::Config(config) => config.execute(fs_client).await,
                 cmds::AdminSubCommand::DirSpace(dir_space) => dir_space.execute(fs_client).await,
+                cmds::AdminSubCommand::Master(master) => master.execute(&conf).await,
             },
-            Some(Commands::Snapshot(cmd)) => cmd.execute(fs_client).await,
+            Some(Commands::Snapshot(cmd)) => cmd.execute(fs_client, &conf).await,
             Some(Commands::Version) | None => Ok(()),
         }
     })

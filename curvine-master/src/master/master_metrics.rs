@@ -16,11 +16,12 @@
 
 use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::ttl::TtlBucket;
-use crate::master::{JobStore, Master};
+use crate::master::{JobStore, Master, MasterPhase};
 use curvine_core_error::CommonResult;
 use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics, Metrics as m};
 use curvine_model::{JobTaskProgress, JobTaskState, JobTaskType, MetricValue, WorkerInfo};
-use curvine_raft::raft::storage::RocksLogStorage;
+use curvine_raft::raft::storage::{LogStorage, RocksLogStorage};
+use curvine_runtime::common::LocalTime;
 use curvine_runtime::sync::FastDashMap;
 use curvine_sys::version::ReleaseVersion;
 use dashmap::DashMap;
@@ -189,6 +190,21 @@ pub struct MasterMetrics {
     pub(crate) master_safe_mode: Gauge,
     pub(crate) master_ufs_caught_up: Gauge,
     pub(crate) journal_ufs: GaugeVec,
+    /// `MasterPhase` discriminant; see `MasterPhase::as_str` for the mapping.
+    /// Exported as a number so a dashboard can chart transitions without
+    /// parsing strings (#CV-94).
+    pub(crate) master_service_phase: Gauge,
+    /// Committed entries this node has not applied yet. Zero while it serves.
+    pub(crate) master_replay_lag: Gauge,
+    /// Percent of the current replay episode already applied, 100 when there is
+    /// nothing left. Only meaningful while the denominator holds still. Integer
+    /// like every other gauge here; `/phase` carries the exact ratio.
+    pub(crate) master_replay_progress_percent: Gauge,
+    /// Applied entries per second over the sampling window.
+    pub(crate) master_apply_rate: Gauge,
+    /// Journal entries written since the last registered snapshot. This is what
+    /// a restart would replay, so it is the number that says "snapshot now".
+    pub(crate) master_snapshot_lag_entries: Gauge,
 
     // Metadata DB keys as produced by `DBEngine::get_rocksdb_metrics`; journal
     // DB keys carry an extra `journal_` prefix.
@@ -432,6 +448,28 @@ impl MasterMetrics {
                 "journal_ufs",
                 "UFS replay progress by kind: pending backlog, stalled flag, failed attempts",
                 &["kind"],
+            )?,
+            master_service_phase: m::new_gauge(
+                "master_service_phase",
+                "MasterPhase discriminant: 1 Starting, 2 Replaying, 3 CatchingUp, 4 Serving, \
+                 5 StandingBy, 6 Quarantined, 7 SafeMode, 8 Exiting",
+            )?,
+            master_replay_lag: m::new_gauge(
+                "master_replay_lag",
+                "Committed entries not yet applied by this master",
+            )?,
+            master_replay_progress_percent: m::new_gauge(
+                "master_replay_progress_percent",
+                "Percent of the current replay episode applied, 100 when caught up \
+                 (static denominator only)",
+            )?,
+            master_apply_rate: m::new_gauge(
+                "master_apply_rate",
+                "Metadata entries applied per second over the sampling window",
+            )?,
+            master_snapshot_lag_entries: m::new_gauge(
+                "master_snapshot_lag_entries",
+                "Journal entries written since the last registered snapshot",
             )?,
 
             rocksdb_metrics: m::new_gauge_vec("rocksdb_metrics", "RocksDB metrics", &["tag"])?,
@@ -858,6 +896,48 @@ impl MasterMetrics {
             .set(i64::from(fs.master_monitor.is_safe_mode()));
         self.master_ufs_caught_up
             .set(i64::from(fs.master_monitor.ufs_caught_up()));
+
+        let quarantined = journal_store
+            .map(|store| matches!(store.recovery_state(), Ok(Some(_))))
+            .unwrap_or(false);
+        let now_ms = LocalTime::mills();
+        let phase = fs.master_monitor.phase(quarantined);
+        let progress = fs.master_monitor.progress();
+        progress.observe_phase(phase, now_ms);
+        self.master_service_phase.set(i64::from(i8::from(phase)));
+
+        let applied = progress.applied();
+        let committed = progress.commit();
+        self.master_replay_lag
+            .set(committed.saturating_sub(applied) as i64);
+
+        // A ratio is only exported while the denominator is still; a leader
+        // that is still catching up gets a lag number instead.
+        let total = committed.saturating_sub(progress.replay_base().min(applied));
+        let ratio = if phase == MasterPhase::CatchingUp && total > 0 {
+            0.0
+        } else if total == 0 {
+            1.0
+        } else {
+            applied.saturating_sub(progress.replay_base()) as f64 / total as f64
+        };
+        self.master_replay_progress_percent
+            .set((ratio * 100.0).round() as i64);
+
+        if let Some(rate) = progress.record_sample(now_ms) {
+            self.master_apply_rate
+                .set(rate.entries_per_sec.round() as i64);
+        }
+
+        if let Some(store) = journal_store {
+            if let Ok(Some(snapshot)) = store.latest_snapshot() {
+                let snapshot_index = snapshot.get_metadata().index;
+                self.master_snapshot_lag_entries
+                    .set(applied.saturating_sub(snapshot_index) as i64);
+            } else {
+                self.master_snapshot_lag_entries.set(applied as i64);
+            }
+        }
 
         if filesystem_info.block_num > 0 {
             let avg_size = filesystem_info.fs_used / filesystem_info.block_num;

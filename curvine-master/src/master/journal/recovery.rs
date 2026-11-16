@@ -103,6 +103,21 @@ impl RecoveryGate {
         self.inner.pending.load(Ordering::Acquire)
     }
 
+    /// Last recorded failure, empty while nothing has gone wrong. Read by the
+    /// ops plane so a safe-mode master can say *why* it stopped serving
+    /// instead of only that it did (#CV-94).
+    pub(crate) fn last_error(&self) -> Option<String> {
+        let slot = match self.inner.last_error.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if slot.is_empty() {
+            None
+        } else {
+            Some(slot.clone())
+        }
+    }
+
     pub(crate) fn note_error(&self, error: &str) {
         if let Ok(mut slot) = self.inner.last_error.lock() {
             slot.clear();

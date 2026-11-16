@@ -18,7 +18,7 @@ use crate::master::journal::{
     ReleaseWriterEntry, RenameEntry,
 };
 use crate::master::meta::inode::{InodeDir, InodeView};
-use crate::master::{FsModeExport, JobManager, Master, MasterMetrics, SyncFsDir};
+use crate::master::{FsModeExport, JobManager, Master, MasterMetrics, ProgressView, SyncFsDir};
 use curvine_config::JournalConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsError;
@@ -83,6 +83,10 @@ pub struct UfsLoader {
     journal_writer: Arc<JournalWriter>,
     recovery: RecoveryGate,
     fsm_state: Arc<Mutex<FsmState>>,
+    /// Published to the observability plane: this worker is the only mover of
+    /// the UFS watermark on a leader, so /phase would otherwise report a gap
+    /// that /recoveryz already considers closed (#CV-94 e2e).
+    progress: ProgressView,
     retry_interval: Duration,
     metrics: &'static MasterMetrics,
 }
@@ -97,6 +101,7 @@ impl UfsLoader {
         journal_writer: Arc<JournalWriter>,
         recovery: RecoveryGate,
         fsm_state: Arc<Mutex<FsmState>>,
+        progress: ProgressView,
     ) -> CommonResult<Self> {
         let copy_timeout = match DurationUnit::from_str(&conf.ufs_copy_timeout) {
             Ok(unit) => unit.as_duration(),
@@ -119,6 +124,7 @@ impl UfsLoader {
             journal_writer,
             recovery,
             fsm_state,
+            progress,
             retry_interval: Duration::from_secs(conf.retry_interval_secs),
             metrics: Master::get_metrics()?,
         })
@@ -460,6 +466,8 @@ impl UfsLoader {
             self.metrics
                 .journal_ufs_applied
                 .set(state.ufs_applied.index as i64);
+            self.progress
+                .set_watermarks(state.applied.index, state.ufs_applied.index);
             (caught_up, pending)
         };
 

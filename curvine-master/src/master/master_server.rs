@@ -280,6 +280,7 @@ impl Master {
             start_time,
             start_time_ms,
             conf.profiling.clone(),
+            conf.master.ops_token.clone(),
         );
 
         Ok(Self {
@@ -308,21 +309,21 @@ impl Master {
     }
 
     pub async fn start(&mut self) -> CommonResult<ServerStateListener> {
+        // Bind and serve the observability plane *before* the journal starts.
+        // A master replays its journal and then waits for a raft role, and that
+        // window can be long: starting this port afterwards left the node
+        // unreachable (no /metrics, no /healthz) exactly while an operator
+        // needs to tell "still replaying" from "stuck" (#CV-94).
         let journal_system = match self.journal_system.take() {
             Some(journal_system) => journal_system,
             None => return err_box!("master journal system is not initialized"),
         };
-        let mut listener = journal_system.start().await?;
-        listener.wait_role().await?;
-
         let rpc_server = match self.rpc_server.take() {
             Some(rpc_server) => rpc_server,
             None => return err_box!("master rpc server is not initialized"),
         };
         let metrics_required = rpc_server.service().conf().master.metrics_required;
         let master_web_port = rpc_server.service().conf().master.web_port;
-        let mut rpc_status = rpc_server.start();
-        rpc_status.wait_running().await?;
 
         let metrics_server = match self.metrics_server.take() {
             Some(metrics_server) => metrics_server,
@@ -337,6 +338,14 @@ impl Master {
                  (metrics_required=false, continuing): {err}"
             );
         }
+
+        // Replay, then publish the raft role. The RPC data plane keeps its
+        // existing contract: it still starts only once the role is known.
+        let mut listener = journal_system.start().await?;
+        listener.wait_role().await?;
+
+        let mut rpc_status = rpc_server.start();
+        rpc_status.wait_running().await?;
 
         self.actor.start()?;
         self.mount_manager.restore_best_effort();

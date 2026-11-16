@@ -42,7 +42,9 @@ pub mod fs;
 
 pub mod journal;
 
+mod capabilities;
 mod master_monitor;
+pub use self::capabilities::*;
 pub use self::master_monitor::*;
 
 mod master_metrics;

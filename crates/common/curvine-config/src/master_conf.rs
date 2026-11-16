@@ -45,6 +45,11 @@ pub struct MasterConf {
     /// probe endpoint from orchestration. Set to false only to tolerate a degraded
     /// observability port.
     pub metrics_required: bool,
+    /// Shared secret required by the read-only ops endpoints
+    /// (`/api/v1/master/ops/*`). When empty, the ops plane is unauthenticated:
+    /// acceptable only on an internal network, and `/phase` reports
+    /// `ops_auth: none` so the exposure is visible (#CV-94).
+    pub ops_token: Option<String>,
     pub io_threads: usize,
     pub worker_threads: usize,
     pub actor_threads: usize,
@@ -496,6 +501,7 @@ impl Default for MasterConf {
             rpc_port: ClusterConf::DEFAULT_MASTER_PORT,
             web_port: ClusterConf::DEFAULT_MASTER_WEB_PORT,
             metrics_required: true,
+            ops_token: None,
             io_threads: 32,
             worker_threads: Utils::worker_threads(32),
             actor_threads: 4,

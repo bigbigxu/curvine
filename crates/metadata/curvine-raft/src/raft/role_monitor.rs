@@ -16,6 +16,8 @@ use curvine_core_error::CommonResult;
 use curvine_runtime::sync::{StateCtl, StateListener, StateMonitor};
 use num_enum::{FromPrimitive, IntoPrimitive};
 use raft::{SoftState, StateRole};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 // raft node status.
 #[repr(i8)]
@@ -30,15 +32,25 @@ pub enum RoleState {
 }
 
 // Asynchronous Task Status Monitor.
-pub struct RoleMonitor(StateMonitor);
+pub struct RoleMonitor {
+    state: StateMonitor,
+    /// Leader announced by the last published `SoftState`, 0 while none is
+    /// known. Published here because the observability plane must be able to
+    /// say who the leader is without touching the raft node (#CV-94).
+    leader_id: Arc<AtomicU64>,
+}
 
 impl RoleMonitor {
     pub fn new() -> Self {
-        Self(StateMonitor::new(RoleState::Init.into()))
+        Self {
+            state: StateMonitor::new(RoleState::Init.into()),
+            leader_id: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     // Node role conversion.
     pub fn advance_role(&self, ss: &SoftState) {
+        self.leader_id.store(ss.leader_id, Ordering::Release);
         if ss.raft_state == StateRole::Leader || ss.raft_state == StateRole::Follower {
             let now = if ss.raft_state == StateRole::Leader {
                 RoleState::Leader
@@ -46,11 +58,11 @@ impl RoleMonitor {
                 RoleState::Follower
             };
 
-            let cur: RoleState = self.0.state();
+            let cur: RoleState = self.state.state();
             if cur == RoleState::Init {
-                self.0.advance_state(now, true);
+                self.state.advance_state(now, true);
             } else {
-                self.0.advance_state(now, false);
+                self.state.advance_state(now, false);
             }
         }
     }
@@ -61,24 +73,29 @@ impl RoleMonitor {
 
     pub fn step_down(&self) {
         if self.is_leader() {
-            self.0.advance_state(RoleState::Follower, false);
+            self.state.advance_state(RoleState::Follower, false);
         }
     }
 
     pub fn advance_exit(&self) {
-        self.0.advance_state(RoleState::Exit, true);
+        self.state.advance_state(RoleState::Exit, true);
     }
 
     pub fn new_listener(&self) -> RoleStateListener {
-        RoleStateListener(self.0.new_listener())
+        RoleStateListener(self.state.new_listener())
     }
 
     pub fn read_ctl(&self) -> StateCtl {
-        self.0.read_ctl()
+        self.state.read_ctl()
+    }
+
+    /// Shared handle for the last announced leader, 0 while none is known.
+    pub fn leader_ctl(&self) -> Arc<AtomicU64> {
+        self.leader_id.clone()
     }
 
     pub fn state(&self) -> RoleState {
-        self.0.state()
+        self.state.state()
     }
 
     pub fn is_running(&self) -> bool {
