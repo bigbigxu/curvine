@@ -60,6 +60,20 @@ impl WorkerManager {
             .count()
     }
 
+    /// The cluster id of a heartbeat or report must match, so a node or a
+    /// report that belongs to another cluster cannot change this cluster's
+    /// state.
+    pub(crate) fn check_cluster_id(&self, cluster_id: &str) -> CommonResult<()> {
+        if cluster_id != self.cluster_id {
+            return err_box!(
+                "cluster_id mismatch, expected {}, actual: {}",
+                self.cluster_id,
+                cluster_id
+            );
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn heartbeat(
         &mut self,
@@ -78,13 +92,7 @@ impl WorkerManager {
         presence_only: bool,
     ) -> FsResult<(Vec<WorkerCommand>, bool)> {
         // The cluster id must match to prevent misregistration.
-        if cluster_id != self.cluster_id {
-            return err_box!(
-                "Registered cluster_id mismatch, expected {}, actual: {}",
-                self.cluster_id,
-                cluster_id
-            );
-        }
+        self.check_cluster_id(cluster_id)?;
 
         let cmds = match status {
             HeartbeatStatus::Start => {

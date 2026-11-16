@@ -12,7 +12,7 @@ fn full_block_report_reclaims_excess_replica() {
     let result = fs
         .block_report(
             BlockReportList {
-                cluster_id: String::new(),
+                cluster_id: "curvine".to_string(),
                 worker_id: 300,
                 full_report: true,
                 total_len: 1,
@@ -57,7 +57,7 @@ fn stale_block_report_does_not_register_location() {
     let result = fs
         .block_report_for_live_worker_session(
             BlockReportList {
-                cluster_id: String::new(),
+                cluster_id: "curvine".to_string(),
                 worker_id: 300,
                 full_report: false,
                 total_len: 1,
@@ -86,7 +86,7 @@ fn stale_block_report_does_not_register_location() {
     assert!(fs
         .block_report_for_legacy_live_worker(
             BlockReportList {
-                cluster_id: String::new(),
+                cluster_id: "curvine".to_string(),
                 worker_id: 300,
                 full_report: false,
                 total_len: 1,
