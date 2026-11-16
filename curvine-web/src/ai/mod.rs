@@ -24,6 +24,7 @@ pub mod agent;
 pub mod audit;
 pub mod auth;
 pub mod conf;
+pub mod grants;
 pub mod limiter;
 pub mod llm;
 pub mod mcp_client;
@@ -35,6 +36,7 @@ pub mod tools;
 
 pub use self::audit::AuditLogger;
 pub use self::conf::{AiSettings, AiSettingsStore, McpServerConf};
+pub use self::grants::SessionGrants;
 pub use self::provider::AiDataProvider;
 pub use self::router_handler::{build_router, AiRouterHandler};
 pub use self::tools::redact_secrets;

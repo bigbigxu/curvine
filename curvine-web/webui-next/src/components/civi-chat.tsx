@@ -7,6 +7,7 @@ import {
   PlayIcon,
   SendIcon,
   Settings2Icon,
+  ShieldCheckIcon,
   SquareIcon,
   Trash2Icon,
   WrenchIcon,
@@ -44,6 +45,8 @@ interface NewChatBody {
   cluster?: string
   /** Console locale (`en` / `zh-CN`) — the backend injects the reply language. */
   locale?: string
+  /** Conversation session id; scopes session-scoped write grants. */
+  session_id?: string
 }
 
 /** One tool invocation rendered as a compact step row. */
@@ -515,7 +518,7 @@ function ConfirmCard({
 }: {
   confirm: CiviConfirm
   sending: boolean
-  onResolve: (callId: string, approve: boolean) => void
+  onResolve: (callId: string, approve: boolean, approveAll?: boolean) => void
 }) {
   const { t } = useI18n()
   return (
@@ -538,6 +541,16 @@ function ConfirmCard({
             </Button>
             <Button
               variant='outline'
+              size='sm'
+              disabled={sending}
+              title={t('civi.approveAllHint')}
+              onClick={() => onResolve(confirm.callId, true, true)}
+            >
+              <ShieldCheckIcon className='size-3.5' />
+              {t('civi.approveAll')}
+            </Button>
+            <Button
+              variant='ghost'
               size='sm'
               disabled={sending}
               onClick={() => onResolve(confirm.callId, false)}
@@ -870,6 +883,13 @@ export function CiviChat() {
       return
     }
     setDraft('')
+    // Every conversation turn carries the session id so the backend can scope
+    // "approve all" write grants to this conversation.
+    let sessionId = activeId
+    if (!sessionId) {
+      sessionId = nextMessageId()
+      setActiveId(sessionId)
+    }
     const history = messages
       .filter((m) => m.status !== 'running')
       .map((m) => ({ role: m.role, content: m.content }))
@@ -880,7 +900,8 @@ export function CiviChat() {
     const body: NewChatBody = {
       messages: [...history, { role: 'user', content: text }],
       // Language preference from the console locale switcher.
-      locale
+      locale,
+      session_id: sessionId
     }
     // Follow the cluster selected in the top bar; the backend resolves it
     // against its registry (empty/undefined = default cluster).
@@ -889,7 +910,7 @@ export function CiviChat() {
     void runChat(body, nextMessageId())
   }
 
-  const resume = (callId: string, approve: boolean) => {
+  const resume = (callId: string, approve: boolean, approveAll = false) => {
     if (sending) return
     // Mark the card resolved, then continue the paused conversation.
     setMessages((prev) =>
@@ -902,7 +923,10 @@ export function CiviChat() {
         )
       }))
     )
-    void runChat({ resume_call_id: callId, approve }, nextMessageId())
+    void runChat(
+      { resume_call_id: callId, approve, approve_all: approveAll || undefined },
+      nextMessageId()
+    )
   }
 
   const saveSettings = async () => {

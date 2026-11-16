@@ -33,6 +33,8 @@ export default {
     confirmTitle: 'Write action requires your confirmation',
     approve: 'Approve',
     reject: 'Reject',
+    approveAll: 'Approve all (this session)',
+    approveAllHint: 'Grants this tool for the rest of the conversation; write actions no longer pause for confirmation.',
     approved: 'Approved',
     rejected: 'Rejected',
 

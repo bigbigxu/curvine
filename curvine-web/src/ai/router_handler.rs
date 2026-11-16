@@ -31,6 +31,7 @@ use crate::ai::agent::{Agent, AgentEvent, ChatBody, PendingCall};
 use crate::ai::audit::AuditLogger;
 use crate::ai::auth;
 use crate::ai::conf::{AiSettings, AiSettingsStore};
+use crate::ai::grants::SessionGrants;
 use crate::ai::limiter::RateLimiter;
 use crate::ai::mcp_server::{self, McpServer};
 use crate::ai::provider::AiDataProvider;
@@ -46,6 +47,8 @@ pub struct AiRouterHandler {
     call_counter: Arc<AtomicU64>,
     /// Write-tool calls waiting for user confirmation.
     pending: Arc<Mutex<HashMap<String, PendingCall>>>,
+    /// Session-scoped write grants ("approve all for this session").
+    grants: Arc<SessionGrants>,
 }
 
 impl AiRouterHandler {
@@ -57,6 +60,7 @@ impl AiRouterHandler {
             limiter: RateLimiter::new(),
             call_counter: Arc::new(AtomicU64::new(0)),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            grants: Arc::new(SessionGrants::new()),
         }
     }
 
@@ -151,6 +155,8 @@ async fn chat(
                 handler.call_counter.clone(),
                 req.cluster,
                 req.locale,
+                req.session_id,
+                handler.grants.clone(),
             ));
             sse_response(&handler, agent.run(messages, None))
         }
@@ -169,6 +175,18 @@ async fn chat(
                 json!({"call_id": pending.call_id, "tool": pending.name, "approve": req.approve}),
             );
 
+            // "Approve all" grants the tool for the rest of the session so
+            // batch write flows do not need one card per call.
+            if req.approve && req.approve_all {
+                if let Some(session) = pending.session_id.as_deref() {
+                    handler.grants.grant(session, &pending.name);
+                }
+                handler.audit.record(
+                    "session_granted",
+                    json!({"tool": pending.name, "session": pending.session_id}),
+                );
+            }
+
             let agent = Arc::new(Agent::new(
                 handler.provider.clone(),
                 settings,
@@ -176,6 +194,8 @@ async fn chat(
                 handler.call_counter.clone(),
                 pending.cluster.clone(),
                 None,
+                pending.session_id.clone(),
+                handler.grants.clone(),
             ));
             let resume = (pending.call_id, pending.name, pending.args, req.approve);
             sse_response(&handler, agent.run(pending.messages, Some(resume)))
@@ -204,6 +224,7 @@ fn sse_response(
                 args,
                 messages,
                 cluster,
+                session_id,
             } => {
                 // Park the write call until the user approves or rejects it.
                 pending_store
@@ -217,6 +238,7 @@ fn sse_response(
                             args: args.clone(),
                             messages,
                             cluster,
+                            session_id,
                         },
                     );
                 (

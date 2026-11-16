@@ -32,6 +32,8 @@ export default {
     confirmTitle: '写操作需要你的确认',
     approve: '批准',
     reject: '拒绝',
+    approveAll: '本次会话内全部批准',
+    approveAllHint: '为本会话授予该工具的执行权限，后续写操作不再逐次确认。',
     approved: '已批准',
     rejected: '已拒绝',
 

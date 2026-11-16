@@ -38,6 +38,7 @@ use serde_json::{json, Value};
 
 use crate::ai::audit::AuditLogger;
 use crate::ai::conf::{AiSettings, MAX_ITERATIONS_LIMIT};
+use crate::ai::grants::SessionGrants;
 use crate::ai::llm::{LlmChunk, LlmClient};
 use crate::ai::mcp_client;
 use crate::ai::provider::AiDataProvider;
@@ -95,6 +96,10 @@ pub struct NewChatRequest {
     /// Console locale (`en` / `zh-CN`); drives the reply-language directive.
     #[serde(default)]
     pub locale: Option<String>,
+    /// Conversation session id (console-minted); scopes "approve all for this
+    /// session" write grants. `None` = grants unsupported for this request.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Resume request after a write-tool confirmation card.
@@ -102,6 +107,10 @@ pub struct NewChatRequest {
 pub struct ResumeChatRequest {
     pub resume_call_id: String,
     pub approve: bool,
+    /// When set together with `approve`, grant the paused tool for the rest
+    /// of the conversation session (skips further confirmation cards).
+    #[serde(default)]
+    pub approve_all: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +129,8 @@ pub struct PendingCall {
     pub messages: Vec<Value>,
     /// Cluster the paused call was targeting (console deployments).
     pub cluster: Option<String>,
+    /// Session the paused call belongs to (scopes session grants).
+    pub session_id: Option<String>,
 }
 
 /// Events streamed to the browser as SSE.
@@ -146,6 +157,8 @@ pub enum AgentEvent {
         messages: Vec<Value>,
         /// Cluster the call targets (`None` = server default).
         cluster: Option<String>,
+        /// Session the call belongs to (scopes session grants).
+        session_id: Option<String>,
     },
     Done {
         finish_reason: Option<String>,
@@ -165,6 +178,10 @@ pub struct Agent {
     cluster: Option<String>,
     /// Console locale driving the reply-language directive.
     locale: Option<String>,
+    /// Conversation session id (scopes write-tool grants).
+    session_id: Option<String>,
+    /// Shared session grant table ("approve all" bypasses confirmation).
+    grants: Arc<SessionGrants>,
 }
 
 /// One external MCP tool available for dispatch.
@@ -176,6 +193,7 @@ struct ExternalTool {
 }
 
 impl Agent {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: Arc<dyn AiDataProvider>,
         settings: AiSettings,
@@ -183,6 +201,8 @@ impl Agent {
         call_counter: Arc<AtomicU64>,
         cluster: Option<String>,
         locale: Option<String>,
+        session_id: Option<String>,
+        grants: Arc<SessionGrants>,
     ) -> Self {
         Agent {
             client: LlmClient::from_settings(&settings),
@@ -192,6 +212,8 @@ impl Agent {
             call_counter,
             cluster,
             locale,
+            session_id,
+            grants,
         }
     }
 
@@ -434,8 +456,21 @@ impl Agent {
                     let (ok, full, preview) = match parsed_args {
                         Ok(args) => {
                             yield AgentEvent::ToolCall { name: name.clone(), args: args.clone() };
-                            // Write tools pause here for user confirmation.
-                            if self.is_write_tool(&name) {
+                            // Write tools pause for user confirmation — unless
+                            // this session already holds an "approve all"
+                            // grant for the tool.
+                            let session_granted = self
+                                .session_id
+                                .as_deref()
+                                .map(|sid| self.grants.is_granted(sid, &name))
+                                .unwrap_or(false);
+                            if session_granted {
+                                self.audit.record(
+                                    "session_grant_used",
+                                    json!({"tool": name, "session": self.session_id}),
+                                );
+                            }
+                            if self.is_write_tool(&name) && !session_granted {
                                 self.audit.record(
                                     "confirm_required",
                                     json!({"tool": name, "args": truncate_for_log(&args_text)}),
@@ -446,6 +481,7 @@ impl Agent {
                                     args,
                                     messages: messages.clone(),
                                     cluster: self.cluster.clone(),
+                                    session_id: self.session_id.clone(),
                                 };
                                 return;
                             }
