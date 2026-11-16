@@ -106,9 +106,11 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "fs_operate",
-            description: "Mutate the Curvine filesystem. Every action is destructive or \
-                          state-changing and requires explicit user confirmation in the \
-                          console before execution.",
+            description: "Mutate the Curvine filesystem: create text files (max 64 KB per \
+                          call), directories, links, attr updates, deletions and trash \
+                          operations. Every action is destructive or state-changing and \
+                          requires explicit user confirmation in the console before \
+                          execution.",
             parameters: fs_operate_schema(),
             perm: "write",
             actions: FS_OPERATE_ACTIONS,
@@ -195,6 +197,7 @@ pub const JOB_INSIGHT_ACTIONS: &[&str] = actions![
 ];
 pub const WORKER_INSIGHT_ACTIONS: &[&str] = actions!["list", "detail"];
 pub const FS_OPERATE_ACTIONS: &[&str] = actions![
+    "create_file",
     "mkdir",
     "rename",
     "delete",
@@ -205,6 +208,10 @@ pub const FS_OPERATE_ACTIONS: &[&str] = actions![
     "trash_restore",
     "trash_empty"
 ];
+
+/// Largest file content one tool call may write (the chat context itself is
+/// the practical bound; this just keeps runaway payloads out of the RPC).
+pub const MAX_CREATE_FILE_BYTES: usize = 64 * 1024;
 pub const MOUNT_OPERATE_ACTIONS: &[&str] = actions!["add", "update", "delete", "resync"];
 pub const JOB_OPERATE_ACTIONS: &[&str] =
     actions!["submit_load", "submit_transfer", "cancel", "retry"];
@@ -331,6 +338,8 @@ fn fs_operate_schema() -> Value {
             "replicas": {"type": "integer", "description": "set_attr: replica count."},
             "ttl_ms": {"type": "integer", "description": "set_attr: time-to-live in milliseconds (0 clears TTL)."},
             "ttl_action": {"type": "string", "enum": ["delete", "trash"], "description": "set_attr: what happens on TTL expiry."},
+            "content": {"type": "string", "description": "create_file: text content to write (max 64 KB)."},
+            "overwrite": {"type": "boolean", "description": "create_file: overwrite an existing file (default false)."},
             "xattr": {"type": "object", "description": "set_attr: additional xattrs as {key: string}."},
             "trash_paths": {"type": "array", "items": {"type": "string"}, "description": "trash_restore: trash entry paths to restore."}
         },
@@ -538,6 +547,16 @@ pub async fn dispatch(
             match action {
                 "rename" | "symlink" | "link" => {
                     require_str(args, "target", action)?;
+                }
+                "create_file" => {
+                    require_str(args, "content", action)?;
+                    let content = args.get("content").and_then(Value::as_str).unwrap_or("");
+                    if content.len() > MAX_CREATE_FILE_BYTES {
+                        return Err(format!(
+                            "content exceeds the {} KB limit for create_file",
+                            MAX_CREATE_FILE_BYTES / 1024
+                        ));
+                    }
                 }
                 _ => {
                     require_str(args, "path", action)?;
@@ -977,6 +996,36 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(v["action"], "decommission");
+    }
+
+    #[tokio::test]
+    async fn test_create_file_content_validation() {
+        let provider = FakeProvider::new();
+        let mut settings = all_enabled_settings();
+        settings.enabled_tools.push("fs_operate".to_string());
+
+        let ok = json!({"action": "create_file", "path": "/a.txt", "content": "hello"});
+        assert!(dispatch(&provider, &settings, "fs_operate", &ok, None).await.is_ok());
+
+        let too_big = json!({
+            "action": "create_file",
+            "path": "/a.txt",
+            "content": "x".repeat(MAX_CREATE_FILE_BYTES + 1)
+        });
+        assert!(dispatch(&provider, &settings, "fs_operate", &too_big, None)
+            .await
+            .is_err());
+
+        // Missing content.
+        assert!(dispatch(
+            &provider,
+            &settings,
+            "fs_operate",
+            &json!({"action": "create_file", "path": "/a.txt"}),
+            None
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]

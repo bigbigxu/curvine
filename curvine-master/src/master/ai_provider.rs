@@ -218,6 +218,11 @@ impl AiDataProvider for MasterAiProvider {
     ) -> Result<Value, String> {
         let path = self.arg_str(args, "path", action)?;
         match action {
+            "create_file" => Err(
+                "fs_operate action 'create_file' writes file content, which is served by the \
+                 admin console provider"
+                    .to_string(),
+            ),
             "mkdir" => {
                 let parent = args
                     .get("recursive")

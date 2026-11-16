@@ -2659,6 +2659,27 @@ impl AiDataProvider for AdminRouterHandler {
         let client = snap.unified_fs.clone();
         let fs_path = FsPath::from_str(path).map_err(|e| e.to_string())?;
         match action {
+            "create_file" => {
+                let content = args
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "create_file requires 'content'".to_string())?;
+                let bytes = content.as_bytes();
+                if bytes.len() > crate::ai::tools::MAX_CREATE_FILE_BYTES {
+                    return Err(format!(
+                        "content exceeds the {} KB limit",
+                        crate::ai::tools::MAX_CREATE_FILE_BYTES / 1024
+                    ));
+                }
+                let overwrite = require_bool_arg(args, "overwrite", false);
+                let mut writer = client
+                    .create(&fs_path, overwrite)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                writer.write(bytes).await.map_err(|e| e.to_string())?;
+                writer.complete().await.map_err(|e| e.to_string())?;
+                Ok(json!({"created": true, "path": path, "bytes": bytes.len()}))
+            }
             "mkdir" => {
                 let created = client
                     .mkdir(&fs_path, require_bool_arg(args, "recursive", true))
