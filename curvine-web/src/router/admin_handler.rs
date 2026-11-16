@@ -52,8 +52,9 @@ use curvine_fs_api::{FileSystem, Path as FsPath, Reader, RpcCode, Writer};
 use curvine_job_client::{JobListOptions, JobMasterClient, TransferClient};
 use curvine_model::{
     AccessMode, FileBlocks, FileStatus, FilesystemInfo, JobSourceType, JobStatus, JobTaskState,
-    ListOptions, LoadJobCommand, MountInfo, MountOptions, Provider, StorageState, StorageType,
-    TransferCommand, TransferKind, TransferState, TtlAction, TtlType, WorkerInfo, WriteType,
+    ListOptions, LoadJobCommand, MountInfo, MountOptions, Provider, SetAttrOpts, StorageState,
+    StorageType, TransferCommand, TransferKind, TransferState, TtlAction, TtlType, WorkerInfo,
+    WriteType,
 };
 use curvine_net::net::InetAddr;
 use curvine_proto::{
@@ -2292,64 +2293,918 @@ impl AdminRouterHandler {
 /// handlers that back the web API, bound to the selected cluster through the
 /// same snapshot the `X-Curvine-Cluster` middleware installs.
 ///
-/// Client session summaries are master-local state the console never sees, so
-/// that tool reports "not supported" (the trait default). The decommission
-/// write goes through the same RPC as the workers page, one worker at a time.
+/// Every action reuses the client stack that backs the web API: the unified
+/// filesystem, the job/transfer clients and the cluster registry. Write
+/// actions go through the same journaled/RPC paths as their console page
+/// counterparts, and the confirmation card in the chat panel is what makes
+/// them safe to expose to a model.
+///
+/// Master-local diagnostics the console cannot see (client sessions, file
+/// locks) fall back to the trait default ("not supported"); the master's own
+/// provider serves those.
 #[async_trait]
 impl AiDataProvider for AdminRouterHandler {
-    async fn cluster_overview(&self, cluster: Option<&str>) -> Result<Value, String> {
+    async fn cluster_insight(
+        &self,
+        cluster: Option<&str>,
+        action: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
         let snap = self.civi_snapshot(cluster)?;
-        snap.overview_value().await.map_err(|e| e.to_string())
+        match action {
+            "overview" => snap.overview_value().await.map_err(|e| e.to_string()),
+            "ha" => {
+                let master_info = current_master_info(&snap)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(master_ha_payload(&snap, &master_info).await)
+            }
+            "config" => {
+                let conf = serde_json::to_value(&snap.conf).map_err(|e| e.to_string())?;
+                Ok(crate::ai::redact_secrets(&conf))
+            }
+            "sessions" => Err(
+                "client sessions are master-local state; query the master's own civi MCP                  endpoint for session data"
+                    .to_string(),
+            ),
+            "clusters" => {
+                let summary = snap.registry.summary();
+                serde_json::to_value(summary).map_err(|e| e.to_string())
+            }
+            "runtime_config" => {
+                let client = snap.unified_client(false);
+                let runtime = client
+                    .get_runtime_config(None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let entries: Vec<Value> = runtime
+                    .iter()
+                    .map(|entry| {
+                        json!({
+                            "key": entry.key,
+                            "file_value": entry.file_value_json,
+                            "override_value": entry.override_value,
+                            "effective": entry.effective_value_json,
+                        })
+                    })
+                    .collect();
+                Ok(json!({"runtime": entries}))
+            }
+            "dir_space" => {
+                let client = snap.unified_client(false);
+                let status = client
+                    .get_dir_space_status()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({
+                    "enabled": status.enabled,
+                    "scanning": status.scanning,
+                    "phase": status.phase,
+                    "paths_total": status.paths_total,
+                    "paths_done": status.paths_done,
+                    "last_outcome": status.last_outcome,
+                }))
+            }
+            "observability" => {
+                let metric = args.get("metric").and_then(Value::as_str).map(str::trim);
+                let component = args.get("component").and_then(Value::as_str).map(str::trim);
+                let range = args.get("range").and_then(Value::as_str).map(str::trim);
+                let step = args.get("step").and_then(Value::as_str).map(str::trim);
+                let service = Arc::clone(&snap.observability);
+                if let Some(range) = range {
+                    let range_ms = civi_parse_duration_ms(range)
+                        .ok_or_else(|| "observability: invalid 'range' (e.g. '1h')".to_string())?;
+                    let step_ms = step
+                        .and_then(civi_parse_duration_ms)
+                        .ok_or_else(|| "observability range query requires a 'step'".to_string())?;
+                    let end_ms = now_secs() * 1000;
+                    let series = service
+                        .range(metric, component, None, end_ms - range_ms, end_ms, Some(step_ms))
+                        .await?;
+                    serde_json::to_value(series).map_err(|e| e.to_string())
+                } else {
+                    let series = service.instant(metric, component, None).await?;
+                    serde_json::to_value(series).map_err(|e| e.to_string())
+                }
+            }
+            other => Err(format!("cluster_insight: unknown action '{}'", other)),
+        }
     }
 
-    async fn list_dir(&self, cluster: Option<&str>, path: &str) -> Result<Value, String> {
+    async fn fs_insight(
+        &self,
+        cluster: Option<&str>,
+        action: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
         let snap = self.civi_snapshot(cluster)?;
-        let fs_path = FsPath::from_str(path).map_err(|e| e.to_string())?;
-        let files = snap
-            .unified_fs
-            .list_status(&fs_path)
-            .await
-            .map_err(|e| e.to_string())?;
-        serde_json::to_value(files).map_err(|e| e.to_string())
+        let path = args.get("path").and_then(Value::as_str).unwrap_or("/");
+        let client = snap.unified_fs.clone();
+        match action {
+            "list_dir" => {
+                let fs_path = FsPath::from_str(path).map_err(|e| e.to_string())?;
+                let files = client.list_status(&fs_path).await.map_err(|e| e.to_string())?;
+                serde_json::to_value(files).map_err(|e| e.to_string())
+            }
+            "stat" => {
+                let fs_path = FsPath::from_str(path).map_err(|e| e.to_string())?;
+                let status = client.get_status(&fs_path).await.map_err(|e| e.to_string())?;
+                serde_json::to_value(status).map_err(|e| e.to_string())
+            }
+            "blocks" => {
+                let fs_path = FsPath::from_str(path).map_err(|e| e.to_string())?;
+                let blocks = client
+                    .fs_client()
+                    .get_block_locations(&fs_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                serde_json::to_value(blocks).map_err(|e| e.to_string())
+            }
+            "content_summary" => {
+                let fs_path = FsPath::from_str(path).map_err(|e| e.to_string())?;
+                let summary = client
+                    .fs_client()
+                    .get_content_summary(&fs_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({
+                    "path": path,
+                    "logical_bytes": summary.logical_bytes,
+                    "replicated_bytes": summary.replicated_bytes,
+                    "file_count": summary.file_count,
+                    "directory_count": summary.directory_count,
+                }))
+            }
+            "cache_summary" => Err(
+                "cache_summary requires the console diagnostics endpoint; use the cache                  summary page for deep reconciliation"
+                    .to_string(),
+            ),
+            "locks" => Err(
+                "file locks are master-local state; query the master's own civi MCP endpoint                  for lock data"
+                    .to_string(),
+            ),
+            "trash_list" => {
+                let page = args.get("page").and_then(Value::as_u64).unwrap_or(1);
+                let page_size = args
+                    .get("page_size")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(100)
+                    .clamp(1, 500) as u32;
+                let entries = client
+                    .fs_client()
+                    .list_trash_page(None, Some(page_size))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({"page": page, "entries": entries.0}))
+            }
+            other => Err(format!("fs_insight: unknown action '{}'", other)),
+        }
     }
 
-    async fn worker_status(&self, cluster: Option<&str>) -> Result<Value, String> {
+    async fn mount_insight(
+        &self,
+        cluster: Option<&str>,
+        action: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
+        let snap = self.civi_snapshot(cluster)?;
+        let client = snap.unified_client(false);
+        match action {
+            "list" => {
+                let table = client.get_mount_table().await.map_err(|e| e.to_string())?;
+                serde_json::to_value(table).map_err(|e| e.to_string())
+            }
+            "info" => {
+                let path = args
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "mount_insight info requires 'path'".to_string())?;
+                let fs_path = FsPath::from_str(path).map_err(|e| e.to_string())?;
+                let info = client
+                    .get_mount_info(&fs_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                serde_json::to_value(info).map_err(|e| e.to_string())
+            }
+            "validate" => {
+                let ufs_path = args
+                    .get("ufs_path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "mount_insight validate requires 'ufs_path'".to_string())?;
+                let normalized = normalize_ufs_path(ufs_path);
+                let fs_path = FsPath::from_str(&normalized).map_err(|e| e.to_string())?;
+                let provider = args
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .map(Provider::try_from)
+                    .transpose()
+                    .map_err(|e| e.to_string())?;
+                let properties: HashMap<String, String> = args
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let ufs = UfsFileSystem::new(&fs_path, properties, provider)
+                    .map_err(|e| e.to_string())?;
+                let status = ufs.get_status(&fs_path).await.map_err(|e| e.to_string())?;
+                Ok(json!({
+                    "valid": true,
+                    "is_dir": status.is_dir,
+                    "ufs_path": normalized
+                }))
+            }
+            "resync_status" => {
+                let task_id = args
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "mount_insight resync_status requires 'task_id'".to_string())?;
+                let task = snap
+                    .resync_tasks
+                    .lock()
+                    .ok()
+                    .and_then(|tasks| tasks.get(task_id).cloned());
+                serde_json::to_value(task).map_err(|e| e.to_string())
+            }
+            other => Err(format!("mount_insight: unknown action '{}'", other)),
+        }
+    }
+
+    async fn job_insight(
+        &self,
+        cluster: Option<&str>,
+        action: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
+        let snap = self.civi_snapshot(cluster)?;
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 100) as usize;
+        match action {
+            "list" => {
+                let options = JobListOptions {
+                    limit,
+                    include_finished: true,
+                    ..JobListOptions::default()
+                };
+                let jobs = snap
+                    .job_client()
+                    .list_job_statuses_with_options(options)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let items: Vec<Value> = jobs.iter().map(civi_job_payload).collect();
+                Ok(json!({"jobs": items}))
+            }
+            "status" => {
+                let job_id = args
+                    .get("job_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "job_insight status requires 'job_id'".to_string())?;
+                let job = snap
+                    .job_client()
+                    .get_job_status(job_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(civi_job_payload(&job))
+            }
+            "transfers" => {
+                let client = snap.transfer_client().map_err(|e| e.to_string())?;
+                let jobs = client
+                    .list(None, Vec::new(), None, None, Some(limit as u32), None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                serde_json::to_value(jobs).map_err(|e| e.to_string())
+            }
+            "transfer_status" => {
+                let job_id = args
+                    .get("job_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "job_insight transfer_status requires 'job_id'".to_string())?;
+                let client = snap.transfer_client().map_err(|e| e.to_string())?;
+                let status = client
+                    .status_page(job_id, Some(100), None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(transfer_status_payload(status))
+            }
+            "transfer_instances" => {
+                let client = snap.transfer_client().map_err(|e| e.to_string())?;
+                let info = client.service_info().await.map_err(|e| e.to_string())?;
+                serde_json::to_value(info).map_err(|e| e.to_string())
+            }
+            "transfer_config" => {
+                let client = snap.transfer_client().map_err(|e| e.to_string())?;
+                let conf = client
+                    .get_runtime_config(None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                serde_json::to_value(conf).map_err(|e| e.to_string())
+            }
+            other => Err(format!("job_insight: unknown action '{}'", other)),
+        }
+    }
+
+    async fn worker_insight(
+        &self,
+        cluster: Option<&str>,
+        action: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
         let snap = self.civi_snapshot(cluster)?;
         let master_info = current_master_info(&snap)
             .await
             .map_err(|e| e.to_string())?;
-        let mut workers = HashMap::new();
-        workers.insert("live_workers".to_string(), master_info.live_workers);
-        workers.insert("lost_workers".to_string(), master_info.lost_workers);
-        serde_json::to_value(workers).map_err(|e| e.to_string())
+        match action {
+            "list" => {
+                let mut workers = HashMap::new();
+                workers.insert("live_workers".to_string(), master_info.live_workers);
+                workers.insert("lost_workers".to_string(), master_info.lost_workers);
+                serde_json::to_value(workers).map_err(|e| e.to_string())
+            }
+            "detail" => {
+                let worker = args
+                    .get("worker")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "worker_insight detail requires 'worker'".to_string())?;
+                for item in master_info
+                    .live_workers
+                    .into_iter()
+                    .chain(master_info.blacklist_workers)
+                    .chain(master_info.decommission_workers)
+                {
+                    if worker_matches(&item, worker) {
+                        let state = item.state().summary().as_str_name();
+                        return Ok(worker_payload(item, state));
+                    }
+                }
+                Err(format!("worker not found: {}", worker))
+            }
+            other => Err(format!("worker_insight: unknown action '{}'", other)),
+        }
     }
 
-    async fn cluster_config(&self, cluster: Option<&str>) -> Result<Value, String> {
+    async fn fs_operate(
+        &self,
+        cluster: Option<&str>,
+        action: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
         let snap = self.civi_snapshot(cluster)?;
-        let conf = serde_json::to_value(&snap.conf).map_err(|e| e.to_string())?;
-        Ok(crate::ai::redact_secrets(&conf))
+        let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+        let client = snap.unified_fs.clone();
+        let fs_path = FsPath::from_str(path).map_err(|e| e.to_string())?;
+        match action {
+            "mkdir" => {
+                let created = client
+                    .mkdir(&fs_path, require_bool_arg(args, "recursive", true))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({"created": created, "path": path}))
+            }
+            "rename" => {
+                let target = args
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "rename requires 'target'".to_string())?;
+                let dst = FsPath::from_str(target).map_err(|e| e.to_string())?;
+                client
+                    .rename(&fs_path, &dst)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({"renamed": true, "from": path, "to": target}))
+            }
+            "delete" => {
+                let recursive = require_bool_arg(args, "recursive", false);
+                let result = client
+                    .delete(&fs_path, recursive)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({
+                    "deleted": true,
+                    "path": path,
+                    "recursive": recursive,
+                    "inodes_removed": result.inodes,
+                    "bytes": result.bytes
+                }))
+            }
+            "set_attr" => {
+                let mut opts = SetAttrOpts {
+                    recursive: require_bool_arg(args, "recursive", false),
+                    ..SetAttrOpts::default()
+                };
+                if let Some(v) = args.get("owner").and_then(Value::as_str) {
+                    opts.owner = Some(v.to_string());
+                }
+                if let Some(v) = args.get("group").and_then(Value::as_str) {
+                    opts.group = Some(v.to_string());
+                }
+                if let Some(v) = args.get("mode").and_then(Value::as_u64) {
+                    opts.mode = Some(v as u32);
+                }
+                if let Some(v) = args.get("replicas").and_then(Value::as_i64) {
+                    opts.replicas = Some(v as i32);
+                }
+                if let Some(v) = args.get("ttl_ms").and_then(Value::as_i64) {
+                    opts.ttl_ms = Some(v);
+                }
+                if let Some(v) = args.get("ttl_action").and_then(Value::as_str) {
+                    opts.ttl_action = Some(TtlAction::try_from(v).map_err(|e| e.to_string())?);
+                }
+                if let Some(map) = args.get("xattr").and_then(Value::as_object) {
+                    for (k, v) in map {
+                        if let Some(bytes) = v.as_str() {
+                            opts.add_x_attr.insert(k.clone(), bytes.as_bytes().to_vec());
+                        }
+                    }
+                }
+                client
+                    .fs_client()
+                    .set_attr(&fs_path, opts)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({"updated": true, "path": path}))
+            }
+            "symlink" => {
+                let target = args
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "symlink requires 'target'".to_string())?;
+                client
+                    .fs_client()
+                    .symlink(target, &fs_path, false)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({"created": true, "link": path, "target": target}))
+            }
+            "link" => {
+                let target = args
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "link requires 'target'".to_string())?;
+                let dst = FsPath::from_str(target).map_err(|e| e.to_string())?;
+                client
+                    .fs_client()
+                    .link(&fs_path, &dst)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({"linked": true, "src": path, "dst": target}))
+            }
+            "free" => {
+                let recursive = require_bool_arg(args, "recursive", false);
+                let result = client
+                    .free(&fs_path, recursive)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({
+                    "freed": true,
+                    "path": path,
+                    "inodes": result.inodes,
+                    "bytes": result.bytes
+                }))
+            }
+            "trash_restore" => {
+                let paths: Vec<&str> = args
+                    .get("trash_paths")
+                    .and_then(Value::as_array)
+                    .map(|list| list.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                if paths.is_empty() {
+                    return Err("trash_restore requires 'trash_paths'".to_string());
+                }
+                let mut restored = Vec::new();
+                for entry in paths {
+                    let p = FsPath::from_str(entry).map_err(|e| e.to_string())?;
+                    client
+                        .fs_client()
+                        .restore_trash(&p, None, false)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    restored.push(entry.to_string());
+                }
+                Ok(json!({"restored": restored}))
+            }
+            "trash_empty" => {
+                let result = client
+                    .fs_client()
+                    .empty_trash()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({
+                    "emptied": true,
+                    "inodes_removed": result.inodes,
+                    "bytes": result.bytes
+                }))
+            }
+            other => Err(format!("fs_operate: unknown action '{}'", other)),
+        }
     }
 
-    async fn add_dcm(&self, cluster: Option<&str>, workers: &[String]) -> Result<Value, String> {
+    async fn mount_operate(
+        &self,
+        cluster: Option<&str>,
+        action: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
         let snap = self.civi_snapshot(cluster)?;
+        let client = snap.unified_client(false);
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("mount_operate {} requires 'path'", action))?;
+        let cv_path = FsPath::from_str(path).map_err(|e| e.to_string())?;
+        match action {
+            "add" | "update" => {
+                let ufs_path_text = args
+                    .get("ufs_path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("mount_operate {} requires 'ufs_path'", action))?;
+                let normalized = normalize_ufs_path(ufs_path_text);
+                let ufs_path = FsPath::from_str(&normalized).map_err(|e| e.to_string())?;
+                let write_type = args
+                    .get("write_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("cache");
+                let payload = MountRequest {
+                    cv_path: path.to_string(),
+                    ufs_path: normalized.clone(),
+                    update: action == "update",
+                    write_type: write_type.to_string(),
+                    ttl: "0".to_string(),
+                    ttl_type: None,
+                    read_verify_ufs: false,
+                    auto_cache: None,
+                    access_mode: args.get("read_only").and_then(Value::as_bool).map(|ro| {
+                        if ro {
+                            "read_only".to_string()
+                        } else {
+                            "write".to_string()
+                        }
+                    }),
+                    replicas: None,
+                    block_size: None,
+                    storage_type: None,
+                    provider: args
+                        .get("provider")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                    properties: args
+                        .get("properties")
+                        .and_then(Value::as_object)
+                        .map(|m| {
+                            m.iter()
+                                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                };
+                let opts = parse_mount_options(&payload).map_err(|e| e.to_string())?;
+                let ufs = UfsFileSystem::new(&ufs_path, opts.add_properties.clone(), opts.provider)
+                    .map_err(|e| e.to_string())?;
+                ufs.list_status(&ufs_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                client
+                    .mount(&ufs_path, &cv_path, opts)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({
+                    "mounted": true,
+                    "updated": action == "update",
+                    "cv_path": path,
+                    "ufs_path": normalized,
+                    "write_type": write_type
+                }))
+            }
+            "delete" => {
+                client.umount(&cv_path).await.map_err(|e| e.to_string())?;
+                Ok(json!({"deleted": true, "cv_path": path}))
+            }
+            "resync" => {
+                let resync_path = args
+                    .get("resync_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or(path);
+                let fs_path = FsPath::from_str(resync_path).map_err(|e| e.to_string())?;
+                if !fs_path.is_cv() {
+                    return Err(format!(
+                        "resync requires a curvine path, got: {}",
+                        resync_path
+                    ));
+                }
+                let mount = client
+                    .get_mount_info(&fs_path)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("mount info not found for {}", resync_path))?;
+                if !matches!(mount.write_type, WriteType::FsMode) {
+                    return Err(format!(
+                        "resync is only allowed for fs_mode mount: {}",
+                        mount.cv_path
+                    ));
+                }
+                let task_id = new_task_id();
+                let task = ResyncTaskState {
+                    id: task_id.clone(),
+                    cv_path: resync_path.to_string(),
+                    mount_path: mount.cv_path.clone(),
+                    write_type: "fs_mode".to_string(),
+                    status: "queued".to_string(),
+                    scanned: 0,
+                    skipped: 0,
+                    recreated: 0,
+                    failed: 0,
+                    pending_dirs: 0,
+                    message: "queued".to_string(),
+                    started_at: LocalTime::now_datetime(),
+                    updated_at: LocalTime::now_datetime(),
+                    done: false,
+                    dry_run: require_bool_arg(args, "dry_run", false),
+                };
+                if let Ok(mut tasks) = snap.resync_tasks.lock() {
+                    tasks.insert(task_id.clone(), task.clone());
+                }
+                let tasks = snap.resync_tasks.clone();
+                let cv = resync_path.to_string();
+                let client_inner = snap.unified_client(false);
+                tokio::spawn(async move {
+                    run_mount_resync_task(client_inner, tasks, task_id, cv, false).await;
+                });
+                Ok(json!({"started": true, "task": task}))
+            }
+            other => Err(format!("mount_operate: unknown action '{}'", other)),
+        }
+    }
+
+    async fn job_operate(
+        &self,
+        cluster: Option<&str>,
+        action: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
+        let snap = self.civi_snapshot(cluster)?;
+        match action {
+            "submit_load" => {
+                let path = args
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "submit_load requires 'path'".to_string())?;
+                let mut builder = LoadJobCommand::builder(path);
+                if let Some(target) = args
+                    .get("target_path")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.trim().is_empty())
+                {
+                    builder = builder.target_path(target.trim());
+                }
+                let result = snap
+                    .job_client()
+                    .submit_load_job(builder.build())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({
+                    "job_id": result.job_id,
+                    "target_path": result.target_path,
+                    "state": job_state_name(result.state)
+                }))
+            }
+            "submit_transfer" => {
+                let src = args
+                    .get("src_path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "submit_transfer requires 'src_path'".to_string())?;
+                let dst = args
+                    .get("dst_path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "submit_transfer requires 'dst_path'".to_string())?;
+                let kind = transfer_kind_from_name(
+                    args.get("kind").and_then(Value::as_str).unwrap_or("copy"),
+                )
+                .map_err(|e| e.to_string())?;
+                let mut command = TransferCommand {
+                    kind,
+                    source_path: src.to_string(),
+                    target_path: dst.to_string(),
+                    client_request_id: TransferCommand::default_client_request_id_with_overwrite(
+                        kind, src, dst, false,
+                    ),
+                    submitter: WEB_TRANSFER_SUBMITTER.to_string(),
+                    tenant: String::new(),
+                    options: Default::default(),
+                    fs_mode_files: Vec::new(),
+                };
+                command.set_overwrite(false);
+                let client = snap.transfer_client().map_err(|e| e.to_string())?;
+                let response = client.submit(command).await.map_err(|e| e.to_string())?;
+                serde_json::to_value(response).map_err(|e| e.to_string())
+            }
+            "cancel" => {
+                let job_id = args
+                    .get("job_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "cancel requires 'job_id'".to_string())?;
+                match args.get("kind").and_then(Value::as_str).unwrap_or("load") {
+                    "transfer" => {
+                        let client = snap.transfer_client().map_err(|e| e.to_string())?;
+                        let resp = client
+                            .cancel(job_id, None)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        serde_json::to_value(resp).map_err(|e| e.to_string())
+                    }
+                    _ => {
+                        let resp = snap
+                            .job_client()
+                            .cancel_job(job_id)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        serde_json::to_value(resp).map_err(|e| e.to_string())
+                    }
+                }
+            }
+            "retry" => {
+                let job_id = args
+                    .get("job_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "retry requires 'job_id'".to_string())?;
+                let client = snap.transfer_client().map_err(|e| e.to_string())?;
+                let resp = client.retry(job_id).await.map_err(|e| e.to_string())?;
+                serde_json::to_value(resp).map_err(|e| e.to_string())
+            }
+            other => Err(format!("job_operate: unknown action '{}'", other)),
+        }
+    }
+
+    async fn worker_operate(
+        &self,
+        cluster: Option<&str>,
+        action: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
+        let snap = self.civi_snapshot(cluster)?;
+        let target_status = worker_action_target_status(action).map_err(|e| e.to_string())?;
+        let list: Vec<&str> = args
+            .get("workers")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if list.is_empty() {
+            return Err("worker_operate requires 'workers' (array of addresses)".to_string());
+        }
         let mut updated = Vec::new();
-        for worker in workers.iter().map(|w| w.trim()).filter(|w| !w.is_empty()) {
-            match snap
+        for worker in list.iter().map(|w| w.trim()).filter(|w| !w.is_empty()) {
+            let (worker, state) = snap
                 .unified_fs
                 .fs_client()
-                .set_worker_status(worker, "decommission")
+                .set_worker_status(worker, target_status)
                 .await
-            {
-                Ok(_) => updated.push(worker.to_string()),
-                Err(err) => log::warn!(
-                    "CIVI: failed to set worker {} status to decommission: {}",
-                    worker,
-                    err
-                ),
-            }
+                .map_err(|e| e.to_string())?;
+            updated.push(json!({
+                "worker": format!("{}:{}", worker.address.hostname, worker.address.rpc_port),
+                "state": state
+            }));
         }
-        Ok(json!(updated))
+        Ok(json!({"action": action, "updated": updated}))
     }
+
+    async fn cluster_operate(
+        &self,
+        cluster: Option<&str>,
+        action: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
+        let snap = self.civi_snapshot(cluster)?;
+        match action {
+            "failover" => {
+                let target = args
+                    .get("target_master")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "failover requires 'target_master'".to_string())?;
+                let response = master_failover_core(&snap, target)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                // The core returns a ready HTTP response; surface a compact
+                // JSON view of it to the model.
+                let status = response.status().as_u16();
+                let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let mut payload =
+                    serde_json::from_slice::<Value>(&body).unwrap_or_else(|_| json!({}));
+                payload["http_status"] = json!(status);
+                if payload["success"] == json!(false) && status != 200 {
+                    Err(payload["error"]["message"]
+                        .as_str()
+                        .unwrap_or("failover failed")
+                        .to_string())
+                } else {
+                    Ok(payload["data"].clone())
+                }
+            }
+            "runtime_config_update" => {
+                let entries = args
+                    .get("entries")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "runtime_config_update requires 'entries'".to_string())?;
+                let client = snap.unified_client(false);
+                let mut applied = Vec::new();
+                for entry in entries {
+                    let key = entry
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "each entry requires 'key'".to_string())?;
+                    let value = entry.get("value").cloned().unwrap_or(Value::Null);
+                    let value_text = match &value {
+                        Value::String(text) => text.clone(),
+                        Value::Null => String::new(),
+                        other => other.to_string(),
+                    };
+                    client
+                        .update_runtime_config(key, &value_text)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    applied.push(json!({"key": key, "value": value}));
+                }
+                Ok(json!({"updated": applied}))
+            }
+            "dir_space_update" => {
+                use curvine_config::{
+                    DIR_SPACE_ENABLED_RUNTIME_KEY, DIR_SPACE_TRACKED_PATHS_RUNTIME_KEY,
+                };
+                let client = snap.unified_client(false);
+                if let Some(enabled) = args.get("enabled").and_then(Value::as_bool) {
+                    client
+                        .update_runtime_config(
+                            DIR_SPACE_ENABLED_RUNTIME_KEY,
+                            if enabled { "true" } else { "false" },
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                if let Some(tracked) = args.get("tracked_paths").and_then(Value::as_array) {
+                    let paths: Vec<String> = tracked
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    client
+                        .update_runtime_config(
+                            DIR_SPACE_TRACKED_PATHS_RUNTIME_KEY,
+                            &json!(paths).to_string(),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(json!({"updated": true}))
+            }
+            other => Err(format!("cluster_operate: unknown action '{}'", other)),
+        }
+    }
+}
+
+/// `bool` argument with a default, used by the fs_operate actions.
+fn require_bool_arg(args: &Value, key: &str, default: bool) -> bool {
+    args.get(key).and_then(Value::as_bool).unwrap_or(default)
+}
+
+/// Parses a compact duration ("1h", "30m", "90s") used by the civi
+/// observability range queries. Returns milliseconds.
+fn civi_parse_duration_ms(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let (digits, unit) = text.split_at(text.len().saturating_sub(1));
+    let value: i64 = digits.parse().ok()?;
+    match unit {
+        "s" => Some(value * 1000),
+        "m" => Some(value * 60_000),
+        "h" => Some(value * 3_600_000),
+        "d" => Some(value * 86_400_000),
+        _ => None,
+    }
+}
+
+/// Compact JSON view of a load/export job for the civi agent. `JobStatus`
+/// does not implement `Serialize`, so the fields are picked explicitly (the
+/// console's job list route has its own richer shape).
+fn civi_job_payload(job: &JobStatus) -> Value {
+    json!({
+        "job_id": job.job_id,
+        "state": job_state_name(job.state),
+        "source_path": job.source_path,
+        "target_path": job.target_path,
+        "total_files": job.total_files,
+        "completed_files": job.completed_files,
+        "failed_files": job.failed_files,
+        "running_files": job.running_files,
+        "pending_files": job.pending_files,
+        "transfer_job_id": job.transfer_job_id,
+    })
 }
 
 /// Session gate for the CIVI routes merged into the console web app.
@@ -2509,21 +3364,16 @@ async fn master_ha_v1(
     ))
 }
 
-async fn master_failover_v1(
-    Extension(instance): Extension<Arc<AdminRouterHandler>>,
-    Json(payload): Json<MasterFailoverRequest>,
+/// Shared core of the master failover flow: used by the console endpoint and
+/// the civi AI assistant (`cluster_operate` -> `failover`). Returns a ready
+/// HTTP response (success or a classified error).
+pub(crate) async fn master_failover_core(
+    instance: &AdminRouterHandler,
+    target_master: &str,
 ) -> FsResult<Response> {
-    let target_master = payload.target_master.trim().to_string();
-    if target_master.is_empty() {
-        return Ok(api_error_response(
-            StatusCode::BAD_REQUEST,
-            "INVALID_TARGET_MASTER",
-            "target_master is required",
-        ));
-    }
-
-    let master_info = current_master_info(&instance).await?;
-    let ha = master_ha_payload(&instance, &master_info).await;
+    let target_master = target_master.trim().to_string();
+    let master_info = current_master_info(instance).await?;
+    let ha = master_ha_payload(instance, &master_info).await;
     let mut active_master = ha
         .get("active_master")
         .and_then(Value::as_str)
@@ -2634,7 +3484,7 @@ async fn master_failover_v1(
         .min(overall_deadline);
         while Instant::now() < attempt_deadline {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            match current_master_info(&instance).await {
+            match current_master_info(instance).await {
                 Ok(info) => {
                     active_master = info.active_master.trim().to_string();
                     if master_is_active_target(
@@ -2708,6 +3558,12 @@ async fn master_failover_v1(
         "MASTER_FAILOVER_TARGET_MISMATCH",
         detail,
     ))
+}
+async fn master_failover_v1(
+    Extension(instance): Extension<Arc<AdminRouterHandler>>,
+    Json(payload): Json<MasterFailoverRequest>,
+) -> FsResult<Response> {
+    master_failover_core(&instance, &payload.target_master).await
 }
 
 /// `GET /api/v1/config` — the effective configuration of the active master.

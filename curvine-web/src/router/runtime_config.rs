@@ -40,6 +40,12 @@ pub struct RuntimeConfigHttpError {
 }
 
 impl RuntimeConfigHttpError {
+    /// The human-readable message, for callers that surface the error
+    /// outside HTTP (e.g. the civi AI provider).
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
     pub fn invalid(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNPROCESSABLE_ENTITY,

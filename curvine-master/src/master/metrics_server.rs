@@ -194,6 +194,7 @@ fn metrics_router(handler: MasterMetricsHandler) -> Router {
     let provider = Arc::new(MasterAiProvider::new(
         handler.fs.clone(),
         Arc::clone(&handler.config_view.conf),
+        Arc::clone(&handler.config_view),
     ));
     // Mounted before the Extension layer: `mount` only adds a route and
     // needs the profiling gate, not the handler state.

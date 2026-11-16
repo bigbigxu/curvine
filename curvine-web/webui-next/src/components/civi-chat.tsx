@@ -49,6 +49,8 @@ interface NewChatBody {
 /** One tool invocation rendered as a compact step row. */
 interface CiviStep {
   name: string
+  /** Aggregated tools dispatch on an action, shown next to the tool name. */
+  action?: string
   status: 'running' | 'done'
   ok: boolean | null
   preview: string
@@ -122,23 +124,53 @@ const FOLLOW_UPS: Record<'en' | 'zh-CN', Record<string, string[]>> = {
       'Are there any zombie client sessions?',
       'Review the cluster configuration highlights'
     ],
-    worker_status: [
+    'fs_insight/list_dir': [
+      'What is inside the largest directory?',
+      'How many files and directories does the cluster hold?',
+      'List another directory for me'
+    ],
+    'fs_insight/stat': [
+      'Show the block locations of this file',
+      'What is the TTL and replica count of this path?',
+      'Summarize the usage of its parent directory'
+    ],
+    'fs_insight/trash_list': [
+      'Restore the most recent deleted path from trash',
+      'What happens if we empty the trash now?'
+    ],
+    'cluster_insight/overview': [
       'Compare per-worker capacity and usage',
       'Which workers are close to full?',
-      'How many live workers does the cluster have?'
+      'What is growing fastest in the filesystem?'
     ],
-    list_dir: [
-      'What is inside the largest directory?',
-      'List another directory for me',
-      'How many files and directories does the cluster hold?'
-    ],
-    session_summary: [
-      'Which sessions look like zombie mounts?',
-      'How many client leases are still live?'
-    ],
-    cluster_config: [
+    'cluster_insight/config': [
       'Which configuration values look risky?',
       'Summarize the master configuration'
+    ],
+    'cluster_insight/observability': [
+      'How did the throughput change over the last hour?',
+      'Show the current RPC latency',
+      'Summarize the JVM memory usage'
+    ],
+    'mount_insight/list': [
+      'Validate the UFS path of one mount',
+      'Which mounts are read-only?',
+      'Show the details of the first mount'
+    ],
+    'job_insight/list': [
+      'Show the status of the most recent job',
+      'Are there any failed jobs?',
+      'List the running transfer jobs'
+    ],
+    'worker_insight/list': [
+      'Compare per-worker capacity and usage',
+      'Which workers are close to full?',
+      'What blocks does the busiest worker hold?'
+    ],
+    'worker_insight/detail': [
+      'How many blocks does this worker hold?',
+      'Should we decommission this worker?',
+      'Compare it against the other workers'
     ]
   },
   'zh-CN': {
@@ -149,37 +181,67 @@ const FOLLOW_UPS: Record<'en' | 'zh-CN', Record<string, string[]>> = {
       '有没有僵尸挂载的客户端会话？',
       '巡检一下集群配置的关键项'
     ],
-    worker_status: [
+    'fs_insight/list_dir': [
+      '看看最大的目录里有什么',
+      '集群里现在有多少文件和目录？',
+      '帮我再列一个目录'
+    ],
+    'fs_insight/stat': [
+      '看看这个文件的块分布',
+      '这个路径的 TTL 和副本数是多少？',
+      '汇总一下它父目录的使用情况'
+    ],
+    'fs_insight/trash_list': [
+      '从回收站恢复最近删除的路径',
+      '现在清空回收站会有什么影响？'
+    ],
+    'cluster_insight/overview': [
       '对比各 worker 的容量和使用情况',
       '哪些 worker 磁盘快满了？',
-      '集群现在有几个在线 worker？'
+      '文件系统里哪块数据增长最快？'
     ],
-    list_dir: [
-      '看看最大的目录里有什么',
-      '帮我再列一个目录',
-      '集群里现在有多少文件和目录？'
-    ],
-    session_summary: [
-      '哪些会话疑似僵尸挂载？',
-      '还有多少活跃的客户端租约？'
-    ],
-    cluster_config: [
+    'cluster_insight/config': [
       '哪些配置项看起来有风险？',
       '总结一下 master 的关键配置'
+    ],
+    'cluster_insight/observability': [
+      '过去一小时吞吐有什么变化？',
+      '当前 RPC 延迟如何？',
+      '总结一下 JVM 内存使用'
+    ],
+    'mount_insight/list': [
+      '校验某个挂载的 UFS 路径',
+      '哪些挂载是只读的？',
+      '看看第一个挂载的详情'
+    ],
+    'job_insight/list': [
+      '看看最近一个任务的状态',
+      '有失败的任务吗？',
+      '列出运行中的 transfer 任务'
+    ],
+    'worker_insight/list': [
+      '对比各 worker 的容量和使用情况',
+      '哪些 worker 磁盘快满了？',
+      '最繁忙的 worker 上有哪些块？'
+    ],
+    'worker_insight/detail': [
+      '这个 worker 上有多少块？',
+      '要不要把这个 worker 下线（decommission）？',
+      '把它和其他 worker 对比一下'
     ]
   }
 }
 
-/** Picks 4 follow-ups: contextual by the tools the answer used, then generic. */
+/** Picks 4 follow-ups: contextual by the tool+action used, then generic. */
 function pickFollowUps(
   locale: 'en' | 'zh-CN',
   lastAnswer: CiviMessage | undefined,
   count = 4
 ): string[] {
   const pools = FOLLOW_UPS[locale] ?? FOLLOW_UPS.en
-  const used = new Set<string>(
-    lastAnswer?.steps.filter((s) => s.status === 'done').map((s) => s.name) ?? []
-  )
+  const used = lastAnswer?.steps
+    .filter((s) => s.status === 'done')
+    .map((s) => `${s.name}/${s.action ?? '_'}`) ?? []
   const picked: string[] = []
   const push = (candidates: string[]) => {
     for (const c of candidates) {
@@ -187,10 +249,10 @@ function pickFollowUps(
       if (!picked.includes(c)) picked.push(c)
     }
   }
-  // Tools used in this answer first, in reverse call order (latest = most relevant).
-  for (const tool of [...used].reverse()) {
+  // Steps used in this answer first, in reverse call order (latest = most relevant).
+  for (const key of [...used].reverse()) {
     if (picked.length >= count) break
-    push(pools[tool] ?? [])
+    push(pools[key] ?? [])
   }
   push(pools._generic ?? [])
   return picked
@@ -432,6 +494,7 @@ function StepRow({ step }: { step: CiviStep }) {
       <span className='inline-flex items-center gap-1 font-medium text-foreground/80'>
         <WrenchIcon className='size-3' />
         {step.name}
+        {step.action ? <span className='text-muted-foreground'>·{step.action}</span> : null}
       </span>
       {step.preview ? (
         <span className='max-w-44 truncate text-muted-foreground' title={step.preview}>
@@ -680,7 +743,16 @@ export function CiviChat() {
               ...msg,
               steps: [
                 ...msg.steps,
-                { name: String(data.name), status: 'running', ok: null, preview: '' }
+                {
+                  name: String(data.name),
+                  action:
+                    data.args && typeof data.args === 'object'
+                      ? String((data.args as Record<string, unknown>).action ?? '')
+                      : '',
+                  status: 'running',
+                  ok: null,
+                  preview: ''
+                }
               ]
             }
           }
