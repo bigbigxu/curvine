@@ -165,7 +165,7 @@ async fn overview(
     let master_state = format!("{:?}", fs.master_monitor.journal_state());
     let master_version = curvine_sys::version::component_version("master");
 
-    let res = Json(json!({
+    let mut res = json!({
         "cluster_id": conf.cluster_id,
         "master_addr": conf.master_addr().to_string(),
         "start_time": start_time,
@@ -180,8 +180,22 @@ async fn overview(
         "files_total": files_total,
         "dir_total": dir_total,
         "master_state": master_state,
-    }));
-    Ok(res)
+    });
+    if let Value::Object(fields) = &mut res {
+        fields.extend(overview_version_fields());
+    }
+    Ok(Json(res))
+}
+
+/// Version metadata of the running master, added to the `/api/overview` response so the
+/// Web UI can show the real build instead of a hard-coded version.
+fn overview_version_fields() -> serde_json::Map<String, Value> {
+    let version = curvine_sys::version::component_version("master");
+    let mut fields = serde_json::Map::new();
+    fields.insert("version".into(), Value::String(version.release_version));
+    fields.insert("git_commit".into(), Value::String(version.git_commit));
+    fields.insert("git_branch".into(), Value::String(version.git_branch));
+    fields
 }
 
 /// Lightweight runtime endpoint for web HA probes (version + process start_time).
@@ -345,10 +359,23 @@ impl RouterHandler for MasterRouterHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn master_version_fields_are_non_empty() {
         let master_version = curvine_sys::version::component_version("master");
         assert!(!master_version.release_version.is_empty());
         assert!(!master_version.git_commit.is_empty());
+    }
+
+    #[test]
+    fn overview_version_fields_report_the_build_version() {
+        let version = curvine_sys::version::component_version("master");
+        let fields = overview_version_fields();
+
+        assert!(!version.release_version.is_empty());
+        assert_eq!(fields["version"], version.release_version.as_str());
+        assert_eq!(fields["git_commit"], version.git_commit.as_str());
+        assert_eq!(fields["git_branch"], version.git_branch.as_str());
     }
 }
