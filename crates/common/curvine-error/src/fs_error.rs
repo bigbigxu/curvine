@@ -535,9 +535,15 @@ impl FsError {
             | FsError::Expired(_)
             | FsError::TransferOverloaded(_) => RetryClass::RetryAfter,
 
-            FsError::NotLeaderMaster(_) | FsError::Raft(_) | FsError::SnapshotNotReady(_) => {
-                RetryClass::RetryMaster
-            }
+            FsError::NotLeaderMaster(_) | FsError::Raft(_) => RetryClass::RetryMaster,
+
+            // SnapshotNotReady is the leader's definitive answer about the
+            // dir-space snapshot state (not yet published / feature off),
+            // not a transport fault. Retrying it spins against every master
+            // for the whole retry budget while the answer cannot change;
+            // callers decide what to do (CLI falls back to a live scan, the
+            // web console renders "pending").
+            FsError::SnapshotNotReady(_) => RetryClass::Permanent,
 
             FsError::AbnormalData(_) => RetryClass::Abort,
 
@@ -868,7 +874,7 @@ impl ErrorExt for FsError {
 #[cfg(test)]
 mod tests {
     use super::ErrorKind;
-    use crate::FsError;
+    use crate::{FsError, RetryClass};
     use curvine_core_error::{ErrorExt, ErrorImpl};
 
     #[test]
@@ -1054,6 +1060,23 @@ mod tests {
     #[test]
     pub fn snapshot_not_ready_kind_value_test() {
         assert_eq!(ErrorKind::SnapshotNotReady as i32, 37);
+    }
+
+    #[test]
+    pub fn snapshot_not_ready_is_not_retried_by_the_connector() {
+        // The connector must surface SnapshotNotReady to the caller instead of
+        // retrying it across masters for the full retry budget: the answer is
+        // definitive, only the caller knows the right fallback.
+        let error = FsError::snapshot_not_ready("/mnt/data");
+        assert_eq!(error.retry_class(), RetryClass::Permanent);
+        assert!(!error.should_retry());
+
+        // Leader-routing errors stay retryable.
+        assert_eq!(
+            FsError::not_leader("x").retry_class(),
+            RetryClass::RetryMaster
+        );
+        assert!(FsError::not_leader("x").should_retry());
     }
 
     #[test]

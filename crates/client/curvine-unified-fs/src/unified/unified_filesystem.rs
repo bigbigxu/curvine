@@ -280,6 +280,9 @@ impl UnifiedFileSystem {
     /// Returns a Curvine dir-space snapshot when applicable. Cache-mode mounts
     /// that delegate full namespace queries to UFS return `Ok(None)` so callers
     /// can fall back to a live recursive scan.
+    ///
+    /// Prefer [`Self::get_content_summary_cv`] when the caller needs the
+    /// dir-space snapshot for any Curvine path, including cache-mode mounts.
     pub async fn try_get_content_summary_snapshot(
         &self,
         path: &Path,
@@ -290,14 +293,25 @@ impl UnifiedFileSystem {
 
         match self.get_mount(path, RpcCode::GetContentSummary).await? {
             Some((_, mount)) if mount.info.is_cache_mode() && !mount.info.is_fs_mode() => Ok(None),
-            _ => {
-                let fut = async { self.cv.get_content_summary(path).await };
-                match self.track("GetContentSummary", path.path(), "", fut).await {
-                    Ok(summary) => Ok(Some(summary)),
-                    Err(err) => Err(err),
-                }
-            }
+            _ => self.get_content_summary_cv(path).await.map(Some),
         }
+    }
+
+    /// Returns the dir-space snapshot summary for any Curvine path, regardless
+    /// of mount type.
+    ///
+    /// Dir-space snapshots always measure the CV namespace (the scanner walks
+    /// CV inodes/edges only) and never touch UFS, so cache-mode mounts must not
+    /// be filtered out here: a tracked cache-mode mount path has a snapshot
+    /// like any other directory. Errors surface verbatim — `SnapshotNotReady`
+    /// means no snapshot has been published for the path yet.
+    pub async fn get_content_summary_cv(&self, path: &Path) -> FsResult<ContentSummary> {
+        if !path.is_cv() {
+            return err_box!("path is not curvine path");
+        }
+
+        let fut = async { self.cv.get_content_summary(path).await };
+        self.track("GetContentSummary", path.path(), "", fut).await
     }
 
     /// Client-master version handshake: report this client's `component_info`
