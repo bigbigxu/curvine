@@ -72,6 +72,7 @@ pub struct Inode {
 
     pub status: CachedStatus,
     pub locs: Option<Box<Vec<LocatedBlock>>>,
+    pub locs_epoch: u64,
 
     pub lifecycle: Lifecycle,
 
@@ -124,6 +125,7 @@ impl Inode {
             name: Box::<str>::from(FUSE_PATH_SEPARATOR),
             status: root_st,
             locs: None,
+            locs_epoch: 0,
             lifecycle: Lifecycle::Invalid,
             n_lookup: LookupCount::new(0),
             ref_ctr: 0,
@@ -160,6 +162,7 @@ impl Inode {
             name,
             status: CachedStatus::from_status(status),
             locs: None,
+            locs_epoch: 0,
             lifecycle: Lifecycle::Cached,
             n_lookup: LookupCount::new(n_lookup),
             ref_ctr: 1,
@@ -236,28 +239,47 @@ impl Inode {
     }
 
     pub fn get_file_blocks(&self, ttl: u64) -> Option<FileBlocks> {
-        if self.blocks_valid(ttl) {
-            self.locs
-                .as_ref()
-                .map(|locs| FileBlocks::new(self.clone_status(), (**locs).clone()))
-        } else {
-            None
+        if !matches!(self.lifecycle, Lifecycle::Cached) {
+            return None;
         }
+        let locs = self.locs.as_ref()?;
+        if self.last_access + ttl < LocalTime::mills() {
+            return None;
+        }
+        let status = self.clone_status();
+        if status.is_expired() {
+            return None;
+        }
+        Some(FileBlocks::new(status, (**locs).clone()))
     }
 
-    pub fn put_file_blocks(&mut self, blocks: &FileBlocks) {
-        if !self.is_dirty() {
-            self.locs = Some(Box::new(blocks.block_locs.clone()));
+    pub fn put_file_blocks(&mut self, blocks: &FileBlocks) -> bool {
+        if blocks.status.len != self.len {
+            if self.locs.is_some() {
+                self.invalidate_file_blocks();
+            }
+            return false;
+        }
 
+        if self.is_dirty() {
+            return false;
+        }
+
+        self.locs = Some(Box::new(blocks.block_locs.clone()));
+        self.last_access = LocalTime::mills();
+
+        if blocks.status.mtime >= self.status.mtime {
             self.status = CachedStatus::from_status(blocks.status.clone());
 
             self.lifecycle = Lifecycle::Cached;
-            self.last_access = LocalTime::mills();
         }
+
+        true
     }
 
     pub fn invalidate_file_blocks(&mut self) {
         self.locs.take();
+        self.locs_epoch = self.locs_epoch.wrapping_add(1);
     }
 
     pub fn is_root(&self) -> bool {
@@ -345,14 +367,6 @@ impl Inode {
         match self.lifecycle {
             Lifecycle::Cached => self.last_access + ttl >= LocalTime::mills(),
             Lifecycle::Dirty => true,
-            Lifecycle::Invalid => false,
-        }
-    }
-
-    pub fn blocks_valid(&self, ttl: u64) -> bool {
-        match self.lifecycle {
-            Lifecycle::Cached => self.last_access + ttl >= LocalTime::mills(),
-            Lifecycle::Dirty => false,
             Lifecycle::Invalid => false,
         }
     }
@@ -468,12 +482,12 @@ mod tests {
 
     #[test]
     fn file_blocks_put_get_and_expire() {
-        let mut inode = Inode::with_status(42, 1, Box::<str>::from("file"), file_status(10, 1), 1);
+        let mut inode = Inode::with_status(42, 1, Box::<str>::from("file"), file_status(20, 1), 1);
         let blocks = FileBlocks::new(file_status(20, 2), vec![LocatedBlock::default()]);
 
         assert!(inode.get_file_blocks(60_000).is_none());
 
-        inode.put_file_blocks(&blocks);
+        assert!(inode.put_file_blocks(&blocks));
         let cached = inode
             .get_file_blocks(60_000)
             .expect("put file blocks should make them available");
@@ -485,6 +499,21 @@ mod tests {
 
         inode.last_access = 0;
         assert!(inode.get_file_blocks(0).is_none());
+    }
+
+    #[test]
+    fn file_blocks_for_another_length_are_rejected() {
+        let mut inode = Inode::with_status(42, 1, Box::<str>::from("file"), file_status(10, 1), 1);
+        let stale = FileBlocks::new(file_status(20, 2), vec![LocatedBlock::default()]);
+
+        assert!(
+            !inode.put_file_blocks(&stale),
+            "a snapshot for another length must not be cached"
+        );
+        assert!(inode.get_file_blocks(60_000).is_none());
+        // Nothing was cached before, so a rejected snapshot must not bump the
+        // generation either: live readers would reopen for no commit.
+        assert_eq!(inode.locs_epoch, 0);
     }
 
     #[test]

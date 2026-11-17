@@ -156,11 +156,15 @@ impl NodeState {
             return;
         }
 
-        {
+        let target_ino = {
             let mut dir = self.dir_write();
-            if let Some(inode) = dir.get_inode_mut(ino, name) {
+            dir.get_inode_mut(ino, name).map(|inode| {
                 inode.invalid_cache();
-            }
+                inode.ino
+            })
+        };
+        if let Some(target_ino) = target_ino {
+            self.mark_handles_stale(target_ino);
         }
 
         if self.conf.metrics_enabled {
@@ -549,16 +553,47 @@ impl NodeState {
             .and_then(|inode| inode.get_file_blocks(self.meta_cache_ttl))
     }
 
-    fn put_file_blocks(&self, ino: u64, blocks: &FileBlocks) {
-        if let Some(inode) = self.dir_write().get_inode_mut(ino, None) {
-            inode.put_file_blocks(blocks);
-            self.record_blocks_cache(CACHE_RESULT_PUT);
+    fn put_file_blocks(&self, ino: u64, blocks: &FileBlocks, expected_epoch: Option<u64>) {
+        if !self.enable_meta_cache || !Self::blocks_fully_in_cv(blocks) {
+            return;
         }
+        if let Some(inode) = self.dir_write().get_inode_mut(ino, None) {
+            if Some(inode.locs_epoch) == expected_epoch && inode.put_file_blocks(blocks) {
+                self.record_blocks_cache(CACHE_RESULT_PUT);
+            }
+        }
+    }
+
+    fn blocks_fully_in_cv(blocks: &FileBlocks) -> bool {
+        !blocks.status.is_expired() && blocks.status.storage_policy.cv_only()
+    }
+
+    pub fn locs_epoch(&self, ino: Option<u64>) -> Option<u64> {
+        let dir = self.dir_read();
+        dir.get_inode(ino?, None).map(|inode| inode.locs_epoch)
     }
 
     pub fn invalidate_file_blocks(&self, ino: u64) {
         if let Some(inode) = self.dir_write().get_inode_mut(ino, None) {
             inode.invalidate_file_blocks();
+        }
+        self.mark_handles_stale(ino);
+    }
+
+    fn mark_handles_stale(&self, ino: u64) {
+        let lock = self.handles.read();
+        if let Some(map) = lock.get(&ino) {
+            for handle in map.values() {
+                handle.mark_stale();
+            }
+        }
+    }
+
+    fn compensate_open_epoch(&self, handle: &FileHandle, ino: u64, sampled: Option<u64>) {
+        if let Some(epoch) = sampled {
+            if self.locs_epoch(Some(ino)) != Some(epoch) {
+                handle.mark_stale();
+            }
         }
     }
 
@@ -586,10 +621,11 @@ impl NodeState {
         if self.enable_meta_cache {
             self.record_blocks_cache(CACHE_RESULT_MISS);
         }
+        let epoch = self.locs_epoch(ino);
         let unified = self.fs.open(path).await?;
         if self.enable_meta_cache {
             if let (Some(ino), UnifiedReader::Cv(reader)) = (ino, &unified) {
-                self.put_file_blocks(ino, reader.file_blocks());
+                self.put_file_blocks(ino, reader.file_blocks(), epoch);
             }
         }
         Ok(FuseReader::new(
@@ -639,6 +675,7 @@ impl NodeState {
 
         // Read-only: only a reader, no writer to register in the writers map.
         if mode == OpenFlags::RDONLY {
+            let epoch = self.locs_epoch(ino);
             let reader = self.open_reader(ino, path).await?;
             let mut status = reader.status().clone();
             let ino = match ino {
@@ -649,6 +686,7 @@ impl NodeState {
             let handle = self
                 .insert_handle_with_writer(ino, Some(Arc::new(reader)), None, status)
                 .await;
+            self.compensate_open_epoch(&handle, ino, epoch);
             return Ok(handle);
         }
 
@@ -670,8 +708,9 @@ impl NodeState {
             }
         };
 
-        let reader = if mode == OpenFlags::RDWR {
-            if writer.is_ufs() {
+        let (reader, epoch) = if mode == OpenFlags::RDWR {
+            let epoch = self.locs_epoch(Some(ino));
+            let reader = if writer.is_ufs() {
                 warn!(
                     "ufs {} -> {} does not support read-write mode for file opening, reader will be None",
                     path,
@@ -689,9 +728,10 @@ impl NodeState {
                         return Err(e);
                     }
                 }
-            }
+            };
+            (reader, epoch)
         } else {
-            None
+            (None, None)
         };
 
         let mut status = writer.status().clone();
@@ -700,6 +740,7 @@ impl NodeState {
         let handle = self
             .insert_handle_with_writer(ino, reader, Some(writer), status)
             .await;
+        self.compensate_open_epoch(&handle, ino, epoch);
 
         Ok(handle)
     }
@@ -708,7 +749,7 @@ impl NodeState {
     /// existed, with the same flush/complete cleanup RELEASE would run.
     async fn release_writer_ref(&self, ino: u64, writer: &Arc<FuseWriter>) {
         let writer = writer.clone();
-        let (_, res) = self
+        let (last, res) = self
             .writers
             .release_with_cleanup(ino, move |last| async move {
                 if last {
@@ -718,6 +759,9 @@ impl NodeState {
                 }
             })
             .await;
+        if last {
+            self.invalidate_file_blocks(ino);
+        }
         if let Err(e) = res {
             warn!("cleanup writer for ino {} after failed open: {}", ino, e);
         }
@@ -862,7 +906,7 @@ impl NodeState {
         let close_result: FuseResult<()> = match handle.as_ref() {
             FileHandle::Backend(_) if handle.has_writer() => {
                 let cleanup_handle = handle.clone();
-                let (_, cleanup_result) = self
+                let (last, cleanup_result) = self
                     .writers
                     .release_with_cleanup(handle.ino(), move |last| async move {
                         if last {
@@ -872,6 +916,9 @@ impl NodeState {
                         }
                     })
                     .await;
+                if last {
+                    self.invalidate_file_blocks(handle.ino());
+                }
                 cleanup_result
             }
 
@@ -1604,6 +1651,9 @@ impl NodeState {
         let flags = OpenFlags::new(flags);
         let path = self.get_path_name(ino, name)?;
         let _guard = self.lock_path(&path).await;
+        if flags.truncate() {
+            self.invalid_cache(ino, Some(name), crate::fuse_metrics::INVAL_REASON_RESIZE);
+        }
 
         if self.enable_write_back {
             let (dirty, status) = self.dir_read().get_dirty_status(ino, Some(name));
@@ -1649,6 +1699,10 @@ impl NodeState {
         opts: CreateFileOpts,
     ) -> FuseResult<Arc<FileHandle>> {
         let flags = OpenFlags::new(flags);
+        if flags.truncate() {
+            self.invalid_cache(ino, None, crate::fuse_metrics::INVAL_REASON_RESIZE);
+        }
+
         if self.enable_write_back {
             let local_status = {
                 let dir = self.dir_read();
@@ -1672,6 +1726,7 @@ impl NodeState {
         }
 
         let path = self.get_path(ino)?;
+        let epoch = self.locs_epoch(Some(ino));
         let reader = match self.new_reader(&path).await {
             Ok(reader) => reader,
             Err(e) => {
@@ -1700,9 +1755,11 @@ impl NodeState {
         }
 
         status.id = ino as i64;
-        Ok(self
+        let handle = self
             .insert_handle_with_writer(ino, Some(Arc::new(reader)), None, status)
-            .await)
+            .await;
+        self.compensate_open_epoch(&handle, ino, epoch);
+        Ok(handle)
     }
 
     pub async fn new_meta_handle(
@@ -1992,6 +2049,7 @@ impl NodeState {
                         }
                     };
 
+                    handle.mark_stale();
                     self.handles
                         .write()
                         .entry(handle.ino())
@@ -2072,7 +2130,7 @@ mod test {
     use curvine_fs_api::Writer;
     use curvine_fs_api::{ListStream, Path};
     use curvine_fs_api::{StateReader, StateWriter};
-    use curvine_model::FileStatus;
+    use curvine_model::{FileBlocks, FileStatus, LocatedBlock, StorageState, TtlAction};
     use curvine_net::net::InetAddr;
     use curvine_runtime::common::{DurationUnit, FastHashMap, Utils};
     use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
@@ -2159,6 +2217,68 @@ mod test {
         assert!(NodeState::map_remove_handle(&mut map, 2, 21).1);
         assert!(map.get(&2).is_none());
         assert!(!NodeState::map_remove_handle(&mut map, 2, 99).1);
+    }
+
+    fn cached_blocks(len: i64, block_lens: &[i64], state: StorageState) -> FileBlocks {
+        let mut status = FileStatus::with_name(1, "f".to_string(), false);
+        status.len = len;
+        status.storage_policy.state = state;
+
+        let locs = block_lens
+            .iter()
+            .enumerate()
+            .map(|(i, len)| {
+                let mut lb = LocatedBlock::default();
+                lb.block.id = i as i64;
+                lb.block.len = *len;
+                lb
+            })
+            .collect();
+
+        FileBlocks::new(status, locs)
+    }
+
+    #[test]
+    fn only_fully_curvine_blocks_are_cached() {
+        // Every byte lives in Curvine: a plain reader answers open().
+        assert!(NodeState::blocks_fully_in_cv(&cached_blocks(
+            10,
+            &[10],
+            StorageState::Cv
+        )));
+        assert!(NodeState::blocks_fully_in_cv(&cached_blocks(
+            0,
+            &[],
+            StorageState::Cv
+        )));
+
+        // UFS-backed and partially cached files must keep going through fs.open,
+        // which resolves the mount and falls back to UFS.
+        assert!(!NodeState::blocks_fully_in_cv(&cached_blocks(
+            10,
+            &[10],
+            StorageState::Both
+        )));
+        assert!(!NodeState::blocks_fully_in_cv(&cached_blocks(
+            10,
+            &[10],
+            StorageState::Ufs
+        )));
+
+        // The master's snapshot is authoritative: a CV-only file is cached even
+        // when the returned list looks shorter than the file.
+        assert!(NodeState::blocks_fully_in_cv(&cached_blocks(
+            10,
+            &[4],
+            StorageState::Cv
+        )));
+
+        // An expired TTL may already have freed the Curvine copy.
+        let mut expired = cached_blocks(10, &[10], StorageState::Cv);
+        expired.status.mtime = 0;
+        expired.status.storage_policy.ttl_ms = 1;
+        expired.status.storage_policy.ttl_action = TtlAction::Free;
+        assert!(!NodeState::blocks_fully_in_cv(&expired));
     }
 
     #[test]

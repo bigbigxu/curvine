@@ -99,6 +99,13 @@ impl FileHandle {
         }
     }
 
+    pub fn mark_stale(&self) {
+        match self {
+            FileHandle::Backend(h) => h.mark_stale(),
+            FileHandle::Cache(_) => {}
+        }
+    }
+
     pub fn as_cache(&self) -> FuseResult<&CacheHandle> {
         match self {
             FileHandle::Cache(h) => Ok(h),

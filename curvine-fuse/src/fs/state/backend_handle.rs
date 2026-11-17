@@ -22,7 +22,7 @@ use curvine_core_error::err_box;
 use curvine_fs_api::Path;
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_model::{CreateFileOptsBuilder, FileStatus, LockFlags, OpenFlags};
-use curvine_runtime::sync::AsyncMutex;
+use curvine_runtime::sync::{AsyncMutex, AtomicBool};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -61,6 +61,8 @@ pub struct BackendHandle {
     /// refreshes it in place after a dirty-read reopen (`read()` takes `&self`).
     status: std::sync::RwLock<FileStatus>,
 
+    stale: AtomicBool,
+
     fh_locks: std::sync::Mutex<HandleLock>,
 }
 
@@ -92,6 +94,7 @@ impl BackendHandle {
             reader: reader.map(|reader| AsyncMutex::new(ReaderState::new(reader))),
             writer,
             status: std::sync::RwLock::new(status),
+            stale: AtomicBool::new(false),
             fh_locks: std::sync::Mutex::new(HandleLock::default()),
         }
     }
@@ -158,21 +161,22 @@ impl BackendHandle {
             //
             // One FuseWriter is shared per inode. LTP ftest04 forks several O_RDWR
             // children against that writer, so write_ver keeps moving under load.
-            // Pin read_ver to the flushed snapshot; later writes leave write_ver
-            // ahead so the next read publishes again.
             if let Some(target_ver) = writer
                 .publish_dirty_read_snapshot(reader_state.read_ver)
                 .await?
             {
-                state.invalidate_file_blocks(self.ino);
-
-                let path = reader_state.reader.path().clone();
-                let new_reader = state.new_reader(&path).await?;
-                // Refresh status from the reopened reader before installing it.
-                self.refresh_status(new_reader.status().clone());
-                reader_state.reader = Arc::new(new_reader);
                 reader_state.read_ver = target_ver;
+                state.invalidate_file_blocks(self.ino);
             }
+        }
+
+        if self.stale.get() && self.stale.compare_and_set(true, false) {
+            let path = state
+                .get_path(self.ino)
+                .unwrap_or_else(|_| reader_state.reader.path().clone());
+            let new_reader = state.new_reader(&path).await?;
+            self.refresh_status(new_reader.status().clone());
+            reader_state.reader = Arc::new(new_reader);
         }
 
         let reader = reader_state.reader.clone();
@@ -246,6 +250,10 @@ impl BackendHandle {
             return writer.path().full_path().to_owned();
         }
         status_path
+    }
+
+    pub fn mark_stale(&self) {
+        self.stale.set(true);
     }
 
     /// Replace the open-time status snapshot after a dirty-read reopen.
@@ -364,7 +372,7 @@ impl BackendHandle {
             reader: reader.map(|reader| AsyncMutex::new(ReaderState::new(reader))),
             writer,
             status: std::sync::RwLock::new(status),
-
+            stale: AtomicBool::new(false),
             fh_locks: std::sync::Mutex::new(locks),
         };
         Ok(handle)
