@@ -83,9 +83,12 @@ fn running_store_for<S: TransferStore>(store: Arc<S>) -> (Arc<S>, TransferJobRec
         cv_metadata_epoch: None,
         state: TransferState::Pending,
         owner: String::new(),
-        lease_epoch: 0,
+        fence: 0,
         lease_expire_at: 0,
         cancel_requested: false,
+        expires_at: 0,
+        cancel_reason: String::new(),
+        max_runs: TransferJobRecord::DEFAULT_MAX_RUNS,
         summary: TransferProgress::default(),
         client_request_id: "report-batch-request".to_string(),
         submitter: "test".to_string(),
@@ -97,7 +100,7 @@ fn running_store_for<S: TransferStore>(store: Arc<S>) -> (Arc<S>, TransferJobRec
         .create_or_get_by_request_id_checked(job.clone())
         .unwrap();
     let lease = store
-        .acquire_runnable_transfer("owner", 60_000, 1, 2, false)
+        .claim_next_job("owner", 1, 2, false, 0, "")
         .unwrap()
         .unwrap();
     let task = |task_id: &str| TransferTaskRecord {
@@ -129,7 +132,7 @@ fn running_store_for<S: TransferStore>(store: Arc<S>) -> (Arc<S>, TransferJobRec
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease.owner.clone(),
-            lease_epoch: lease.lease_epoch,
+            fence: lease.fence,
             tasks: vec![task("task-1"), task("task-2")],
             message: "planned".to_string(),
             now_ms: 2,
@@ -141,7 +144,7 @@ fn running_store_for<S: TransferStore>(store: Arc<S>) -> (Arc<S>, TransferJobRec
                 job_id: job.job_id.clone(),
                 run_id: job.run_id,
                 owner: lease.owner.clone(),
-                lease_epoch: lease.lease_epoch,
+                fence: lease.fence,
                 task_id: task_id.to_string(),
                 attempt_id: 1,
                 worker_id: 7,
@@ -394,7 +397,7 @@ fn assert_stale_marking_uses_probe_snapshot<S: TransferStore>(
             &job.job_id,
             job.run_id,
             &lease.owner,
-            lease.lease_epoch,
+            lease.fence,
             1_001,
             vec![selected],
         )
@@ -469,7 +472,7 @@ fn assert_stale_marking_does_not_overwrite_fresh_report<S: TransferStore>(
             &job.job_id,
             job.run_id,
             &lease.owner,
-            lease.lease_epoch,
+            lease.fence,
             1_001,
             vec![selected],
         )
@@ -500,7 +503,7 @@ fn assert_failure_summary_uses_stable_task_order<S: TransferStore>(
                 job_id: job.job_id.clone(),
                 run_id: job.run_id,
                 owner: lease.owner.clone(),
-                lease_epoch: lease.lease_epoch,
+                fence: lease.fence,
                 task_id: task_id.to_string(),
                 from_states: vec![TransferTaskState::Running],
                 state: TransferTaskState::Failed,

@@ -18,7 +18,7 @@ use curvine_model::{
     TransferCountFilter, TransferJobRecord, TransferLease, TransferListFilter, TransferProgress,
     TransferState, TransferStateCounts, TransferStateUpdate, TransferTaskCounts,
     TransferTaskRecord, TransferTaskReport, TransferTaskState, TransferTaskStatus,
-    TransferTaskSummary, TransferTenantSummary, WorkerInflight,
+    TransferTaskSummary, TransferTenantSummary,
 };
 use percent_encoding::percent_decode_str;
 use postgres::{error::SqlState, GenericClient, Row, Transaction};
@@ -28,7 +28,6 @@ use r2d2_postgres::PostgresConnectionManager;
 use rustls::pki_types::CertificateDer;
 use rustls::RootCertStore;
 use rustls_pemfile::certs;
-use std::collections::BTreeSet;
 use std::error::Error as _;
 use std::fs;
 use std::path::PathBuf;
@@ -249,7 +248,7 @@ fn init_schema(conn: &mut PgConnection) -> FsResult<()> {
             kind integer not null,
             state integer not null,
             owner text not null,
-            lease_epoch bigint not null,
+            fence bigint not null,
             lease_expire_at bigint not null,
             cancel_requested boolean not null,
             record_json text not null,
@@ -420,227 +419,14 @@ fn ensure_postgres_legacy_task_json_sync_trigger(conn: &mut impl GenericClient) 
     .map_err(postgres_err)
 }
 
-fn lock_submission_gate(conn: &mut impl GenericClient) -> FsResult<()> {
-    conn.query_opt(
-        "select version from transfer_schema_version where id = 1 for update",
-        &[],
-    )
-    .map_err(postgres_err)?
-    .ok_or_else(|| FsError::common("Missing PostgreSQL transfer schema version"))?;
-    Ok(())
-}
-
-fn select_runnable_owned(
-    conn: &mut impl GenericClient,
-    owner: &str,
-    now_ms: i64,
-    lease_ms: i64,
-) -> FsResult<Option<(String, u64, u64, i32)>> {
-    let running_check_interval_ms = crate::transfer::running_transfer_check_interval_ms(lease_ms);
-    let running_event_lease_before_ms =
-        now_ms.saturating_add(lease_ms.saturating_sub(running_check_interval_ms));
-    let running_renew_lease_before_ms = now_ms.saturating_add(lease_ms / 2);
-    select_lease_candidate(
-        conn,
-        "select job_id, run_id, lease_epoch, state
-         from transfer_jobs as job
-         where job.owner = $1 and job.lease_expire_at > $2
-           and (
-                (job.state = 5 and job.updated_at < $2)
-                or (
-                    job.state = 4 and (
-                        job.lease_expire_at <= $4
-                        or (
-                            job.lease_expire_at <= $3 and (
-                                exists (
-                                    select 1 from transfer_tasks as task
-                                    where task.job_id = job.job_id and task.run_id = job.run_id
-                                      and task.state in (1, 4, 6)
-                                )
-                                or exists (
-                                    select 1 from transfer_tasks as task
-                                    where task.job_id = job.job_id and task.run_id = job.run_id
-                                      and task.state = 2 and task.stale_deadline_at < $2
-                                )
-                                or not exists (
-                                    select 1 from transfer_tasks as task
-                                    where task.job_id = job.job_id and task.run_id = job.run_id
-                                      and task.state in (1, 2, 6)
-                                )
-                            )
-                        )
-                    )
-                )
-           )
-         order by job.updated_at asc
-         limit 1
-         for update",
-        &[
-            &owner,
-            &now_ms,
-            &running_event_lease_before_ms,
-            &running_renew_lease_before_ms,
-        ],
-    )
-}
-
-fn select_expired_runnable(
-    conn: &mut impl GenericClient,
-    now_ms: i64,
-) -> FsResult<Option<(String, u64, u64, i32)>> {
-    select_lease_candidate(
-        conn,
-        "select job_id, run_id, lease_epoch, state
-         from transfer_jobs
-         where state in (2, 3, 4, 5) and lease_expire_at <= $1
-         order by updated_at asc
-         limit 1
-         for update",
-        &[&now_ms],
-    )
-}
-
-fn has_pending_runnable(conn: &mut impl GenericClient, now_ms: i64) -> FsResult<bool> {
-    conn.query_opt(
-        "select 1 from transfer_jobs where state = 1 and lease_expire_at <= $1 limit 1",
-        &[&now_ms],
-    )
-    .map(|value| value.is_some())
-    .map_err(postgres_err)
-}
-
-fn select_pending_runnable(
-    conn: &mut impl GenericClient,
-    now_ms: i64,
-    active_targets: &[(String, String)],
-) -> FsResult<Option<(String, u64, u64, i32)>> {
-    let mut values: Vec<Box<dyn postgres::types::ToSql + Sync>> = vec![Box::new(now_ms)];
-    let mut exclusions = Vec::with_capacity(active_targets.len());
-    let mut active_tenants = BTreeSet::new();
-    // An executing job on "/" overlaps every path. Only fs_mode jobs, which are
-    // exempt from overlap, may still start.
-    let mut root_active = false;
-
-    for (target_path, tenant) in active_targets {
-        let target_path = normalize_target_path(target_path);
-        if target_path == "/" {
-            root_active = true;
-            continue;
-        }
-        active_tenants.insert(tenant.clone());
-
-        let (child_lower, child_upper) = child_path_bounds(&target_path);
-        let exact = values.len() + 1;
-        values.push(Box::new(target_path.clone()));
-        let child_lower_index = values.len() + 1;
-        values.push(Box::new(child_lower));
-        let child_upper_index = values.len() + 1;
-        values.push(Box::new(child_upper));
-        let mut conflicts = vec![
-            format!("target_path = ${exact}::text"),
-            format!(
-                "(target_path >= ${child_lower_index}::text and target_path < ${child_upper_index}::text)"
-            ),
-        ];
-
-        let ancestors = ancestor_paths(&target_path);
-        if !ancestors.is_empty() {
-            let mut indexes = Vec::with_capacity(ancestors.len());
-            for ancestor in ancestors {
-                indexes.push((values.len() + 1).to_string());
-                values.push(Box::new(ancestor));
-            }
-            conflicts.push(format!(
-                "target_path in ({})",
-                indexes
-                    .into_iter()
-                    .map(|index| format!("${index}::text"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        exclusions.push(format!("not ({})", conflicts.join(" or ")));
-    }
-    if root_active {
-        // Exclusion parameters are unused when only fs_mode jobs may start.
-        values.truncate(1);
-    }
-
-    let mut sql = "select job_id, run_id, lease_epoch, state
-                   from transfer_jobs
-                   where state = 1 and lease_expire_at <= $1::bigint"
-        .to_string();
-    if root_active {
-        sql.push_str(" and submitter like 'fs-mode:%'");
-    } else if !exclusions.is_empty() {
-        sql.push_str(" and (submitter like 'fs-mode:%' or (");
-        sql.push_str(&exclusions.join(" and "));
-        sql.push_str("))");
-    }
-    if active_tenants.is_empty() {
-        sql.push_str(" order by updated_at asc, job_id asc limit 1 for update");
-    } else {
-        let mut indexes = Vec::with_capacity(active_tenants.len());
-        for tenant in active_tenants {
-            indexes.push((values.len() + 1).to_string());
-            values.push(Box::new(tenant));
-        }
-        sql.push_str(&format!(
-            " order by case when tenant in ({}) then 1 else 0 end asc, updated_at asc, job_id asc limit 1 for update",
-            indexes
-                .into_iter()
-                .map(|index| format!("${index}::text"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    let params = values
-        .iter()
-        .map(|value| value.as_ref() as &(dyn postgres::types::ToSql + Sync))
-        .collect::<Vec<_>>();
-    select_lease_candidate(conn, &sql, &params)
-}
-
-fn select_executing_targets(conn: &mut impl GenericClient) -> FsResult<Vec<(String, String)>> {
-    conn.query(
-        "select target_path, tenant from transfer_jobs
-         where state in (2, 3, 4, 5) and submitter not like 'fs-mode:%'",
-        &[],
-    )
-    .map_err(postgres_err)
-    .map(|rows| {
-        rows.into_iter()
-            .map(|row| (row.get(0), row.get(1)))
-            .collect()
-    })
-}
-
-fn select_lease_candidate(
-    conn: &mut impl GenericClient,
-    sql: &str,
-    params: &[&(dyn postgres::types::ToSql + Sync)],
-) -> FsResult<Option<(String, u64, u64, i32)>> {
-    conn.query_opt(sql, params)
-        .map_err(postgres_err)?
-        .map(|row| {
-            Ok((
-                row.get(0),
-                read_u64(&row, 1)?,
-                read_u64(&row, 2)?,
-                row.get(3),
-            ))
-        })
-        .transpose()
-}
-
 fn insert_job(conn: &mut impl GenericClient, job: &TransferJobRecord) -> FsResult<bool> {
     let run_id = db_u64(job.run_id)?;
-    let lease_epoch = db_u64(job.lease_epoch)?;
+    let fence = db_u64(job.fence)?;
     let record_json = json(job)?;
     conn.execute(
         "insert into transfer_jobs (
             job_id, submitter, tenant, client_request_id, job_key, target_path, run_id, kind, state, owner,
-            lease_epoch, lease_expire_at, cancel_requested, record_json, created_at, updated_at
+            fence, lease_expire_at, cancel_requested, record_json, created_at, updated_at
         ) values (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
         ) on conflict (submitter, client_request_id) do nothing",
@@ -655,7 +441,7 @@ fn insert_job(conn: &mut impl GenericClient, job: &TransferJobRecord) -> FsResul
             &(job.kind as i32),
             &(job.state as i32),
             &job.owner,
-            &lease_epoch,
+            &fence,
             &job.lease_expire_at,
             &job.cancel_requested,
             &record_json,
@@ -709,11 +495,11 @@ fn insert_task(conn: &mut impl GenericClient, task: &TransferTaskRecord) -> FsRe
 
 fn update_job(conn: &mut impl GenericClient, job: &TransferJobRecord) -> FsResult<bool> {
     let run_id = db_u64(job.run_id)?;
-    let lease_epoch = db_u64(job.lease_epoch)?;
+    let fence = db_u64(job.fence)?;
     let record_json = json(job)?;
     conn.execute(
         "update transfer_jobs
-         set tenant = $1, target_path = $2, kind = $3, state = $4, owner = $5, lease_epoch = $6,
+         set tenant = $1, target_path = $2, kind = $3, state = $4, owner = $5, fence = $6,
              lease_expire_at = $7, cancel_requested = $8, record_json = $9,
              created_at = $10, updated_at = $11
          where job_id = $12 and run_id = $13",
@@ -723,7 +509,7 @@ fn update_job(conn: &mut impl GenericClient, job: &TransferJobRecord) -> FsResul
             &(job.kind as i32),
             &(job.state as i32),
             &job.owner,
-            &lease_epoch,
+            &fence,
             &job.lease_expire_at,
             &job.cancel_requested,
             &record_json,
@@ -1154,15 +940,6 @@ fn ancestor_paths(target_path: &str) -> Vec<String> {
         ancestors.push(current.clone());
     }
     ancestors
-}
-
-fn normalize_target_path(path: &str) -> String {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        "/".to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 fn child_path_bounds(target_path: &str) -> (String, String) {
@@ -1691,107 +1468,204 @@ impl TransferStore for PostgresTransferStore {
         })
     }
 
-    fn acquire_runnable_transfer(
+    fn list_active_owned_jobs(&self, limit: usize) -> FsResult<Vec<(String, u64, String)>> {
+        let mut conn = self.conn()?;
+        let rows = conn
+            .query(
+                "select job_id, run_id, owner from transfer_jobs
+                 where owner <> '' and state in (2, 3, 4, 5)
+                 order by updated_at asc limit $1",
+                &[&(limit.max(1) as i64)],
+            )
+            .map_err(postgres_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<_, String>(0),
+                    row.get::<_, i64>(1) as u64,
+                    row.get::<_, String>(2),
+                )
+            })
+            .collect())
+    }
+
+    fn list_expired_jobs(&self, now_ms: i64, limit: usize) -> FsResult<Vec<(String, u64)>> {
+        let mut conn = self.conn()?;
+        let rows = conn
+            .query(
+                "select job_id, run_id from transfer_jobs
+                 where expires_at > 0 and expires_at <= $1
+                   and state not in (5, 6, 7, 8, 9)
+                 order by expires_at asc limit $2",
+                &[&now_ms, &(limit.max(1) as i64)],
+            )
+            .map_err(postgres_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1) as u64))
+            .collect())
+    }
+
+    fn claim_next_job(
         &self,
         owner: &str,
-        lease_ms: i64,
         now_ms: i64,
         max_executing_transfers: u64,
         prefer_pending: bool,
+        _lease_ms: i64,
+        after_job_id: &str,
     ) -> FsResult<Option<TransferLease>> {
-        let max_executing_transfers = db_u64(max_executing_transfers)?;
-        self.transaction(|tx| {
-            lock_submission_gate(tx)?;
-            let mut candidate = if !prefer_pending {
-                select_runnable_owned(tx, owner, now_ms, lease_ms)?
-            } else {
-                None
-            };
-            if candidate.is_none() {
-                candidate = select_expired_runnable(tx, now_ms)?;
-            }
-            if candidate.is_none() && has_pending_runnable(tx, now_ms)? {
-                let executing = count_rows(
-                    tx,
-                    "select count(*) from transfer_jobs where state in (2, 3, 4, 5)",
-                    &[],
-                )?;
-                if db_u64(executing)? < max_executing_transfers {
-                    let active_targets = select_executing_targets(tx)?;
-                    candidate = select_pending_runnable(tx, now_ms, &active_targets)?;
-                }
-            }
-            let Some((job_id, run_id, lease_epoch, state)) = candidate else {
-                return Ok(None);
-            };
-            let mut record =
-                select_job_by_id(tx, &job_id)?.ok_or_else(|| FsError::job_not_found(&job_id))?;
-            if state == TransferState::Pending as i32 {
-                record.state = TransferState::Planning;
-                record.summary.message = "acquired for planning".to_string();
-                record.summary.update_time = now_ms;
-            }
-            record.owner = owner.to_string();
-            record.lease_epoch = lease_epoch.saturating_add(1);
-            record.lease_expire_at = now_ms.saturating_add(lease_ms);
-            record.updated_at = now_ms;
-            let affected = tx
-                .execute(
-                    "update transfer_jobs
-                     set state = $1, owner = $2, lease_epoch = $3, lease_expire_at = $4,
-                         record_json = $5, updated_at = $6
-                     where job_id = $7 and run_id = $8 and lease_epoch = $9",
-                    &[
-                        &(record.state as i32),
-                        &owner,
-                        &db_u64(record.lease_epoch)?,
-                        &record.lease_expire_at,
-                        &json(&record)?,
-                        &now_ms,
-                        &job_id,
-                        &db_u64(run_id)?,
-                        &db_u64(lease_epoch)?,
-                    ],
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(postgres_err)?;
+        let never_expires = TransferJobRecord::LEASE_NEVER_EXPIRES;
+        if !prefer_pending {
+            let mine: Option<(String, i64)> = tx
+                .query_opt(
+                    "select job_id, run_id from transfer_jobs
+                     where owner = $1 and state in (2, 3, 4, 5) and job_id > $2
+                     order by job_id asc limit 1",
+                    &[&owner, &after_job_id],
                 )
-                .map_err(postgres_err)?;
-            if affected == 0 {
-                return Ok(None);
+                .map_err(postgres_err)?
+                .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)));
+            if let Some((job_id, run_id)) = mine {
+                // Read-only re-tick: the rotation cursor is the in-memory keyset.
+                let _ = never_expires;
+                tx.commit().map_err(postgres_err)?;
+                return Ok(Some(TransferLease {
+                    job_id,
+                    run_id: run_id as u64,
+                    owner: owner.to_string(),
+                    fence: run_id as u64,
+                }));
             }
-            Ok(Some(TransferLease {
-                job_id,
-                run_id,
-                owner: owner.to_string(),
-                lease_epoch: record.lease_epoch,
-            }))
-        })
+        }
+        let executing: Option<i64> = tx
+            .query_opt(
+                "select count(*) from transfer_jobs
+                 where owner = $1 and state in (2, 3, 4, 5)",
+                &[&owner],
+            )
+            .map_err(postgres_err)?
+            .map(|row| row.get::<_, i64>(0));
+        if executing.unwrap_or(0) as u64 >= max_executing_transfers {
+            return Ok(None);
+        }
+        let candidate: Option<(String, i64)> = tx
+            .query_opt(
+                "select job_id, run_id from transfer_jobs
+                 where state = 1 order by updated_at asc, job_id asc limit 1",
+                &[],
+            )
+            .map_err(postgres_err)?
+            .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)));
+        let Some((job_id, run_id)) = candidate else {
+            return Ok(None);
+        };
+        let affected = tx
+            .execute(
+                "update transfer_jobs
+                 set state = $1, owner = $2, fence = $3, lease_expire_at = $4,
+                     updated_at = $5
+                 where job_id = $6 and run_id = $7 and state = 1",
+                &[
+                    &(TransferState::Planning as i32),
+                    &owner,
+                    &run_id,
+                    &never_expires,
+                    &now_ms,
+                    &job_id,
+                    &run_id,
+                ],
+            )
+            .map_err(postgres_err)?;
+        if affected == 0 {
+            return Ok(None);
+        }
+        tx.commit().map_err(postgres_err)?;
+        Ok(Some(TransferLease {
+            job_id,
+            run_id: run_id as u64,
+            owner: owner.to_string(),
+            fence: run_id as u64,
+        }))
     }
 
-    fn renew_lease(
+    fn mark_canceling(
         &self,
         job_id: &str,
         run_id: u64,
         owner: &str,
-        lease_epoch: u64,
-        lease_ms: i64,
+        reason: &str,
         now_ms: i64,
     ) -> FsResult<bool> {
-        self.transaction(|tx| {
-            let mut job = match select_job_by_id_for_update(tx, job_id)? {
-                Some(job)
-                    if job.run_id == run_id
-                        && job.owner == owner
-                        && job.lease_epoch == lease_epoch
-                        && job.lease_expire_at > now_ms
-                        && !job.state.is_terminal() =>
-                {
-                    job
-                }
-                _ => return Ok(false),
-            };
-            job.lease_expire_at = now_ms.saturating_add(lease_ms);
-            job.updated_at = now_ms;
-            update_job(tx, &job)
-        })
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(postgres_err)?;
+        let Some(mut record) = select_job_by_id_for_update(&mut tx, job_id)? else {
+            return Ok(false);
+        };
+        if record.run_id != run_id
+            || record.state.is_terminal()
+            || record.state == TransferState::Canceling
+        {
+            return Ok(false);
+        }
+        record.state = TransferState::Canceling;
+        record.cancel_requested = reason == "user";
+        record.cancel_reason = reason.to_string();
+        if !owner.is_empty() {
+            record.owner = owner.to_string();
+        }
+        record.summary.message = format!("canceling: {}", reason);
+        record.summary.update_time = now_ms;
+        record.updated_at = now_ms;
+        let affected = update_job(&mut tx, &record)?;
+        tx.commit().map_err(postgres_err)?;
+        Ok(affected)
+    }
+
+    fn revive_run(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(postgres_err)?;
+        let Some(mut record) = select_job_by_id_for_update(&mut tx, job_id)? else {
+            return Ok(false);
+        };
+        if record.run_id != run_id || record.state.is_terminal() {
+            return Ok(false);
+        }
+        let next_run = run_id.saturating_add(1);
+        record.run_id = next_run;
+        record.state = TransferState::Pending;
+        record.owner.clear();
+        record.cancel_requested = false;
+        record.cancel_reason.clear();
+        record.fence = 0;
+        record.summary.message = format!("re-planning run {}", next_run);
+        record.summary.update_time = now_ms;
+        record.updated_at = now_ms;
+        let affected = update_job(&mut tx, &record)?;
+        tx.commit().map_err(postgres_err)?;
+        Ok(affected)
+    }
+
+    fn fail_job(&self, job_id: &str, run_id: u64, reason: &str, now_ms: i64) -> FsResult<bool> {
+        let mut conn = self.conn()?;
+        let mut tx = conn.transaction().map_err(postgres_err)?;
+        let Some(mut record) = select_job_by_id_for_update(&mut tx, job_id)? else {
+            return Ok(false);
+        };
+        if record.run_id != run_id || record.state.is_terminal() {
+            return Ok(false);
+        }
+        record.state = TransferState::Failed;
+        record.cancel_reason = reason.to_string();
+        record.summary.message = reason.to_string();
+        record.summary.update_time = now_ms;
+        record.updated_at = now_ms;
+        let affected = update_job(&mut tx, &record)?;
+        tx.commit().map_err(postgres_err)?;
+        Ok(affected)
     }
 
     fn set_owner_addr(&self, job_id: &str, run_id: u64, owner_addr: &str) -> FsResult<()> {
@@ -1812,7 +1686,7 @@ impl TransferStore for PostgresTransferStore {
                 Some(job)
                     if job.run_id == update.run_id
                         && job.owner == update.owner
-                        && job.lease_epoch == update.lease_epoch
+                        && job.fence == update.fence
                         && job.lease_expire_at > update.now_ms
                         && update.from_states.contains(&job.state) =>
                 {
@@ -1834,7 +1708,7 @@ impl TransferStore for PostgresTransferStore {
                 Some(job)
                     if job.run_id == update.run_id
                         && job.owner == update.owner
-                        && job.lease_epoch == update.lease_epoch
+                        && job.fence == update.fence
                         && job.lease_expire_at > update.now_ms
                         && job.state == TransferState::Planning =>
                 {
@@ -1863,7 +1737,7 @@ impl TransferStore for PostgresTransferStore {
         job_id: &str,
         run_id: u64,
         owner: &str,
-        lease_epoch: u64,
+        fence: u64,
         cv_metadata_epoch: u64,
         now_ms: i64,
     ) -> FsResult<bool> {
@@ -1872,7 +1746,7 @@ impl TransferStore for PostgresTransferStore {
                 Some(job)
                     if job.run_id == run_id
                         && job.owner == owner
-                        && job.lease_epoch == lease_epoch
+                        && job.fence == fence
                         && job.lease_expire_at > now_ms
                         && !job.state.is_terminal()
                         && job
@@ -1895,7 +1769,7 @@ impl TransferStore for PostgresTransferStore {
                 Some(job)
                     if job.run_id == update.run_id
                         && job.owner == update.owner
-                        && job.lease_epoch == update.lease_epoch
+                        && job.fence == update.fence
                         && job.lease_expire_at > update.now_ms
                         && !job.state.is_terminal() =>
                 {
@@ -1930,7 +1804,7 @@ impl TransferStore for PostgresTransferStore {
                 Some(job)
                     if job.run_id == update.run_id
                         && job.owner == update.owner
-                        && job.lease_epoch == update.lease_epoch
+                        && job.fence == update.fence
                         && job.lease_expire_at > update.now_ms
                         && job.state == TransferState::Planning => {}
                 _ => return Ok(false),
@@ -1949,7 +1823,7 @@ impl TransferStore for PostgresTransferStore {
                 Some(job)
                     if job.run_id == update.run_id
                         && job.owner == update.owner
-                        && job.lease_epoch == update.lease_epoch
+                        && job.fence == update.fence
                         && job.lease_expire_at > update.now_ms
                         && job.state == TransferState::Planning =>
                 {
@@ -1985,7 +1859,7 @@ impl TransferStore for PostgresTransferStore {
                 Some(job)
                     if job.run_id == update.run_id
                         && job.owner == update.owner
-                        && job.lease_epoch == update.lease_epoch
+                        && job.fence == update.fence
                         && job.lease_expire_at > update.now_ms
                         && !job.state.is_terminal() => {}
                 _ => return Ok(false),
@@ -2025,37 +1899,12 @@ impl TransferStore for PostgresTransferStore {
         )
     }
 
-    fn select_inflight_by_worker(&self) -> FsResult<Vec<WorkerInflight>> {
-        let mut conn = self.conn()?;
-        let rows = conn
-            .query(
-                "select worker_id, count(*), coalesce(sum(progress_total_size), 0),
-                        count(*) filter (where progress_total_size > 0)
-             from transfer_tasks where state = 2
-             group by worker_id",
-                &[],
-            )
-            .map_err(postgres_err)?;
-        Ok(rows
-            .iter()
-            .map(|row| WorkerInflight {
-                worker_id: u32::try_from(row.get::<_, i64>(0)).unwrap_or(0),
-                task_count: u64::try_from(row.get::<_, i64>(1)).unwrap_or(u64::MAX),
-                estimated_bytes: row.get::<_, i64>(2),
-                unknown_bytes_count: u64::try_from(
-                    row.get::<_, i64>(1).saturating_sub(row.get::<_, i64>(3)),
-                )
-                .unwrap_or(0),
-            })
-            .collect())
-    }
-
     fn mark_stale_attempts(
         &self,
         job_id: &str,
         run_id: u64,
         owner: &str,
-        lease_epoch: u64,
+        fence: u64,
         now_ms: i64,
         candidates: Vec<TransferTaskRecord>,
     ) -> FsResult<Vec<StaleTaskAttempt>> {
@@ -2064,14 +1913,14 @@ impl TransferStore for PostgresTransferStore {
         }
         ensure_task_transaction_bound(candidates.len())?;
         let run_id_value = db_u64(run_id)?;
-        let lease_epoch_value = db_u64(lease_epoch)?;
+        let fence_value = db_u64(fence)?;
         self.transaction(|tx| {
             let owner_valid = tx
                 .query_opt(
                     "select 1 from transfer_jobs
                      where job_id = $1 and run_id = $2 and owner = $3
-                       and lease_epoch = $4 and lease_expire_at > $5",
-                    &[&job_id, &run_id_value, &owner, &lease_epoch_value, &now_ms],
+                       and fence = $4 and lease_expire_at > $5",
+                    &[&job_id, &run_id_value, &owner, &fence_value, &now_ms],
                 )
                 .map_err(postgres_err)?
                 .is_some();
@@ -2106,7 +1955,7 @@ impl TransferStore for PostgresTransferStore {
                            and exists (
                                select 1 from transfer_jobs
                                where job_id = $7 and run_id = $8 and owner = $14
-                                 and lease_epoch = $15 and lease_expire_at > $6
+                                 and fence = $15 and lease_expire_at > $6
                            )",
                         &[
                             &(task.state as i32),
@@ -2123,7 +1972,7 @@ impl TransferStore for PostgresTransferStore {
                             &candidate.worker_session_id,
                             &candidate.stale_deadline_at,
                             &owner,
-                            &lease_epoch_value,
+                            &fence_value,
                         ],
                     )
                     .map_err(postgres_err)?
@@ -2218,7 +2067,7 @@ impl TransferStore for PostgresTransferStore {
             };
             if job.run_id != start.run_id
                 || job.owner != start.owner
-                || job.lease_epoch != start.lease_epoch
+                || job.fence != start.fence
                 || job.lease_expire_at <= start.now_ms
                 || job.cancel_requested
                 || job.state.is_terminal()

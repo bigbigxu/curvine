@@ -18,7 +18,7 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::ttl::TtlBucket;
 use crate::master::{JobStore, Master, MasterPhase};
 use curvine_core_error::CommonResult;
-use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics, Metrics as m};
+use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Metrics, Metrics as m};
 use curvine_model::{JobTaskProgress, JobTaskState, JobTaskType, MetricValue, WorkerInfo};
 use curvine_raft::raft::storage::{LogStorage, RocksLogStorage};
 use curvine_runtime::common::LocalTime;
@@ -182,6 +182,10 @@ pub struct MasterMetrics {
     pub(crate) journal_queue_len: Gauge,
     pub(crate) journal_flush_count: Counter,
     pub(crate) journal_flush_time: Counter,
+    /// Journal flush latency distribution. `journal_flush_time` only carries the
+    /// sum, so an average hides the flush that took 2s while a million took
+    /// 200us. Quantiles over this histogram are what the dashboard shows.
+    pub(crate) journal_flush_duration_us: Histogram,
     pub(crate) journal_committed: Gauge,
     pub(crate) journal_term: Gauge,
     pub(crate) journal_applied: Gauge,
@@ -419,6 +423,11 @@ impl MasterMetrics {
                 "Number of flushes of log entries",
             )?,
             journal_flush_time: m::new_counter("journal_flush_time", "Log entry flush time")?,
+            journal_flush_duration_us: m::new_histogram_with_buckets(
+                "journal_flush_duration_us",
+                "Journal batch flush latency in microseconds",
+                &buckets,
+            )?,
             journal_committed: m::new_gauge(
                 "journal_committed",
                 "Raft commit index of the journal",

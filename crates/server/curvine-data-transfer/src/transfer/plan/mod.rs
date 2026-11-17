@@ -77,7 +77,17 @@ pub struct PlannedTransfer {
 /// carries at most this many files or this many bytes before splitting.
 /// Batching is default-on; no configuration toggle (M/W/T ship together).
 pub const BATCH_MAX_FILES: usize = 512;
-pub const BATCH_TARGET_BYTES: i64 = 256 * 1024 * 1024;
+
+/// Target size of one planned task, for both batching and large-file splitting.
+///
+/// Every task costs one row, one attempt transaction and one submit RPC, so the
+/// control-plane cost of a job is `total_bytes / TASK_TARGET_BYTES` **regardless
+/// of how many files it contains**. At the previous 256 MiB split threshold a
+/// ~300 MB ORC file produced 2-3 tasks of one 128 MiB block each, which turned a
+/// 14 TB partition into ~115k tasks and made a single scheduler tick take
+/// minutes (CV-86). At 1 GiB the same partition needs ~15k tasks, and a failed
+/// task still only re-copies one batch.
+pub const TASK_TARGET_BYTES: i64 = 1024 * 1024 * 1024;
 
 /// Default group size: half of the 10GiB worker in-flight budget.
 pub const SEGMENT_GROUP_TARGET_BYTES: i64 = TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES / 2;
@@ -103,7 +113,7 @@ pub fn is_non_splittable(name: &str) -> bool {
 /// Pure batch split decision (design §7.1): flush when the file count or
 /// accumulated bytes reach the thresholds.
 pub fn batch_should_flush(file_count: usize, accumulated_bytes: i64) -> bool {
-    file_count >= BATCH_MAX_FILES || accumulated_bytes >= BATCH_TARGET_BYTES
+    file_count >= BATCH_MAX_FILES || accumulated_bytes >= TASK_TARGET_BYTES
 }
 
 pub(crate) fn supports_segment_grouping(workers: &[WorkerInfo]) -> bool {
@@ -723,10 +733,10 @@ impl TransferPlanner {
             }
             total_size += status.len;
             if batching {
-                // Large files (>= batch target) are split into per-block
-                // segment tasks dispatched to different workers (design §14).
-                // A segment maps to exactly one CV block (128 MiB).
-                if status.len >= BATCH_TARGET_BYTES && !is_non_splittable(path.name()) {
+                // Files at or above the task target are split into
+                // block-aligned segments dispatched to different workers
+                // (design §14); a segment maps to exactly one CV block.
+                if status.len >= TASK_TARGET_BYTES && !is_non_splittable(path.name()) {
                     if !batch.is_empty() {
                         let files = std::mem::take(&mut batch);
                         batch_bytes = 0;
@@ -754,8 +764,8 @@ impl TransferPlanner {
                     }
                     continue;
                 }
-                // Compressed large files or medium files stay a single task.
-                if status.len >= BATCH_TARGET_BYTES {
+                // Compressed large files stay a single unsplittable task.
+                if status.len >= TASK_TARGET_BYTES {
                     if !batch.is_empty() {
                         let files = std::mem::take(&mut batch);
                         batch_bytes = 0;
@@ -1708,9 +1718,12 @@ mod tests {
             cv_metadata_epoch: None,
             state: TransferState::Pending,
             owner: String::new(),
-            lease_epoch: 0,
+            fence: 0,
             lease_expire_at: 0,
             cancel_requested: false,
+            expires_at: 0,
+            cancel_reason: String::new(),
+            max_runs: TransferJobRecord::DEFAULT_MAX_RUNS,
             summary: Default::default(),
             client_request_id: command.client_request_id.clone(),
             submitter: String::new(),

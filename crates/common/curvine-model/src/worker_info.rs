@@ -86,12 +86,21 @@ pub struct WorkerInfo {
     pub liveness: Liveness,
     pub worker_session_id: String,
     pub transfer_capabilities: TransferWorkerCapabilities,
-    /// Runtime Transfer admission budget from the latest heartbeat. Zero
-    /// represents a legacy worker that did not report this capability.
+    /// Admission budget the worker last reported. Advisory only: it is
+    /// observability input (console, metrics, `/api/workers`), never an
+    /// admission ceiling - the transfer role's runtime config owns that
+    /// decision so operators tune one place instead of every worker.
     pub transfer_inflight_budget_bytes: i64,
-    /// Runtime concurrency ceiling from the latest heartbeat. Zero represents
-    /// a legacy worker that did not report this capability.
+    /// Concurrency the worker last reported. Advisory only, same rule as
+    /// [`Self::transfer_inflight_budget_bytes`].
     pub worker_max_concurrent_tasks: usize,
+    /// Live transfer load from the last heartbeat: tasks admitted (queued or
+    /// running) on this worker. Zero means "unknown" (legacy worker) and is
+    /// treated as an idle worker; the worker's own gate remains the backstop.
+    pub transfer_inflight_tasks: u64,
+    /// Live transfer bytes admitted on this worker, same semantics as
+    /// [`Self::transfer_inflight_tasks`].
+    pub transfer_inflight_bytes: i64,
     /// Structured version/protocol metadata reported by the worker on its
     /// heartbeat. `None` means a legacy worker that only sent the display
     /// string `software_version`.
@@ -143,32 +152,14 @@ impl WorkerInfo {
             transfer_capabilities: TransferWorkerCapabilities::default(),
             transfer_inflight_budget_bytes: 0,
             worker_max_concurrent_tasks: 0,
+            transfer_inflight_tasks: 0,
+            transfer_inflight_bytes: 0,
             component_info: None,
             scheduled_bytes: 0,
             scheduled_since_ms: 0,
             scheduled_blocks: BTreeMap::new(),
             scheduled_block_bytes: 0,
             scheduled_seq: 0,
-        }
-    }
-
-    /// Returns the worker-reported budget, or `default_budget` for a legacy
-    /// heartbeat that omitted it.
-    pub fn effective_transfer_inflight_budget_bytes(&self, default_budget: i64) -> i64 {
-        if self.transfer_inflight_budget_bytes > 0 {
-            self.transfer_inflight_budget_bytes
-        } else {
-            default_budget
-        }
-    }
-
-    /// Returns the worker-reported concurrency ceiling, or `default_limit`
-    /// for a legacy heartbeat that omitted it.
-    pub fn effective_worker_max_concurrent_tasks(&self, default_limit: usize) -> usize {
-        if self.worker_max_concurrent_tasks > 0 {
-            self.worker_max_concurrent_tasks
-        } else {
-            default_limit
         }
     }
 
@@ -503,6 +494,8 @@ impl Default for WorkerInfo {
             transfer_capabilities: TransferWorkerCapabilities::default(),
             transfer_inflight_budget_bytes: 0,
             worker_max_concurrent_tasks: 0,
+            transfer_inflight_tasks: 0,
+            transfer_inflight_bytes: 0,
             component_info: None,
             scheduled_bytes: 0,
             scheduled_since_ms: 0,

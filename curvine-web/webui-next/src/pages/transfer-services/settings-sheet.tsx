@@ -17,6 +17,7 @@ import {
   parseConfigValue,
   TRANSFER_KNOBS
 } from '@/lib/transfer-services'
+import { formatBytes } from '@/lib/format'
 
 /**
  * Live transfer knobs, edited across every instance at once.
@@ -193,6 +194,14 @@ export function TransferSettingsSheet({
                   <TableBody>
                     {TRANSFER_KNOBS.map((knob) => {
                       const aggregated = aggregatedConfigValue(entries, knob.key)
+                      // A byte ceiling is stored in bytes; showing 10737418240
+                      // would make every other value look tiny.
+                      const effective =
+                        aggregated.value === undefined
+                          ? '—'
+                          : knob.kind === 'bytes'
+                            ? formatBytes(Number(parseConfigValue(aggregated.value)))
+                            : String(parseConfigValue(aggregated.value))
                       const draft =
                         drafts[knob.key] ??
                         (aggregated.value !== undefined
@@ -211,11 +220,7 @@ export function TransferSettingsSheet({
                                 tone="warning"
                               />
                             ) : (
-                              <span className="tabular-nums">
-                                {aggregated.value === undefined
-                                  ? '—'
-                                  : String(parseConfigValue(aggregated.value))}
-                              </span>
+                              <span className="tabular-nums">{effective}</span>
                             )}
                           </TableCell>
                           <TableCell>
@@ -223,6 +228,7 @@ export function TransferSettingsSheet({
                               <Input
                                 className="h-8 w-32"
                                 value={draft}
+                                placeholder={knob.kind === 'bytes' ? '10GB' : undefined}
                                 disabled={busy}
                                 onChange={(event) =>
                                   setDrafts((current) => ({

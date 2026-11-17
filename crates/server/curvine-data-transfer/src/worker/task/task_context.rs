@@ -167,6 +167,18 @@ impl TaskContext {
         self.get_state() <= JobTaskState::Loading
     }
 
+    /// Fence check for an inbound cancel: a zero component is a wildcard.
+    /// Matching style mirrors `transfer_report_matches` so a cancel and a report
+    /// agree on what "this attempt" means.
+    pub fn matches_fence(&self, run_id: u64, attempt_id: u64) -> bool {
+        let Some(report) = self.info.transfer_report.as_ref() else {
+            // A task without report info is a master-job task: fence only by the
+            // job id, which the caller already matched.
+            return true;
+        };
+        (run_id == 0 || report.run_id == run_id) && (attempt_id == 0 || report.attempt_id == attempt_id)
+    }
+
     pub fn is_cancel(&self) -> bool {
         self.cancel_requested.load(Ordering::Acquire) || self.get_state() == JobTaskState::Canceled
     }

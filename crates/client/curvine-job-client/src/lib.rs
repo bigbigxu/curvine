@@ -220,6 +220,8 @@ impl JobMasterClient {
     /// Cancel the loading task
     pub async fn cancel_job(&self, job_id: impl AsRef<str>) -> FsResult<()> {
         let req = CancelJobRequest {
+            run_id: None,
+            attempt_id: None,
             job_id: job_id.as_ref().to_string(),
         };
         let _: CancelJobResponse = self.client.rpc(RpcCode::CancelJob, req).await?;

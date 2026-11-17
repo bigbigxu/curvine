@@ -1192,6 +1192,8 @@ impl MasterHandler {
                     },
                     header.transfer_inflight_budget_bytes.unwrap_or_default(),
                     header.worker_max_concurrent_tasks.unwrap_or_default() as usize,
+                    header.transfer_inflight_tasks.unwrap_or_default().max(0) as u64,
+                    header.transfer_inflight_bytes.unwrap_or_default(),
                     header.software_version,
                     u64::try_from(header.fs_ctime).unwrap_or_default(),
                     ProtoUtils::storage_info_list_from_pb(header.storages),
@@ -2057,7 +2059,7 @@ mod tests {
     }
 
     #[test]
-    fn client_heartbeat_starts_a_new_lease_epoch_after_demotion() {
+    fn client_heartbeat_starts_a_new_fence_after_demotion() {
         use curvine_raft::raft::RoleState;
 
         // Publishes the process-global session gauge (#1885 review).

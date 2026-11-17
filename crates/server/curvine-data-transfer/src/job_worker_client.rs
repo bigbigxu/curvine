@@ -68,9 +68,14 @@ impl JobWorkerClient {
         Ok(())
     }
 
-    pub async fn cancel_job(&self, job_id: impl AsRef<str>) -> FsResult<()> {
+    /// Cancel a job's tasks on this worker. `run_id` fences the cancel to one
+    /// run generation so a late cancel cannot kill the re-planned run's tasks;
+    /// `0` keeps the historical cancel-everything behaviour.
+    pub async fn cancel_job(&self, job_id: impl AsRef<str>, run_id: u64) -> FsResult<()> {
         let request = CancelJobRequest {
             job_id: job_id.as_ref().to_string(),
+            run_id: Some(run_id as i64),
+            attempt_id: None,
         };
 
         let _: CancelJobResponse = self.rpc(RpcCode::CancelJob, request).await?;

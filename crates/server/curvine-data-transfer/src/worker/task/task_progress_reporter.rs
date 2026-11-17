@@ -16,11 +16,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::task_store::TaskStore;
+use super::record_report_outcome;
 use curvine_error::{FsError, FsResult};
 use curvine_job_client::{TransferClient, TransferTaskProgressReport};
 use curvine_model::{JobTaskProgress, TransferTaskReportInfo};
 use curvine_runtime::runtime::{JoinHandle, RpcRuntime, Runtime};
-use log::debug;
+use log::{debug, info};
 use tokio::sync::mpsc;
 
 const TRANSFER_REPORT_TIMEOUT_MS: u64 = 5_000;
@@ -32,6 +34,8 @@ const MAX_PROGRESS_REPORT_BATCH_DELAY: Duration = Duration::from_millis(25);
 pub(super) struct ProgressReport {
     pub(super) report: TransferTaskProgressReport,
     pub(super) log_context: String,
+    /// Handle used to stop the attempt when the store rejects the report.
+    pub(super) abort: Arc<TaskStore>,
 }
 
 /// Outcome of an awaited report RPC that the Store answered.
@@ -177,7 +181,27 @@ impl TransferProgressBatcher {
             match result {
                 Ok(Ok(accepted)) => {
                     for (report, accepted) in reports.into_iter().zip(accepted) {
-                        if !accepted {
+                        if accepted {
+                            continue;
+                        }
+                        // A rejected progress report means this attempt no
+                        // longer owns the task row: the scheduler already
+                        // cancelled it, or another owner took over. Stop here
+                        // instead of copying to the end — this is the fallback
+                        // that makes a lost cancel RPC harmless within one
+                        // report interval (CV-105 §3.5).
+                        record_report_outcome(&Ok(ReportOutcome::Rejected));
+                        let info = &report.report.info;
+                        let cancelled = report
+                            .abort
+                            .cancel_fenced(&report.report.job_id, info.run_id, info.attempt_id);
+                        if !cancelled.is_empty() {
+                            info!(
+                                "aborted {} transfer task(s) after a fenced progress report: {}",
+                                cancelled.len(),
+                                report.log_context
+                            );
+                        } else {
                             debug!(
                                 "transfer task progress batch report rejected: {}",
                                 report.log_context
@@ -213,6 +237,7 @@ impl Drop for TransferProgressBatcher {
 /// Per-task facade over a Worker-shared progress batcher.
 pub struct TaskProgressReporter {
     batcher: Arc<TransferProgressBatcher>,
+    tasks: Arc<TaskStore>,
     job_id: String,
     task_id: String,
     report_info: TransferTaskReportInfo,
@@ -222,6 +247,7 @@ pub struct TaskProgressReporter {
 impl TaskProgressReporter {
     pub(crate) fn new(
         batcher: Arc<TransferProgressBatcher>,
+        tasks: Arc<TaskStore>,
         job_id: String,
         task_id: String,
         report_info: TransferTaskReportInfo,
@@ -229,6 +255,7 @@ impl TaskProgressReporter {
     ) -> Self {
         Self {
             batcher,
+            tasks,
             job_id,
             task_id,
             report_info,
@@ -245,6 +272,7 @@ impl TaskProgressReporter {
                 progress,
             },
             log_context: self.log_context.clone(),
+            abort: self.tasks.clone(),
         });
     }
 

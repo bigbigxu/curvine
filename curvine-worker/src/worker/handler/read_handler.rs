@@ -230,6 +230,7 @@ impl ReadHandler {
         }
         self.metrics.read_bytes.inc_by(region.len() as i64);
         self.metrics.read_time_us.inc_by(used as i64);
+        self.metrics.read_duration_us.observe(used as f64);
         self.metrics.read_count.inc();
 
         Ok(msg.success_with_data(None, region))

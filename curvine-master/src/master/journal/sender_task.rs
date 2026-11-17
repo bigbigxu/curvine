@@ -155,10 +155,12 @@ impl SenderTask {
         self.client.block_on_send_propose(bytes)?;
         self.batch.batch.clear();
 
+        let used_us = spend.used_us();
         self.metrics.journal_flush_count.inc();
+        self.metrics.journal_flush_time.inc_by(used_us as i64);
         self.metrics
-            .journal_flush_time
-            .inc_by(spend.used_us() as i64);
+            .journal_flush_duration_us
+            .observe(used_us as f64);
 
         // Scroll to the next batch.
         self.batch.next();

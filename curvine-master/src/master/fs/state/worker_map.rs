@@ -196,6 +196,8 @@ impl WorkerMap {
         transfer_capabilities: TransferWorkerCapabilities,
         transfer_inflight_budget_bytes: i64,
         worker_max_concurrent_tasks: usize,
+        transfer_inflight_tasks: u64,
+        transfer_inflight_bytes: i64,
         software_version: String,
         startup_time_ms: u64,
         storages: Vec<StorageInfo>,
@@ -217,6 +219,8 @@ impl WorkerMap {
         info.transfer_capabilities = transfer_capabilities;
         info.transfer_inflight_budget_bytes = transfer_inflight_budget_bytes;
         info.worker_max_concurrent_tasks = worker_max_concurrent_tasks;
+        info.transfer_inflight_tasks = transfer_inflight_tasks;
+        info.transfer_inflight_bytes = transfer_inflight_bytes;
         info.software_version = software_version;
         info.startup_time_ms = startup_time_ms;
         info.component_info = component_info;

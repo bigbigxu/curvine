@@ -52,7 +52,7 @@
       ],
       "title": "关键态势",
       "type": "row",
-      "description": "集群是否在线、空间和文件规模、当前读写。先看这一行判断要不要下钻。"
+      "description": "含义：一眼可见的集群态势，包含规模、吞吐、在线率，以及本次新增的容量与迁移趋势。\n趋势：先看左边六个数字是否异常，再看下面两条趋势线是容量打满还是服务停摆。"
     },
     {
       "datasource": {
@@ -91,7 +91,7 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 4,
+        "w": 3,
         "x": 0,
         "y": 1
       },
@@ -157,8 +157,8 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 4,
-        "x": 4,
+        "w": 3,
+        "x": 3,
         "y": 1
       },
       "id": 66,
@@ -221,8 +221,8 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 4,
-        "x": 8,
+        "w": 3,
+        "x": 6,
         "y": 1
       },
       "id": 67,
@@ -286,8 +286,8 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 4,
-        "x": 12,
+        "w": 3,
+        "x": 9,
         "y": 1
       },
       "id": 68,
@@ -351,8 +351,8 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 4,
-        "x": 16,
+        "w": 3,
+        "x": 12,
         "y": 1
       },
       "id": 69,
@@ -416,8 +416,8 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 4,
-        "x": 20,
+        "w": 3,
+        "x": 15,
         "y": 1
       },
       "id": 70,
@@ -469,6 +469,449 @@
       "description": "含义：当前时刻全部 Worker 的读字节速率与写字节速率之和。\n趋势：这是瞬时值。读或写突然抬升表示流量进来；掉到 0 要先确认 Worker 是否还在采集。"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 3,
+        "x": 18,
+        "y": 1
+      },
+      "id": 143,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.0.9",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum(transfer_worker_inflight_count{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"})",
+          "format": "time_series",
+          "instant": true,
+          "interval": "",
+          "legendFormat": "账本",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum(worker_transfer_tasks_running{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"})",
+          "format": "time_series",
+          "instant": true,
+          "interval": "",
+          "legendFormat": "实跑",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum(worker_transfer_tasks_queued{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"})",
+          "format": "time_series",
+          "instant": true,
+          "interval": "",
+          "legendFormat": "排队",
+          "refId": "C"
+        }
+      ],
+      "title": "Transfer 在飞任务",
+      "type": "stat",
+      "description": "含义：账本估算的在飞任务数，以及 worker 上报的实跑与排队任务数。\n趋势：账本与实跑同时抬升是正常负载；账本高而实跑低说明任务在反复被拒；两者都为 0 而作业在排队就是容量不足。"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 3,
+        "x": 21,
+        "y": 1
+      },
+      "id": 144,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.0.9",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "100 * sum(rate(transfer_dispatch_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\",result=\"blocked_no_worker\"}[$__rate_interval])) / clamp_min(sum(rate(transfer_dispatch_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval])), 1e-9)",
+          "format": "time_series",
+          "instant": true,
+          "interval": "",
+          "legendFormat": "受阻 %",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "max(transfer_dispatch_capacity_mismatch{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"})",
+          "format": "time_series",
+          "instant": true,
+          "interval": "",
+          "legendFormat": "mismatch",
+          "refId": "B"
+        }
+      ],
+      "title": "Transfer 派发受阻",
+      "type": "stat",
+      "description": "含义：区间内因没有余量而放弃派发的比例，以及容量口径是否自相矛盾（mismatch=1）。\n趋势：受阻比例上升是容量不足的直接信号；mismatch=1 表示两个上限互相压制，需要调整配置。"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "含义：集群声明容量、已用、可用容量，以及与写入策略真正相关的可分配容量/可用（只统计存活 worker）随时间的变化。\n趋势：可分配与声明之间的差距就是掉线/下线节点占着的容量；可用容量下降快于已用上升，通常是预留或预分配在涨。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "exemplar": false,
+          "expr": "sum(capacity{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"})",
+          "format": "time_series",
+          "instant": false,
+          "interval": "",
+          "legendFormat": "Worker 声明总容量",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "exemplar": false,
+          "expr": "sum(fs_used{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"})",
+          "format": "time_series",
+          "instant": false,
+          "interval": "",
+          "legendFormat": "Curvine 已用容量",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "exemplar": false,
+          "expr": "sum(available{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"})",
+          "format": "time_series",
+          "instant": false,
+          "interval": "",
+          "legendFormat": "Worker 可用容量",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "max(allocatable_capacity{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\"})",
+          "format": "time_series",
+          "instant": false,
+          "interval": "",
+          "legendFormat": "可分配容量（仅存活 worker）",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "max(allocatable_available{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\"})",
+          "format": "time_series",
+          "instant": false,
+          "interval": "",
+          "legendFormat": "可分配可用（仅存活 worker）",
+          "refId": "E"
+        }
+      ],
+      "title": "集群容量与水位趋势",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "含义：迁移吞吐与容量的同视图——派发结果速率、账本在飞任务、worker 实跑任务。\n趋势：派发成功速率下降而在飞任务维持在容量上限，表示集群容量已经打满、迁移进入排队；在飞任务掉到 0 且派发速率也掉到 0，才是迁移链路本身停了。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 14,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "id": 142,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum by (result) (rate(transfer_dispatch_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval]))",
+          "format": "time_series",
+          "instant": false,
+          "interval": "",
+          "legendFormat": "派发 {{result}}/s",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum(transfer_worker_inflight_count{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"})",
+          "format": "time_series",
+          "instant": false,
+          "interval": "",
+          "legendFormat": "账本在飞任务",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum(worker_transfer_tasks_running{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"})",
+          "format": "time_series",
+          "instant": false,
+          "interval": "",
+          "legendFormat": "Worker 实跑任务",
+          "refId": "C"
+        }
+      ],
+      "title": "Transfer 容量与派发趋势",
+      "type": "timeseries"
+    },
+    {
       "collapsed": true,
       "datasource": {
         "type": "datasource",
@@ -478,7 +921,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 6
+        "y": 15
       },
       "id": 1,
       "panels": [
@@ -950,127 +1393,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "description": "含义：Worker 存储池已用容量、可用容量随时间的变化。\n趋势：已用曲线持续抬升且不回落，表示空间在净增长；突然下跌要确认是删除还是目标丢失。",
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "custom": {
-                "axisCenteredZero": false,
-                "axisColorMode": "text",
-                "axisLabel": "",
-                "axisPlacement": "auto",
-                "barAlignment": 0,
-                "drawStyle": "line",
-                "fillOpacity": 20,
-                "gradientMode": "opacity",
-                "hideFrom": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": false
-                },
-                "lineInterpolation": "linear",
-                "lineWidth": 2,
-                "pointSize": 5,
-                "scaleDistribution": {
-                  "type": "linear"
-                },
-                "showPoints": "never",
-                "spanNulls": false,
-                "stacking": {
-                  "group": "A",
-                  "mode": "none"
-                },
-                "thresholdsStyle": {
-                  "mode": "off"
-                }
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green"
-                  }
-                ]
-              },
-              "unit": "bytes"
-            },
-            "overrides": []
-          },
-          "gridPos": {
-            "h": 7,
-            "w": 8,
-            "x": 8,
-            "y": 24
-          },
-          "id": 8,
-          "options": {
-            "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
-              "displayMode": "table",
-              "placement": "bottom",
-              "showLegend": true
-            },
-            "tooltip": {
-              "mode": "multi",
-              "sort": "desc"
-            }
-          },
-          "targets": [
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "${datasource}"
-              },
-              "exemplar": false,
-              "expr": "sum(capacity{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"})",
-              "format": "time_series",
-              "instant": false,
-              "interval": "",
-              "legendFormat": "Worker 声明总容量",
-              "refId": "A"
-            },
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "${datasource}"
-              },
-              "exemplar": false,
-              "expr": "sum(fs_used{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"})",
-              "format": "time_series",
-              "instant": false,
-              "interval": "",
-              "legendFormat": "Curvine 已用容量",
-              "refId": "B"
-            },
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "${datasource}"
-              },
-              "exemplar": false,
-              "expr": "sum(available{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"})",
-              "format": "time_series",
-              "instant": false,
-              "interval": "",
-              "legendFormat": "Worker 可用容量",
-              "refId": "C"
-            }
-          ],
-          "title": "Worker 存储池容量趋势",
-          "type": "timeseries"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "description": "含义：把在线、容量、丢失节点、故障磁盘等风险收成一组当前读数。\n趋势：任一风险项从 0 变为非 0 都要下钻到对应分类。数值回落表示该风险解除。",
+          "description": "含义：一眼可见的风险信号——目录锁阻塞、故障磁盘、丢失节点、复制失败，以及因磁盘空间不足被拒绝的写入。\n趋势：任一数值不为 0 都值得排查；写满拒绝出现表示已经发生不可写入状态，不只是水位偏高。",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -1260,6 +1583,20 @@
               "interval": "",
               "legendFormat": "复制失败",
               "refId": "D"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum(increase(disk_full_rejected_writes{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__range]))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "写满拒绝（区间）",
+              "refId": "E"
             }
           ],
           "title": "风险摘要",
@@ -1289,7 +1626,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 7
+        "y": 15
       },
       "id": 9,
       "panels": [],
@@ -1335,7 +1672,7 @@
         "h": 5,
         "w": 4,
         "x": 0,
-        "y": 8
+        "y": 16
       },
       "id": 10,
       "options": {
@@ -1400,7 +1737,7 @@
               }
             ]
           },
-          "unit": "us"
+          "unit": "µs"
         },
         "overrides": []
       },
@@ -1408,7 +1745,7 @@
         "h": 5,
         "w": 4,
         "x": 4,
-        "y": 8
+        "y": 16
       },
       "id": 62,
       "options": {
@@ -1589,7 +1926,7 @@
         "h": 5,
         "w": 8,
         "x": 8,
-        "y": 8
+        "y": 16
       },
       "id": 2,
       "options": {
@@ -1697,7 +2034,7 @@
         "h": 5,
         "w": 4,
         "x": 16,
-        "y": 8
+        "y": 16
       },
       "id": 71,
       "options": {
@@ -1763,7 +2100,7 @@
         "h": 5,
         "w": 4,
         "x": 20,
-        "y": 8
+        "y": 16
       },
       "id": 45,
       "options": {
@@ -1866,7 +2203,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 13
+        "y": 21
       },
       "id": 11,
       "options": {
@@ -1959,7 +2296,7 @@
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 13
+        "y": 21
       },
       "id": 12,
       "options": {
@@ -2052,7 +2389,7 @@
         "h": 6,
         "w": 6,
         "x": 12,
-        "y": 13
+        "y": 21
       },
       "id": 13,
       "options": {
@@ -2153,7 +2490,7 @@
         "h": 6,
         "w": 6,
         "x": 18,
-        "y": 13
+        "y": 21
       },
       "id": 14,
       "options": {
@@ -2246,7 +2583,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 19
+        "y": 27
       },
       "id": 15,
       "options": {
@@ -2341,7 +2678,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 19
+        "y": 27
       },
       "id": 16,
       "options": {
@@ -2406,7 +2743,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 19
+        "y": 27
       },
       "id": 17,
       "options": {
@@ -2502,7 +2839,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 26
+        "y": 34
       },
       "id": 49,
       "options": {
@@ -2597,7 +2934,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 34
+        "y": 42
       },
       "id": 58,
       "options": {
@@ -2636,7 +2973,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "含义：按操作类型统计的 Master 元数据操作平均延迟。\n趋势：平均延迟上升表示这类操作整体变慢，不只是少数慢尾。",
+      "description": "含义：master 处理 RPC 的耗时分布（P50 / P95 / P99），所有操作合并统计。\n趋势：P99 抬升而 P50 平稳是长尾（锁竞争、慢盘刷盘或个别重操作）；三条一起抬升是整体拥塞。需要定位是哪个操作时看左边按 operation 拆分的 P99 面板。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2689,16 +3026,17 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 34
+        "y": 42
       },
       "id": 59,
       "options": {
         "legend": {
           "calcs": [
-            "lastNotNull"
+            "lastNotNull",
+            "max"
           ],
-          "displayMode": "list",
-          "placement": "bottom",
+          "displayMode": "table",
+          "placement": "right",
           "showLegend": true
         },
         "tooltip": {
@@ -2712,15 +3050,45 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
+          "editorMode": "code",
           "exemplar": false,
-          "expr": "rate(operation_duration_sum{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\",instance=~\"$master_instance\"}[$__rate_interval]) / clamp_min(rate(operation_duration_count{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\",instance=~\"$master_instance\"}[$__rate_interval]), 1e-9)",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(operation_duration_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\",instance=~\"$master_instance\"}[$__rate_interval])))",
           "format": "time_series",
+          "instant": false,
           "interval": "",
-          "legendFormat": "{{instance}} {{operation}}",
+          "legendFormat": "P50",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(operation_duration_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\",instance=~\"$master_instance\"}[$__rate_interval])))",
+          "format": "time_series",
+          "instant": false,
+          "interval": "",
+          "legendFormat": "P95",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(operation_duration_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\",instance=~\"$master_instance\"}[$__rate_interval])))",
+          "format": "time_series",
+          "instant": false,
+          "interval": "",
+          "legendFormat": "P99",
+          "refId": "C"
         }
       ],
-      "title": "主节点操作平均延迟",
+      "title": "主节点操作延迟分位（P50 / P95 / P99）",
       "type": "timeseries"
     },
     {
@@ -2781,7 +3149,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 41
+        "y": 49
       },
       "id": 18,
       "options": {
@@ -2844,7 +3212,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "含义：Raft 日志刷到磁盘的平均耗时。\n趋势：上升表示磁盘或刷盘路径变慢，随后通常会看到队列变长和 RPC 变慢。",
+      "description": "含义：Raft 日志批量刷盘（编码 + propose）的耗时分布。\n趋势：P99 抬升表示一次刷盘卡住，写入会整体变慢并推高日志滞后；P50 平稳而 P99 抖动通常是磁盘或网络抖动。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2897,16 +3265,17 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 41
+        "y": 49
       },
       "id": 19,
       "options": {
         "legend": {
           "calcs": [
-            "lastNotNull"
+            "lastNotNull",
+            "max"
           ],
-          "displayMode": "list",
-          "placement": "bottom",
+          "displayMode": "table",
+          "placement": "right",
           "showLegend": true
         },
         "tooltip": {
@@ -2920,15 +3289,45 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
+          "editorMode": "code",
           "exemplar": false,
-          "expr": "rate(journal_flush_time{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\",instance=~\"$master_instance\"}[$__rate_interval]) / clamp_min(rate(journal_flush_count{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\",instance=~\"$master_instance\"}[$__rate_interval]), 1e-9)",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(journal_flush_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\",instance=~\"$master_instance\"}[$__rate_interval])))",
           "format": "time_series",
+          "instant": false,
           "interval": "",
-          "legendFormat": "{{instance}}",
+          "legendFormat": "P50",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(journal_flush_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\",instance=~\"$master_instance\"}[$__rate_interval])))",
+          "format": "time_series",
+          "instant": false,
+          "interval": "",
+          "legendFormat": "P95",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(journal_flush_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\",instance=~\"$master_instance\"}[$__rate_interval])))",
+          "format": "time_series",
+          "instant": false,
+          "interval": "",
+          "legendFormat": "P99",
+          "refId": "C"
         }
       ],
-      "title": "日志刷盘平均延迟",
+      "title": "日志刷盘延迟分位（P50 / P95 / P99）",
       "type": "timeseries"
     },
     {
@@ -2988,7 +3387,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 41
+        "y": 49
       },
       "id": 73,
       "options": {
@@ -3122,7 +3521,7 @@
         "h": 7,
         "w": 6,
         "x": 0,
-        "y": 48
+        "y": 56
       },
       "id": 20,
       "options": {
@@ -3226,7 +3625,7 @@
         "h": 7,
         "w": 6,
         "x": 6,
-        "y": 48
+        "y": 56
       },
       "id": 42,
       "options": {
@@ -3318,7 +3717,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 48
+        "y": 56
       },
       "id": 21,
       "options": {
@@ -3435,7 +3834,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 55
+        "y": 63
       },
       "id": 22,
       "options": {
@@ -3575,7 +3974,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 55
+        "y": 63
       },
       "id": 23,
       "options": {
@@ -3667,7 +4066,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 55
+        "y": 63
       },
       "id": 44,
       "options": {
@@ -3759,7 +4158,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 62
+        "y": 70
       },
       "id": 46,
       "options": {
@@ -3863,7 +4262,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 62
+        "y": 70
       },
       "id": 47,
       "options": {
@@ -3955,7 +4354,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 62
+        "y": 70
       },
       "id": 48,
       "options": {
@@ -4062,7 +4461,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 69
+        "y": 77
       },
       "id": 102,
       "options": {
@@ -4095,6 +4494,101 @@
       "description": "含义：Master 按 Worker 预分配、尚未落成正式块的空间，scheduled_bytes。\n趋势：上升表示有写入正在占位。长期不下降，可能是客户端没有完成提交或 Worker 没有回报。"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "含义：请求从收到到处理线程真正开始执行之间的等待时间，按线程池（main / actor）拆分。这是执行器饱和的信号：处理耗时统计不包含这段排队。\n趋势：排队 P99 抬升说明请求在排队而不是在处理；actor 池排队过久会让客户端心跳超时并释放锁，比 main 池排队更危险。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 14,
+            "gradientMode": "opacity",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          },
+          "unit": "µs"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 12,
+        "y": 85
+      },
+      "id": 140,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "histogram_quantile(0.99, sum by (executor, le) (rate(rpc_queue_duration_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"master\",instance=~\"$master_instance\"}[$__rate_interval])))",
+          "format": "time_series",
+          "instant": false,
+          "interval": "",
+          "legendFormat": "{{executor}}",
+          "refId": "A"
+        }
+      ],
+      "title": "主节点 RPC 排队延迟 P99（按 executor）",
+      "type": "timeseries"
+    },
+    {
       "collapsed": true,
       "datasource": {
         "type": "datasource",
@@ -4104,7 +4598,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 77
+        "y": 93
       },
       "id": 24,
       "panels": [
@@ -4405,7 +4899,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "description": "含义：全部 Worker 读写耗时的当前平均值，由耗时增量除以次数增量得到。\n趋势：数值变大表示平均每次读写更慢。要和 IOPS、吞吐一起看是排队还是磁盘变慢。",
+          "description": "含义：集群整体读写 P99 延迟（区间末值）。\n趋势：持续抬升表示存储侧变慢；它与吞吐同时下降通常意味着 IO 已经饱和。",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -4428,7 +4922,7 @@
                   }
                 ]
               },
-              "unit": "us"
+              "unit": "µs"
             },
             "overrides": []
           },
@@ -4460,16 +4954,31 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
+              "editorMode": "code",
               "exemplar": false,
-              "expr": "((sum(rate(read_time_us{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval])) + sum(rate(write_time_us{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval]))) / clamp_min(sum(rate(read_count{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval])) + sum(rate(write_count{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval])), 1))",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(read_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval])))",
               "format": "time_series",
               "instant": true,
               "interval": "",
-              "legendFormat": "avg us/op",
+              "legendFormat": "读 P99",
               "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(write_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval])))",
+              "format": "time_series",
+              "instant": true,
+              "interval": "",
+              "legendFormat": "写 P99",
+              "refId": "B"
             }
           ],
-          "title": "Worker 平均读写耗时",
+          "title": "Worker 读写延迟 P99",
           "type": "stat"
         },
         {
@@ -4840,7 +5349,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "description": "含义：Worker 已使用内存。\n趋势：上升表示进程占用变多。接近机器内存上限时，会开始换页并拖慢读写。",
+          "description": "含义：每个数据目录的原始可用空间比例（预留与写入保护之前的值）。\n趋势：某个目录持续下降会先触发写保护而不是写满；多目录之间差距拉大说明写分布不均或单盘异常。",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -4885,7 +5394,7 @@
                   }
                 ]
               },
-              "unit": "bytes"
+              "unit": "percent"
             },
             "overrides": []
           },
@@ -4899,10 +5408,11 @@
           "options": {
             "legend": {
               "calcs": [
-                "lastNotNull"
+                "lastNotNull",
+                "min"
               ],
-              "displayMode": "list",
-              "placement": "bottom",
+              "displayMode": "table",
+              "placement": "right",
               "showLegend": true
             },
             "tooltip": {
@@ -4916,15 +5426,17 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
+              "editorMode": "code",
               "exemplar": false,
-              "expr": "used_memory_bytes{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}",
+              "expr": "100 * max by (dir_path) (disk_free_ratio{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}) / 10000",
               "format": "time_series",
+              "instant": false,
               "interval": "",
-              "legendFormat": "{{instance}}",
+              "legendFormat": "{{dir_path}}",
               "refId": "A"
             }
           ],
-          "title": "工作节点已用内存",
+          "title": "数据目录可用空间比例（按目录）",
           "type": "timeseries"
         },
         {
@@ -5555,7 +6067,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "description": "含义：每台 Worker 的平均读写延迟。\n趋势：单台延迟抬升，查该节点磁盘和 CPU。全部一起抬升，查集群负载或网络。",
+          "description": "含义：每个 worker 的块读取 / 写入 P99 延迟。\n趋势：单实例 P99 明显高于其他实例是慢盘或该实例 IO 打满；整排一起抬升是集群级压力。平均值会把长尾摊平，所以这里用 P99。",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -5614,10 +6126,11 @@
           "options": {
             "legend": {
               "calcs": [
-                "lastNotNull"
+                "lastNotNull",
+                "max"
               ],
-              "displayMode": "list",
-              "placement": "bottom",
+              "displayMode": "table",
+              "placement": "right",
               "showLegend": true
             },
             "tooltip": {
@@ -5631,11 +6144,13 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
+              "editorMode": "code",
               "exemplar": false,
-              "expr": "rate(read_time_us{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval]) / clamp_min(rate(read_count{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval]), 1e-9)",
+              "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(read_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval])))",
               "format": "time_series",
+              "instant": false,
               "interval": "",
-              "legendFormat": "read {{instance}}",
+              "legendFormat": "读 P99 {{instance}}",
               "refId": "A"
             },
             {
@@ -5643,15 +6158,17 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
+              "editorMode": "code",
               "exemplar": false,
-              "expr": "rate(write_time_us{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval]) / clamp_min(rate(write_count{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval]), 1e-9)",
+              "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(write_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval])))",
               "format": "time_series",
+              "instant": false,
               "interval": "",
-              "legendFormat": "write {{instance}}",
+              "legendFormat": "写 P99 {{instance}}",
               "refId": "B"
             }
           ],
-          "title": "工作节点平均读写延迟",
+          "title": "工作节点读写延迟 P99（按实例）",
           "type": "timeseries"
         },
         {
@@ -5703,7 +6220,7 @@
                   }
                 ]
               },
-              "unit": "us"
+              "unit": "µs"
             },
             "overrides": []
           },
@@ -5721,7 +6238,7 @@
                 "max"
               ],
               "displayMode": "table",
-              "placement": "bottom",
+              "placement": "right",
               "showLegend": true
             },
             "tooltip": {
@@ -5735,12 +6252,13 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
+              "editorMode": "code",
               "exemplar": false,
-              "expr": "sum(rate(read_time_us{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval])) / clamp_min(sum(rate(read_count{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval])), 1)",
+              "expr": "histogram_quantile(0.5, sum by (le) (rate(read_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval])))",
               "format": "time_series",
               "instant": false,
               "interval": "",
-              "legendFormat": "读平均耗时",
+              "legendFormat": "读 P50",
               "refId": "A"
             },
             {
@@ -5748,18 +6266,75 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
+              "editorMode": "code",
               "exemplar": false,
-              "expr": "sum(rate(write_time_us{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval])) / clamp_min(sum(rate(write_count{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval])), 1)",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(read_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval])))",
               "format": "time_series",
               "instant": false,
               "interval": "",
-              "legendFormat": "写平均耗时",
+              "legendFormat": "读 P95",
               "refId": "B"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(read_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval])))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "读 P99",
+              "refId": "C"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "histogram_quantile(0.5, sum by (le) (rate(write_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval])))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "写 P50",
+              "refId": "D"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(write_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval])))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "写 P95",
+              "refId": "E"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(write_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval])))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "写 P99",
+              "refId": "F"
             }
           ],
-          "title": "Worker 平均读写耗时趋势",
+          "title": "Worker 读写延迟分位趋势（P50 / P95 / P99）",
           "type": "timeseries",
-          "description": "含义：全集群 Worker 平均读耗时与平均写耗时随时间的变化。\n趋势：曲线抬升表示读写变慢。读和写只有一条抬升时，瓶颈在对应路径。"
+          "description": "含义：集群整体读写延迟的分位趋势。\n趋势：P99 与 P50 的差距就是长尾的规模；长尾扩大通常先出现在个别慢盘上，可以对照上面的按实例 P99 面板定位。"
         },
         {
           "datasource": {
@@ -6717,6 +7292,115 @@
           ],
           "title": "Worker 状态变迁速率",
           "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：worker 因存储不可用或空间不足拒绝写入的次数，按原因拆分（storage_unavailable / disk_out_of_space）。\n趋势：出现拒绝说明已经进入不可写入状态，不只是水位偏高；按原因区分是整盘不可用还是单纯写满。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 14,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 0,
+            "y": 81
+          },
+          "id": 141,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum by (reason) (rate(admission_reject_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval]))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "{{reason}}/s",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum(rate(disk_full_rejected_writes{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval]))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "写满拒绝合计/s",
+              "refId": "B"
+            }
+          ],
+          "title": "磁盘写满与写入准入拒绝",
+          "type": "timeseries"
         }
       ],
       "targets": [
@@ -6742,7 +7426,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 78
+        "y": 94
       },
       "id": 37,
       "panels": [
@@ -7729,7 +8413,7 @@
       "description": "客户端看到的流量，以及 Prometheus 抓取和进程自身状态。"
     },
     {
-      "collapsed": true,
+      "collapsed": false,
       "datasource": {
         "type": "datasource",
         "uid": "grafana"
@@ -7738,10 +8422,2130 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 79
+        "y": 95
       },
       "id": 76,
       "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 5,
+            "w": 6,
+            "x": 0,
+            "y": 8
+          },
+          "id": 120,
+          "options": {
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "auto"
+          },
+          "pluginVersion": "10.0.9",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum(transfer_worker_inflight_count{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"})",
+              "format": "time_series",
+              "instant": true,
+              "interval": "",
+              "legendFormat": "账本在飞任务",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum(worker_transfer_tasks_running{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"})",
+              "format": "time_series",
+              "instant": true,
+              "interval": "",
+              "legendFormat": "Worker 实跑任务",
+              "refId": "B"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum(worker_transfer_tasks_queued{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"})",
+              "format": "time_series",
+              "instant": true,
+              "interval": "",
+              "legendFormat": "Worker 排队等待",
+              "refId": "C"
+            }
+          ],
+          "title": "Transfer 在飞任务（账本 / Worker 实跑）",
+          "type": "stat",
+          "description": "含义：本集群有多少传输任务真正在跑。账本是 Transfer 依据心跳快照加本地未应答派发算出的估算值，Worker 实跑是 worker 自己上报的运行中任务数。\n趋势：两条线长期背离说明账本漂移（看容量口径面板）；实跑持续贴着 0 而账本很高，表示派发失败在堆积。"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "decbytes"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 5,
+            "w": 6,
+            "x": 6,
+            "y": 8
+          },
+          "id": 121,
+          "options": {
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "auto"
+          },
+          "pluginVersion": "10.0.9",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum(transfer_worker_inflight_bytes{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"})",
+              "format": "time_series",
+              "instant": true,
+              "interval": "",
+              "legendFormat": "账本在飞字节",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum(worker_transfer_task_inflight_budget_bytes{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"})",
+              "format": "time_series",
+              "instant": true,
+              "interval": "",
+              "legendFormat": "Worker 预算合计",
+              "refId": "B"
+            }
+          ],
+          "title": "Transfer 在飞字节（账本 / Worker 预算合计）",
+          "type": "stat",
+          "description": "含义：账本估算的在飞字节 vs 所有 worker 声明的字节预算之和。\n趋势：账本逼近预算表示即将触发字节闸，任务会开始被拒绝或不被派发；账本远超预算说明预算调得过小。"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "percent"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 5,
+            "w": 6,
+            "x": 12,
+            "y": 8
+          },
+          "id": 122,
+          "options": {
+            "colorMode": "background",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "auto"
+          },
+          "pluginVersion": "10.0.9",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "100 * sum(rate(transfer_dispatch_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\",result=\"blocked_no_worker\"}[$__rate_interval])) / clamp_min(sum(rate(transfer_dispatch_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval])), 1e-9)",
+              "format": "time_series",
+              "instant": true,
+              "interval": "",
+              "legendFormat": "受阻比例 %",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum(rate(transfer_dispatch_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\",result=\"accepted\"}[$__rate_interval]))",
+              "format": "time_series",
+              "instant": true,
+              "interval": "",
+              "legendFormat": "派发成功/s",
+              "refId": "B"
+            }
+          ],
+          "title": "派发受阻比例（区间）",
+          "type": "stat",
+          "description": "含义：区间内有多少比例的派发尝试因为没有 worker 有余量而被放弃（blocked_no_worker）。\n趋势：持续升高表示集群容量不足；与在飞字节同时升高说明是字节闸，与在飞任务同时升高说明是并发闸。"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 5,
+            "w": 6,
+            "x": 18,
+            "y": 8
+          },
+          "id": 123,
+          "options": {
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "auto"
+          },
+          "pluginVersion": "10.0.9",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "max(transfer_dispatch_capacity_mismatch{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"})",
+              "format": "time_series",
+              "instant": true,
+              "interval": "",
+              "legendFormat": "mismatch",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "max(transfer_dispatch_task_estimate_bytes{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"})",
+              "format": "time_series",
+              "instant": true,
+              "interval": "",
+              "legendFormat": "单任务估算字节",
+              "refId": "B"
+            }
+          ],
+          "title": "容量口径自洽（mismatch / 单任务估算）",
+          "type": "stat",
+          "description": "含义：1 表示两个上限互相矛盾——并发上限乘以最大单任务估算字节已经超过字节预算，于是字节闸先关，并发旋钮实际上不起作用；右侧是当前观测到的最大单任务估算字节。\n趋势：变 1 时要么调大 worker_inflight_budget_bytes，要么调小 worker_max_concurrent_tasks，否则真实并发会远低于配置值。"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：派发结果速率与在飞任务量的同视图对照。\n趋势：accepted 掉到 0 而 blocked_no_worker 抬升，是集群容量打满；在飞估算抬升但 Worker 实跑不抬升，说明任务被拒绝后回队列、没有真正开始跑。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 14,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 0,
+            "y": 13
+          },
+          "id": 124,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum by (result) (rate(transfer_dispatch_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval]))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "派发 {{result}}/s",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum(transfer_worker_inflight_count{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"})",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "账本在飞任务",
+              "refId": "B"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum(worker_transfer_tasks_running{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"})",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "Worker 实跑任务",
+              "refId": "C"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum(worker_transfer_tasks_queued{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"})",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "Worker 排队等待",
+              "refId": "D"
+            }
+          ],
+          "title": "Transfer 派发与在飞趋势（派发结果 · 在飞估算 · Worker 实跑）",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：账本估算的在飞字节与 worker 上报的预算上限随时间的变化。\n趋势：曲线贴住预算线就是字节闸饱和；账本明显低于预算却仍在被拒绝，说明预算在 worker 侧更小或快照过期。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 14,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "decbytes"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 12,
+            "y": 13
+          },
+          "id": 125,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum(transfer_worker_inflight_bytes{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"})",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "账本在飞字节",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum(worker_transfer_task_inflight_budget_bytes{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"})",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "Worker 预算合计",
+              "refId": "B"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "max(transfer_dispatch_task_estimate_bytes{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"})",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "最大单任务估算",
+              "refId": "C"
+            }
+          ],
+          "title": "Transfer 在飞字节趋势（估算 / Worker 预算）",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：Transfer 账本里每个 worker 的在飞任务估算，取前 10 名。\n趋势：少数 worker 单点偏高说明派发不均（轮转失效或部分 worker 心跳滞后）；全部贴着同一高度是健康的均衡状态。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 14,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 0,
+            "y": 22
+          },
+          "id": 126,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "topk(10, max by (worker_id) (transfer_worker_inflight_count{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "worker_id={{worker_id}}",
+              "refId": "A"
+            }
+          ],
+          "title": "每个 Worker 在飞任务（按 worker）",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：Transfer 账本里每个 worker 的在飞字节估算（前 10 名），以及 worker 自己声明的字节预算。\n趋势：单条曲线逼近预算线表示该 worker 即将被闸住；曲线远超预算线表示预算配小了（派发只能靠拒绝来收敛）。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 14,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "decbytes"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 8,
+            "y": 22
+          },
+          "id": 127,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "topk(10, max by (worker_id) (transfer_worker_inflight_bytes{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "worker_id={{worker_id}}",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "max(worker_transfer_task_inflight_budget_bytes{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"})",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "Worker 字节预算",
+              "refId": "B"
+            }
+          ],
+          "title": "每个 Worker 在飞字节（按 worker vs 预算）",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：worker 本地并发信号量的剩余量与排队任务数——最后一道硬闸的实时状态。\n趋势：可用 permit 归零且排队上升表示 worker 打满；permit 有余量但排队仍在涨，说明卡在字节预算而不是并发。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 14,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 16,
+            "y": 22
+          },
+          "id": 128,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "max by (instance) (worker_transfer_task_permits_available{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"})",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "可用 permit {{instance}}",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "max by (instance) (worker_transfer_task_permits_max{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"})",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "并发上限 {{instance}}",
+              "refId": "B"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "max by (instance) (worker_transfer_tasks_queued{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"})",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "排队 {{instance}}",
+              "refId": "C"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "max by (instance) (worker_transfer_tasks_active{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"})",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "跟踪任务 {{instance}}",
+              "refId": "D"
+            }
+          ],
+          "title": "Worker 准入余量与排队（按实例）",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：worker 侧对提交的受理与拒绝，按结果和原因拆分（inflight_tasks=并发满，inflight_budget=字节满，stale_session/stale_attempt=会话或重试过期，no_report_endpoint=报告端点缺失）。\n趋势：容量类原因（inflight_tasks/inflight_budget）应该只在快照空窗期短暂出现；持续出现就是控制面估算不足。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 14,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 0,
+            "y": 29
+          },
+          "id": 129,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum by (result) (rate(worker_transfer_task_submit_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval]))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "受理 {{result}}/s",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum by (reason) (rate(worker_transfer_task_submit_rejected_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval]))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "拒绝 {{reason}}/s",
+              "refId": "B"
+            }
+          ],
+          "title": "Worker 提交受理与拒绝原因",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：worker 回 accepted=false 时 Transfer 归的类（capacity=容量满，session=会话失效）以及任务被重新排回 Pending 的原因。\n趋势：capacity 类拒绝不产生任何控制面副作用，只把任务放回队列；它的速率就是控制面估算误差的直接度量。重排原因里的 stale/transient_retry 抬升表示任务在反复失败。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 14,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 8,
+            "y": 29
+          },
+          "id": 130,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum by (class) (rate(transfer_worker_reject_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval]))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "拒绝 {{class}}/s",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum by (reason) (rate(transfer_requeue_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval]))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "重排 {{reason}}/s",
+              "refId": "B"
+            }
+          ],
+          "title": "Transfer 侧拒绝分类与重排原因",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：transfer 直连 master 的 RPC 延迟 P99，按调用阶段与操作拆分（如 worker_segment/get_block_locations）。\n趋势：某一阶段 P99 抬升说明 master 侧变慢或该操作放大（例如按路径逐条查询），会直接拖慢任务派发与收尾。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 14,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "µs"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 16,
+            "y": 29
+          },
+          "id": 131,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "histogram_quantile(0.99, sum by (stage, operation, le) (rate(transfer_master_rpc_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval])))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "{{stage}} {{operation}}",
+              "refId": "A"
+            }
+          ],
+          "title": "Transfer→Master RPC P99（按阶段 / 操作）",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：transfer 直连 master 的 RPC 速率，按阶段、操作、结果拆分。\n趋势：error 出现说明 master 侧拒绝或网络失败；总速率异常放大往往伴随重试风暴，需要对比 P99 一起看。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 14,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 0,
+            "y": 36
+          },
+          "id": 132,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum by (stage, operation, result) (rate(transfer_master_rpc_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval]))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "{{stage}} {{operation}} {{result}}/s",
+              "refId": "A"
+            }
+          ],
+          "title": "Transfer→Master RPC 速率与错误",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：调度器 tick 速率与作业汇总待刷队列长度。\n趋势：tick 速率掉零表示调度线程停了；待刷队列持续堆积表示汇总写库跟不上（下游 DB 变慢）。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 14,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 8,
+            "y": 36
+          },
+          "id": 133,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "rate(transfer_scheduler_tick_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval])",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "调度 tick/s",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "max(transfer_job_summary_dirty_len{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"})",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "待刷汇总条数",
+              "refId": "B"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum by (result) (rate(transfer_job_summary_flush_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval]))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "汇总刷新 {{result}}/s",
+              "refId": "C"
+            }
+          ],
+          "title": "调度节拍与待刷汇总",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：作业汇总（job summary）批量写库的 P99 耗时。\n趋势：抬升会让作业进度与终态延迟可见，配合待刷队列一起判断是不是存储侧瓶颈。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 14,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "µs"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 16,
+            "y": 36
+          },
+          "id": 134,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "histogram_quantile(0.99, sum by (result, le) (rate(transfer_job_summary_flush_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval])))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "{{result}}",
+              "refId": "A"
+            }
+          ],
+          "title": "作业汇总写入 P99",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：任务进度上报通道的两端——worker 发起的上报结果（success/rejected/failure），按信封类型统计的 RPC 速率，以及一次批量上报携带的任务数。\n趋势：批量任务数上升说明上报在聚合（好事）；RPC 类型里逐条上报的比例升高会放大 DB 写压力。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 14,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 0,
+            "y": 43
+          },
+          "id": 135,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum by (type) (rate(transfer_task_report_rpc_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval]))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "{{type}}/s",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "rate(transfer_task_report_batch_tasks_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval])",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "批量任务数/s",
+              "refId": "B"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum by (result) (rate(worker_transfer_task_report_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval]))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "Worker 上报 {{result}}/s",
+              "refId": "C"
+            }
+          ],
+          "title": "任务报告通道（RPC 类型 / 批量任务数）",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：worker 侧任务失败原因分布，以及被从 worker 任务表驱逐的数量按原因拆分。\n趋势：某一种失败原因持续升高是明确的故障信号；驱逐升高说明 worker 内存/保留策略在收尾旧任务。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 14,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 8,
+            "y": 43
+          },
+          "id": 136,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum by (reason) (rate(worker_transfer_task_failed_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval]))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "失败 {{reason}}/s",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum by (reason) (rate(worker_transfer_task_evicted_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval]))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "驱逐 {{reason}}/s",
+              "refId": "B"
+            }
+          ],
+          "title": "Worker 失败原因与任务驱逐",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：worker 实际拷贝的字节速率，按任务终态拆分。\n趋势：completed 曲线就是集群真实的迁移吞吐；failed 上也出现字节说明有部分成功后又整体失败的任务。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 14,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "Bps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 16,
+            "y": 43
+          },
+          "id": 137,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum by (state) (rate(worker_transfer_task_copy_bytes_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"}[$__rate_interval]))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "{{state}}",
+              "refId": "A"
+            }
+          ],
+          "title": "Worker 复制字节（按终态）",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：worker 为调度器补探（probe）保留的终态任务数与最老一条的年龄。\n趋势：保留数长期不降或年龄一路上涨，说明补探路径有问题，终态上下文会一直占内存（-1 表示当前没有保留）。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 14,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 0,
+            "y": 50
+          },
+          "id": 138,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "max by (instance) (worker_transfer_terminal_retained_tasks{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"})",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "保留数 {{instance}}",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "max by (instance) (worker_transfer_terminal_retention_age_seconds{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\"})",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "最老年龄(s) {{instance}}",
+              "refId": "B"
+            }
+          ],
+          "title": "Worker 终态任务保留与探活年龄",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：作业/任务清理速率，以及从断点续传载入的字节速率。\n趋势：清理速率长期为 0 说明终态作业在累积；断点续传字节高说明重启后大量任务在走续传而不是重头拷。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 14,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 8,
+            "y": 50
+          },
+          "id": 139,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "rate(transfer_cleanup_purged_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval])",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "清理作业/s",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "rate(transfer_cleanup_purged_tasks_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval])",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "清理任务/s",
+              "refId": "B"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "rate(transfer_group_resume_loaded_bytes{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval])",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "断点续传字节/s",
+              "refId": "C"
+            }
+          ],
+          "title": "清理与断点续传",
+          "type": "timeseries"
+        },
         {
           "datasource": {
             "type": "prometheus",
@@ -7772,8 +10576,8 @@
           "gridPos": {
             "h": 5,
             "w": 8,
-            "x": 0,
-            "y": 8
+            "x": 16,
+            "y": 50
           },
           "id": 77,
           "options": {
@@ -7858,8 +10662,8 @@
           "gridPos": {
             "h": 5,
             "w": 8,
-            "x": 8,
-            "y": 8
+            "x": 0,
+            "y": 57
           },
           "id": 78,
           "options": {
@@ -7956,8 +10760,8 @@
           "gridPos": {
             "h": 5,
             "w": 8,
-            "x": 16,
-            "y": 8
+            "x": 8,
+            "y": 57
           },
           "id": 79,
           "options": {
@@ -8037,8 +10841,8 @@
           "gridPos": {
             "h": 5,
             "w": 8,
-            "x": 0,
-            "y": 13
+            "x": 16,
+            "y": 57
           },
           "id": 80,
           "options": {
@@ -8122,8 +10926,8 @@
           "gridPos": {
             "h": 5,
             "w": 8,
-            "x": 8,
-            "y": 13
+            "x": 0,
+            "y": 62
           },
           "id": 81,
           "options": {
@@ -8194,8 +10998,8 @@
           "gridPos": {
             "h": 5,
             "w": 8,
-            "x": 16,
-            "y": 13
+            "x": 8,
+            "y": 62
           },
           "id": 82,
           "options": {
@@ -8302,8 +11106,8 @@
           "gridPos": {
             "h": 7,
             "w": 8,
-            "x": 0,
-            "y": 18
+            "x": 16,
+            "y": 62
           },
           "id": 83,
           "options": {
@@ -8410,8 +11214,8 @@
           "gridPos": {
             "h": 7,
             "w": 8,
-            "x": 8,
-            "y": 18
+            "x": 0,
+            "y": 69
           },
           "id": 84,
           "options": {
@@ -8421,7 +11225,7 @@
                 "max"
               ],
               "displayMode": "table",
-              "placement": "bottom",
+              "placement": "right",
               "showLegend": true
             },
             "tooltip": {
@@ -8468,19 +11272,6 @@
               "interval": "",
               "legendFormat": "dispatch {{result}}",
               "refId": "C"
-            },
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "${datasource}"
-              },
-              "exemplar": false,
-              "expr": "sum by (result) (rate(transfer_lease_renew_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval]))",
-              "format": "time_series",
-              "instant": false,
-              "interval": "",
-              "legendFormat": "lease {{result}}",
-              "refId": "D"
             },
             {
               "datasource": {
@@ -8556,8 +11347,8 @@
           "gridPos": {
             "h": 7,
             "w": 8,
-            "x": 16,
-            "y": 18
+            "x": 8,
+            "y": 69
           },
           "id": 85,
           "options": {
@@ -8624,8 +11415,8 @@
           "gridPos": {
             "h": 7,
             "w": 8,
-            "x": 0,
-            "y": 25
+            "x": 16,
+            "y": 69
           },
           "id": 86,
           "options": {
@@ -8757,8 +11548,8 @@
           "gridPos": {
             "h": 7,
             "w": 8,
-            "x": 8,
-            "y": 25
+            "x": 0,
+            "y": 76
           },
           "id": 87,
           "options": {
@@ -8864,8 +11655,8 @@
           "gridPos": {
             "h": 7,
             "w": 8,
-            "x": 16,
-            "y": 25
+            "x": 8,
+            "y": 76
           },
           "id": 88,
           "options": {
@@ -8977,15 +11768,15 @@
                   }
                 ]
               },
-              "unit": "us"
+              "unit": "µs"
             },
             "overrides": []
           },
           "gridPos": {
             "h": 7,
             "w": 8,
-            "x": 0,
-            "y": 32
+            "x": 16,
+            "y": 76
           },
           "id": 89,
           "options": {
@@ -8995,7 +11786,7 @@
                 "max"
               ],
               "displayMode": "table",
-              "placement": "bottom",
+              "placement": "right",
               "showLegend": true
             },
             "tooltip": {
@@ -9104,8 +11895,8 @@
           "gridPos": {
             "h": 7,
             "w": 8,
-            "x": 8,
-            "y": 32
+            "x": 0,
+            "y": 83
           },
           "id": 90,
           "options": {
@@ -9115,7 +11906,7 @@
                 "max"
               ],
               "displayMode": "table",
-              "placement": "bottom",
+              "placement": "right",
               "showLegend": true
             },
             "tooltip": {
@@ -9211,8 +12002,8 @@
           "gridPos": {
             "h": 7,
             "w": 8,
-            "x": 16,
-            "y": 32
+            "x": 8,
+            "y": 83
           },
           "id": 91,
           "options": {
@@ -9222,7 +12013,7 @@
                 "max"
               ],
               "displayMode": "table",
-              "placement": "bottom",
+              "placement": "right",
               "showLegend": true
             },
             "tooltip": {
@@ -9331,8 +12122,8 @@
           "gridPos": {
             "h": 7,
             "w": 8,
-            "x": 0,
-            "y": 39
+            "x": 16,
+            "y": 83
           },
           "id": 92,
           "options": {
@@ -9483,8 +12274,8 @@
           "gridPos": {
             "h": 7,
             "w": 8,
-            "x": 8,
-            "y": 39
+            "x": 0,
+            "y": 90
           },
           "id": 93,
           "options": {
@@ -9603,8 +12394,8 @@
           "gridPos": {
             "h": 7,
             "w": 12,
-            "x": 0,
-            "y": 46
+            "x": 8,
+            "y": 90
           },
           "id": 94,
           "options": {
@@ -9652,11 +12443,25 @@
               "expr": "sum(transfer_tasks_stale{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"})",
               "legendFormat": "stale",
               "refId": "C"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum(transfer_tasks_canceled{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"})",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "已取消",
+              "refId": "D"
             }
           ],
           "title": "Transfer 任务状态（瞬时）",
           "type": "timeseries",
-          "description": "含义：当前 pending、running、stale 任务数。\n趋势：pending 上升是排队。stale 上升表示任务失去续租，可能会被重试。"
+          "description": "含义：待处理、运行中、滞留、已取消的任务数（瞬时）。\n趋势：待处理堆积而运行中不涨是容量不足或被闸住；滞留（stale）抬升表示任务超时未回报，需要看报告通道与 worker 存活。"
         },
         {
           "datasource": {
@@ -9714,8 +12519,8 @@
           "gridPos": {
             "h": 7,
             "w": 12,
-            "x": 12,
-            "y": 46
+            "x": 0,
+            "y": 97
           },
           "id": 95,
           "options": {
@@ -9815,8 +12620,8 @@
           "gridPos": {
             "h": 7,
             "w": 8,
-            "x": 0,
-            "y": 53
+            "x": 12,
+            "y": 97
           },
           "id": 96,
           "options": {
@@ -9826,7 +12631,7 @@
                 "max"
               ],
               "displayMode": "table",
-              "placement": "bottom",
+              "placement": "right",
               "showLegend": true
             },
             "tooltip": {
@@ -9840,9 +12645,13 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
+              "editorMode": "code",
               "exemplar": false,
-              "expr": "sum(rate(worker_transfer_task_queue_duration_us_sum{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\",result=\"started\"}[$__rate_interval])) / clamp_min(sum(rate(worker_transfer_task_queue_duration_us_count{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\",result=\"started\"}[$__rate_interval])), 1e-9)",
-              "legendFormat": "avg queue wait",
+              "expr": "histogram_quantile(0.50, sum by (le) (rate(worker_transfer_task_queue_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval])))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "P50",
               "refId": "A"
             },
             {
@@ -9850,15 +12659,19 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
+              "editorMode": "code",
               "exemplar": false,
-              "expr": "histogram_quantile(0.99, sum by (le) (rate(worker_transfer_task_queue_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\",result=\"started\"}[$__rate_interval])))",
-              "legendFormat": "p99",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(worker_transfer_task_queue_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval])))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "P99",
               "refId": "B"
             }
           ],
-          "title": "Worker 排队等待（任务并发 permit）",
+          "title": "Worker 排队等待分位（任务并发 permit）",
           "type": "timeseries",
-          "description": "含义：Worker 拿到任务并发许可之前的等待时间，含平均和 P99。\n趋势：上升表示 Worker 并发名额不够，任务在排队。回落表示排队缓解。"
+          "description": "含义：任务在 worker 上等待并发 permit 的耗时分布（P50 / P99）。\n趋势：P99 抬升表示排队变长，通常由并发上限打满或字节预算闸住引起；P50 也抬升说明整体过载而不是个别长尾。"
         },
         {
           "datasource": {
@@ -9916,8 +12729,8 @@
           "gridPos": {
             "h": 7,
             "w": 8,
-            "x": 8,
-            "y": 53
+            "x": 0,
+            "y": 104
           },
           "id": 97,
           "options": {
@@ -9927,7 +12740,7 @@
                 "max"
               ],
               "displayMode": "table",
-              "placement": "bottom",
+              "placement": "right",
               "showLegend": true
             },
             "tooltip": {
@@ -9941,9 +12754,13 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
+              "editorMode": "code",
               "exemplar": false,
-              "expr": "sum(rate(worker_transfer_task_read_duration_us_sum{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval])) / clamp_min(sum(rate(worker_transfer_task_read_duration_us_count{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval])), 1e-9)",
-              "legendFormat": "avg",
+              "expr": "histogram_quantile(0.5, sum by (le) (rate(worker_transfer_task_read_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval])))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "P50",
               "refId": "A"
             },
             {
@@ -9951,15 +12768,33 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
+              "editorMode": "code",
               "exemplar": false,
-              "expr": "histogram_quantile(0.99, sum by (le) (rate(worker_transfer_task_read_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval])))",
-              "legendFormat": "p99",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(worker_transfer_task_read_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval])))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "P95",
               "refId": "B"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(worker_transfer_task_read_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval])))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "P99",
+              "refId": "C"
             }
           ],
-          "title": "Worker 任务读取耗时",
+          "title": "Worker 任务读取耗时分位（P50 / P95 / P99）",
           "type": "timeseries",
-          "description": "含义：Worker 执行迁移任务时读取数据的耗时，含平均和 P99。\n趋势：上升表示读源变慢。P99 远高于平均，表示只有部分读很慢。"
+          "description": "含义：任务读取一侧的耗时分布（P50 / P95 / P99），由 worker 在每个任务收尾时记录。\n趋势：P99 抬升而 P50 平稳是长尾（个别慢盘、慢源端）；三条一起抬升是整体变慢（带宽或后端压力）。"
         },
         {
           "datasource": {
@@ -10017,8 +12852,8 @@
           "gridPos": {
             "h": 7,
             "w": 8,
-            "x": 16,
-            "y": 53
+            "x": 8,
+            "y": 104
           },
           "id": 98,
           "options": {
@@ -10028,7 +12863,7 @@
                 "max"
               ],
               "displayMode": "table",
-              "placement": "bottom",
+              "placement": "right",
               "showLegend": true
             },
             "tooltip": {
@@ -10042,9 +12877,13 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
+              "editorMode": "code",
               "exemplar": false,
-              "expr": "sum(rate(worker_transfer_task_write_duration_us_sum{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval])) / clamp_min(sum(rate(worker_transfer_task_write_duration_us_count{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval])), 1e-9)",
-              "legendFormat": "avg",
+              "expr": "histogram_quantile(0.5, sum by (le) (rate(worker_transfer_task_write_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval])))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "P50",
               "refId": "A"
             },
             {
@@ -10052,280 +12891,33 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
+              "editorMode": "code",
               "exemplar": false,
-              "expr": "histogram_quantile(0.99, sum by (le) (rate(worker_transfer_task_write_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval])))",
-              "legendFormat": "p99",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(worker_transfer_task_write_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval])))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "P95",
               "refId": "B"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(worker_transfer_task_write_duration_us_bucket{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"worker\",instance=~\"$worker_instance\"}[$__rate_interval])))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "P99",
+              "refId": "C"
             }
           ],
-          "title": "Worker 任务写入耗时",
+          "title": "Worker 任务写入耗时分位（P50 / P95 / P99）",
           "type": "timeseries",
-          "description": "含义：Worker 执行迁移任务时写入数据的耗时，含平均和 P99。\n趋势：上升表示写目标变慢。与读取耗时对比，可以看出慢在读还是写。"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "description": "含义：每台 Worker 当前并行的迁移任务数。面板标题里的 100 是并发上限。\n趋势：贴近上限表示该 Worker 已经跑满。长期贴满且排队上升，需要提高并发或增加 Worker。",
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "custom": {
-                "axisCenteredZero": false,
-                "axisColorMode": "text",
-                "axisLabel": "",
-                "axisPlacement": "auto",
-                "barAlignment": 0,
-                "drawStyle": "line",
-                "fillOpacity": 20,
-                "gradientMode": "opacity",
-                "hideFrom": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": false
-                },
-                "lineInterpolation": "linear",
-                "lineWidth": 2,
-                "pointSize": 5,
-                "scaleDistribution": {
-                  "type": "linear"
-                },
-                "showPoints": "never",
-                "spanNulls": false,
-                "stacking": {
-                  "group": "A",
-                  "mode": "none"
-                },
-                "thresholdsStyle": {
-                  "mode": "off"
-                }
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green"
-                  },
-                  {
-                    "color": "yellow",
-                    "value": 80
-                  },
-                  {
-                    "color": "red",
-                    "value": 100
-                  }
-                ]
-              },
-              "unit": "short"
-            },
-            "overrides": []
-          },
-          "gridPos": {
-            "h": 7,
-            "w": 8,
-            "x": 0,
-            "y": 60
-          },
-          "id": 99,
-          "options": {
-            "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
-              "displayMode": "table",
-              "placement": "bottom",
-              "showLegend": true
-            },
-            "tooltip": {
-              "mode": "multi",
-              "sort": "desc"
-            }
-          },
-          "targets": [
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "${datasource}"
-              },
-              "editorMode": "code",
-              "exemplar": false,
-              "expr": "topk(10, max by (worker_id) (transfer_worker_inflight_count{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}))",
-              "format": "time_series",
-              "instant": false,
-              "interval": "",
-              "legendFormat": "{{worker_id}}",
-              "refId": "A"
-            }
-          ],
-          "title": "每个 Worker 同时跑几个任务（上限 100）",
-          "type": "timeseries"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "description": "含义：每台 Worker 为迁移缓存的数据量。面板标题里的 10GB 是缓存上限。\n趋势：贴近上限表示缓存空间用尽，新的传输会等待。回落表示缓存被消费或释放。",
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "custom": {
-                "axisCenteredZero": false,
-                "axisColorMode": "text",
-                "axisLabel": "",
-                "axisPlacement": "auto",
-                "barAlignment": 0,
-                "drawStyle": "line",
-                "fillOpacity": 20,
-                "gradientMode": "opacity",
-                "hideFrom": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": false
-                },
-                "lineInterpolation": "linear",
-                "lineWidth": 2,
-                "pointSize": 5,
-                "scaleDistribution": {
-                  "type": "linear"
-                },
-                "showPoints": "never",
-                "spanNulls": false,
-                "stacking": {
-                  "group": "A",
-                  "mode": "none"
-                },
-                "thresholdsStyle": {
-                  "mode": "off"
-                }
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green"
-                  },
-                  {
-                    "color": "yellow",
-                    "value": 80
-                  },
-                  {
-                    "color": "red",
-                    "value": 100
-                  }
-                ]
-              },
-              "unit": "percent"
-            },
-            "overrides": [
-              {
-                "matcher": {
-                  "id": "byFrameRefID",
-                  "options": "B"
-                },
-                "properties": [
-                  {
-                    "id": "unit",
-                    "value": "short"
-                  },
-                  {
-                    "id": "custom.axisPlacement",
-                    "value": "right"
-                  },
-                  {
-                    "id": "color",
-                    "value": {
-                      "fixedColor": "red",
-                      "mode": "fixed"
-                    }
-                  },
-                  {
-                    "id": "custom.fillOpacity",
-                    "value": 0
-                  },
-                  {
-                    "id": "custom.drawStyle",
-                    "value": "line"
-                  },
-                  {
-                    "id": "custom.lineWidth",
-                    "value": 2
-                  },
-                  {
-                    "id": "custom.lineStyle",
-                    "value": {
-                      "dash": [
-                        4,
-                        4
-                      ]
-                    }
-                  }
-                ]
-              }
-            ]
-          },
-          "gridPos": {
-            "h": 7,
-            "w": 8,
-            "x": 8,
-            "y": 60
-          },
-          "id": 100,
-          "options": {
-            "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
-              "displayMode": "table",
-              "placement": "bottom",
-              "showLegend": true
-            },
-            "tooltip": {
-              "mode": "multi",
-              "sort": "desc"
-            }
-          },
-          "targets": [
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "${datasource}"
-              },
-              "editorMode": "code",
-              "exemplar": false,
-              "expr": "topk(10, max by (worker_id) (100 * transfer_worker_inflight_bytes{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"} / (10*1024*1024*1024)))",
-              "format": "time_series",
-              "instant": false,
-              "interval": "",
-              "legendFormat": "{{worker_id}}",
-              "refId": "A"
-            },
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "${datasource}"
-              },
-              "editorMode": "code",
-              "exemplar": false,
-              "expr": "count(count by (worker_id) (transfer_worker_inflight_bytes{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"} > 10*1024*1024*1024))",
-              "format": "time_series",
-              "instant": false,
-              "interval": "",
-              "legendFormat": "缓存超标的 Worker 个数",
-              "refId": "B"
-            }
-          ],
-          "title": "每个 Worker 缓存了多少数据（上限 10GB）",
-          "type": "timeseries"
+          "description": "含义：任务写入一侧的耗时分布（P50 / P95 / P99），由 worker 在每个任务收尾时记录。\n趋势：P99 抬升而 P50 平稳是长尾（个别慢盘、慢源端）；三条一起抬升是整体变慢（带宽或后端压力）。"
         },
         {
           "datasource": {
@@ -10430,7 +13022,7 @@
             "h": 7,
             "w": 8,
             "x": 16,
-            "y": 60
+            "y": 104
           },
           "id": 101,
           "options": {
@@ -10539,17 +13131,18 @@
           "gridPos": {
             "h": 7,
             "w": 8,
-            "x": 16,
-            "y": 39
+            "x": 0,
+            "y": 111
           },
           "id": 106,
           "options": {
             "legend": {
               "calcs": [
-                "lastNotNull"
+                "lastNotNull",
+                "max"
               ],
-              "displayMode": "list",
-              "placement": "bottom",
+              "displayMode": "table",
+              "placement": "right",
               "showLegend": true
             },
             "tooltip": {
@@ -10706,8 +13299,8 @@
           "gridPos": {
             "h": 8,
             "w": 8,
-            "x": 0,
-            "y": 67
+            "x": 8,
+            "y": 111
           },
           "id": 107,
           "options": {
@@ -10830,17 +13423,18 @@
           "gridPos": {
             "h": 8,
             "w": 8,
-            "x": 8,
-            "y": 67
+            "x": 16,
+            "y": 111
           },
           "id": 108,
           "options": {
             "legend": {
               "calcs": [
-                "lastNotNull"
+                "lastNotNull",
+                "max"
               ],
-              "displayMode": "list",
-              "placement": "bottom",
+              "displayMode": "table",
+              "placement": "right",
               "showLegend": true
             },
             "tooltip": {
@@ -10931,8 +13525,8 @@
           "gridPos": {
             "h": 8,
             "w": 8,
-            "x": 16,
-            "y": 67
+            "x": 0,
+            "y": 119
           },
           "id": 109,
           "options": {
@@ -11086,8 +13680,8 @@
           "gridPos": {
             "h": 7,
             "w": 8,
-            "x": 0,
-            "y": 75
+            "x": 8,
+            "y": 119
           },
           "id": 110,
           "options": {
@@ -11160,6 +13754,319 @@
           ],
           "title": "Transfer 任务分布（运行中 / 待处理 / 已完成）",
           "type": "piechart"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：因 owner 失联被判定接管的作业数、因到期被取消的作业数，以及当前被排除判死的配置漂移 peer 数。\n趋势：owner_lost 上升说明有 transfer 实例非正常退出（会触发重规划）；ttl_expired 上升说明提交方给的寿命不够用；drift>0 必须先修配置，此时判死逻辑对该 peer 失效。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 20,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 0,
+            "y": 0
+          },
+          "id": 145,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum(rate(transfer_owner_lost_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval]))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "owner 失联/s",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum(rate(transfer_jobs_ttl_expired_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval]))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "TTL 到期/s",
+              "refId": "B"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "max(transfer_peer_config_drift{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"})",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "配置漂移 peer 数",
+              "refId": "C"
+            }
+          ],
+          "title": "Transfer 所有权与 TTL",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：进入 Failed 终态的作业按原因分布。\n趋势：owner_lost 对应实例故障，ttl_expired 对应提交方给的寿命到期，其他原因需要看任务侧失败明细。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 20,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 0,
+            "y": 0
+          },
+          "id": 146,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "sum by (reason) (rate(transfer_jobs_failed_total{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"}[$__rate_interval]))",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "{{reason}}/s",
+              "refId": "A"
+            }
+          ],
+          "title": "Transfer 作业失败原因",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "含义：当前处于 Canceling 状态最久的作业已等待多少秒。\n趋势：持续上升说明 worker 迟迟不停（cancel RPC 丢失或任务卡住）；系统不会强制杀，只告警。",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 20,
+                "gradientMode": "opacity",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  }
+                ]
+              },
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 7,
+            "w": 8,
+            "x": 0,
+            "y": 0
+          },
+          "id": 147,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "exemplar": false,
+              "expr": "max(transfer_canceling_wait_seconds{appid=~\"$appid\",__DATABASE__=~\"$database\",__TOKEN__=~\"$token\",group=\"transfer\",instance=~\"$transfer_instance\"})",
+              "format": "time_series",
+              "instant": false,
+              "interval": "",
+              "legendFormat": "最长等待(s)",
+              "refId": "A"
+            }
+          ],
+          "title": "Transfer 取消等待时长",
+          "type": "timeseries"
         }
       ],
       "targets": [
@@ -11173,7 +14080,7 @@
       ],
       "title": "Transfer",
       "type": "row",
-      "description": "迁移调度、任务排队、对象存储和 Worker 执行耗时。"
+      "description": "含义：Transfer 迁移服务的容量与派发行为——先是容量（在飞任务/字节、准入余量、拒绝原因），再是调度与存储侧信号。\n趋势：容量类面板放在最前面，因为迁移停滞最常见的原因是集群容量打满而不是服务故障。"
     }
   ],
   "refresh": "30s",
@@ -11417,7 +14324,7 @@
   "timezone": "browser",
   "title": "Curvine 运维总览",
   "uid": "curvine-overview",
-  "version": 1,
+  "version": 2,
   "weekStart": "",
   "description": "Curvine 集群运维总览。面板按关键态势、总览、主节点、工作节点、客户端、Transfer 分行。用顶部变量选择数据源、应用和实例。点击面板信息图标查看指标含义，以及曲线升降代表什么。Database 与 Token 是可选的采集路由标签，默认 .* 匹配全部已有标签；不要把真实令牌写回仓库。"
 }

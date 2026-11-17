@@ -92,6 +92,10 @@ pub struct TransferService<S> {
     store: Arc<S>,
     cache: Option<ClusterMetadataCache>,
     task_stale_timeout_ms: i64,
+    /// Defaults for submits that do not carry a TTL / run budget (CV-105 §3.4).
+    /// Taken from TransferConf so operators can change them without a code edit.
+    default_job_ttl_ms: i64,
+    default_job_max_runs: u32,
     report_dispatcher: Option<TransferReportDispatcher<S>>,
     /// job_key -> last auto-repair attempt time (ms).
     /// Cooldown is per-process / per-replica, not shared across transfer instances.
@@ -110,6 +114,8 @@ impl<S> Clone for TransferService<S> {
             store: self.store.clone(),
             cache: self.cache.clone(),
             task_stale_timeout_ms: self.task_stale_timeout_ms,
+            default_job_ttl_ms: self.default_job_ttl_ms,
+            default_job_max_runs: self.default_job_max_runs,
             report_dispatcher: self.report_dispatcher.clone(),
             auto_repair_last_attempt_ms: self.auto_repair_last_attempt_ms.clone(),
             task_cache: self.task_cache.clone(),
@@ -128,6 +134,8 @@ where
             cache: None,
             task_stale_timeout_ms: 60_000,
             report_dispatcher: None,
+            default_job_ttl_ms: 86_400_000,
+            default_job_max_runs: curvine_config::TransferConf::DEFAULT_JOB_MAX_RUNS,
             auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
             task_cache: None,
             runtime_config: None,
@@ -141,6 +149,8 @@ where
             task_stale_timeout_ms: i64::try_from(task_stale_timeout.as_millis())
                 .unwrap_or(i64::MAX),
             report_dispatcher: None,
+            default_job_ttl_ms: 86_400_000,
+            default_job_max_runs: curvine_config::TransferConf::DEFAULT_JOB_MAX_RUNS,
             auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
             task_cache: None,
             runtime_config: None,
@@ -159,6 +169,8 @@ where
             store: store.clone(),
             cache: None,
             task_stale_timeout_ms,
+            default_job_ttl_ms: 86_400_000,
+            default_job_max_runs: curvine_config::TransferConf::DEFAULT_JOB_MAX_RUNS,
             report_dispatcher: Some(TransferReportDispatcher::new(
                 store,
                 task_stale_timeout_ms,
@@ -182,6 +194,8 @@ where
             task_stale_timeout_ms: i64::try_from(task_stale_timeout.as_millis())
                 .unwrap_or(i64::MAX),
             report_dispatcher: None,
+            default_job_ttl_ms: 86_400_000,
+            default_job_max_runs: curvine_config::TransferConf::DEFAULT_JOB_MAX_RUNS,
             auto_repair_last_attempt_ms: Arc::new(Mutex::new(HashMap::new())),
             task_cache: None,
             runtime_config: None,
@@ -201,6 +215,8 @@ where
             store: store.clone(),
             cache: Some(cache),
             task_stale_timeout_ms,
+            default_job_ttl_ms: 86_400_000,
+            default_job_max_runs: curvine_config::TransferConf::DEFAULT_JOB_MAX_RUNS,
             report_dispatcher: Some(TransferReportDispatcher::new(
                 store,
                 task_stale_timeout_ms,
@@ -311,6 +327,22 @@ where
             mount_snapshot_attempts: 0,
             planning_attempts: 0,
             takeover_count: 0,
+            // Deadline is fixed at submit and never extended, not even by a
+            // re-plan: an upstream that asked for a one-day job gets one day.
+            expires_at: {
+                let ttl_ms = req.ttl_ms.unwrap_or(0);
+                let ttl_ms = if ttl_ms > 0 {
+                    ttl_ms
+                } else {
+                    self.default_job_ttl_ms
+                };
+                now_ms.saturating_add(ttl_ms)
+            },
+            cancel_reason: String::new(),
+            max_runs: match req.max_runs.unwrap_or(0) {
+                0 => self.default_job_max_runs,
+                runs => runs,
+            },
             placement_addr: placement_addr.clone().unwrap_or_default(),
             owner_addr: String::new(),
             terminal_summary: None,
@@ -318,7 +350,7 @@ where
             cv_metadata_epoch: None,
             state: TransferState::Pending,
             owner: String::new(),
-            lease_epoch: 0,
+            fence: 0,
             lease_expire_at: 0,
             cancel_requested: false,
             summary: TransferProgress {
@@ -491,6 +523,13 @@ where
         }
     }
 
+    /// Defaults for submits without a TTL / run budget, from `TransferConf`.
+    pub fn with_job_defaults(mut self, ttl_ms: i64, max_runs: u32) -> Self {
+        self.default_job_ttl_ms = ttl_ms.max(1);
+        self.default_job_max_runs = max_runs.max(1);
+        self
+    }
+
     /// Attaches the process-wide file-level task cache. Without it every task
     /// read/write goes to the store (the pre-cache behavior).
     pub fn with_task_cache(mut self, task_cache: Arc<TaskCache>) -> Self {
@@ -642,6 +681,8 @@ where
         // Nested auto-repair must stay off: retry already opens a fresh request_id run.
         self.submit_transfer_inner(
             SubmitTransferRequest {
+                ttl_ms: None,
+                max_runs: None,
                 kind: command.kind as i32,
                 source_path: command.source_path.clone(),
                 target_path: command.target_path.clone(),
@@ -1946,8 +1987,8 @@ pub fn job_to_proto(job: TransferJobRecord) -> TransferJobStatusProto {
         created_at: job.created_at,
         updated_at: job.updated_at,
         owner: Some(job.owner),
-        lease_epoch: Some(job.lease_epoch),
-        lease_expire_at: Some(job.lease_expire_at),
+        fence: Some(job.fence),
+        expires_at: Some(job.expires_at),
         cv_metadata_epoch: job.cv_metadata_epoch,
         takeover_count: Some(job.takeover_count),
         placement_addr: Some(job.placement_addr),
@@ -2056,9 +2097,12 @@ mod tests {
             cv_metadata_epoch: None,
             state: TransferState::Completed,
             owner: String::new(),
-            lease_epoch: 0,
+            fence: 0,
             lease_expire_at: 0,
+            expires_at: 0,
             cancel_requested: false,
+            cancel_reason: String::new(),
+            max_runs: TransferJobRecord::DEFAULT_MAX_RUNS,
             summary: TransferProgress::default(),
             client_request_id: command.client_request_id.clone(),
             submitter: command.submitter.clone(),

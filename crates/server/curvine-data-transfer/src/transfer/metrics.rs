@@ -25,6 +25,18 @@ use std::time::Instant;
 
 static TRANSFER_METRICS: OnceCell<TransferMetrics> = OnceCell::new();
 
+/// Decrements without ever publishing a negative count.
+///
+/// A task's life spans planning, dispatch, retries, takeovers and restarts, and
+/// each process observes only part of it, so a missed increment has to show up
+/// as drift towards zero instead of as `-302` on a dashboard.
+pub(crate) fn dec_floor(gauge: &Gauge) {
+    let current = gauge.get();
+    if current > 0 {
+        gauge.set(current - 1);
+    }
+}
+
 pub struct TransferMetrics {
     submit_total: CounterVec,
     report_total: CounterVec,
@@ -49,6 +61,7 @@ pub struct TransferMetrics {
     cleanup_purged_total: Counter,
     cleanup_purged_tasks_total: Counter,
     group_resume_loaded_bytes_total: Counter,
+    scheduler_tick_total: Counter,
     acquire_total: CounterVec,
     planning_total: CounterVec,
     dispatch_total: CounterVec,
@@ -76,6 +89,13 @@ pub struct TransferMetrics {
     cluster_snapshot_capable_workers: Gauge,
     cluster_snapshot_refresh_total: CounterVec,
     cluster_snapshot_refresh_duration_us: HistogramVec,
+    owner_lost_total: Counter,
+    jobs_failed_total: CounterVec,
+    jobs_ttl_expired_total: Counter,
+    peer_config_drift: Gauge,
+    canceling_wait_seconds: Gauge,
+    dispatch_capacity_mismatch: Gauge,
+    dispatch_task_estimate_bytes: Gauge,
 }
 
 impl TransferMetrics {
@@ -225,6 +245,11 @@ impl TransferMetrics {
             group_resume_loaded_bytes_total: m::new_counter(
                 "transfer_group_resume_loaded_bytes",
                 "Total persisted complete-segment prefix bytes reused by group retries",
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            scheduler_tick_total: m::new_counter(
+                "transfer_scheduler_tick_total",
+                "Scheduler ticks completed (a stalled scheduler stops increasing)",
             )
             .map_err(|err| FsError::common(err.to_string()))?,
             acquire_total: m::new_counter_vec(
@@ -409,6 +434,37 @@ impl TransferMetrics {
                 &["result"],
             )
             .map_err(|err| FsError::common(err.to_string()))?,
+            owner_lost_total: m::new_counter(
+                "transfer_owner_lost_total",
+                "Jobs judged owner-lost and moved into Canceling",
+            )?,
+            jobs_failed_total: m::new_counter_vec(
+                "transfer_jobs_failed_total",
+                "Jobs that ended Failed, by reason",
+                &["reason"],
+            )?,
+            jobs_ttl_expired_total: m::new_counter(
+                "transfer_jobs_ttl_expired_total",
+                "Jobs canceled because their submit-time deadline passed",
+            )?,
+            peer_config_drift: m::new_gauge(
+                "transfer_peer_config_drift",
+                "Peers excluded from ownership judgement because their endpoints differ from ours",
+            )?,
+            canceling_wait_seconds: m::new_gauge(
+                "transfer_canceling_wait_seconds",
+                "How long the longest cancelling job has been waiting for its tasks to stop",
+            )?,
+            dispatch_capacity_mismatch: m::new_gauge(
+                "transfer_dispatch_capacity_mismatch",
+                "1 when the per-worker count ceiling cannot be reached inside the byte ceiling",
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            dispatch_task_estimate_bytes: m::new_gauge(
+                "transfer_dispatch_task_estimate_bytes",
+                "Largest task size the scheduler has estimated since start (capacity check input)",
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
             cluster_snapshot_refresh_duration_us: m::new_histogram_vec_with_buckets(
                 "transfer_cluster_snapshot_refresh_duration_us",
                 "Transfer cluster metadata snapshot refresh latency in microseconds",
@@ -526,20 +582,20 @@ impl TransferMetrics {
         self.tasks_canceled.set(counts.canceled as i64);
     }
 
-    /// Incremental task-state accounting between hourly full-scan
-    /// calibrations (set_task_counts). Cancel/purge drift is corrected by
-    /// the next calibration; gauges are approximate observability.
+    /// Incremental task-state accounting between full-scan calibrations
+    /// (set_task_counts). Cancel/purge drift is corrected by the next
+    /// calibration; gauges are approximate observability.
     pub fn task_planned(&self, count: usize) {
         self.tasks_pending.add(count as i64);
     }
 
     pub fn task_assigned(&self) {
-        self.tasks_pending.dec();
+        dec_floor(&self.tasks_pending);
         self.tasks_running.inc();
     }
 
     pub fn task_terminal(&self, state: TransferTaskState) {
-        self.tasks_running.dec();
+        dec_floor(&self.tasks_running);
         match state {
             TransferTaskState::Completed => self.tasks_completed.inc(),
             TransferTaskState::Failed => self.tasks_failed.inc(),
@@ -548,21 +604,30 @@ impl TransferMetrics {
         }
     }
 
+    /// Failed→Pending redelivery inside the retry budget. Without this pair the
+    /// next dispatch debits `pending` for a task that was never credited back.
+    pub fn task_retried(&self, count: usize) {
+        for _ in 0..count {
+            dec_floor(&self.tasks_failed);
+        }
+        self.tasks_pending.add(count as i64);
+    }
+
     /// Running→Stale (probe marked a missing attempt).
     pub fn task_staled(&self) {
-        self.tasks_running.dec();
+        dec_floor(&self.tasks_running);
         self.tasks_stale.inc();
     }
 
     /// Stale→Pending (redelivered after backoff).
     pub fn task_stale_requeued(&self) {
-        self.tasks_stale.dec();
+        dec_floor(&self.tasks_stale);
         self.tasks_pending.inc();
     }
 
     /// Stale→Failed (retry budget exhausted).
     pub fn task_stale_exhausted(&self) {
-        self.tasks_stale.dec();
+        dec_floor(&self.tasks_stale);
         self.tasks_failed.inc();
     }
 
@@ -582,6 +647,12 @@ impl TransferMetrics {
         if resume_bytes > 0 {
             self.group_resume_loaded_bytes_total.inc_by(resume_bytes);
         }
+    }
+
+    /// One scheduler tick finished. `rate()` dropping to zero while jobs are
+    /// pending is the signature of a stalled scheduler.
+    pub fn inc_scheduler_tick(&self) {
+        self.scheduler_tick_total.inc();
     }
 
     pub fn inc_acquire(&self, result: &str) {
@@ -633,6 +704,31 @@ impl TransferMetrics {
     /// Task requeues to Pending by reason (capacity / stale / other).
     pub fn inc_requeue(&self, reason: &str) {
         self.requeue_total.with_label_values(&[reason]).inc();
+    }
+
+    /// One job crossed into Canceling because its owner was declared dead.
+    pub fn inc_owner_lost(&self) {
+        self.owner_lost_total.inc();
+    }
+
+    /// One job reached the Failed terminal state, by reason.
+    pub fn inc_job_failed(&self, reason: &str) {
+        self.jobs_failed_total.with_label_values(&[reason]).inc();
+    }
+
+    /// One job was canceled because its submit-time deadline passed.
+    pub fn inc_ttl_expired(&self) {
+        self.jobs_ttl_expired_total.inc();
+    }
+
+    /// How many peers are currently excluded from ownership judgement.
+    pub fn set_peer_config_drift(&self, peers: usize) {
+        self.peer_config_drift.set(peers as i64);
+    }
+
+    /// Longest current wait in the Canceling state, in seconds.
+    pub fn set_canceling_wait_seconds(&self, seconds: i64) {
+        self.canceling_wait_seconds.set(seconds.max(0));
     }
 
     pub fn inc_completed_bytes(&self, state: &str, bytes: i64) {
@@ -732,6 +828,17 @@ impl TransferMetrics {
         self.set_cluster_snapshot(version, updated_at_ms, live_workers, capable_workers);
     }
 
+    /// Reports whether the two dispatch ceilings can both be binding.
+    ///
+    /// `count_ceiling x task_bytes > byte_ceiling` means the byte gate closes
+    /// long before the count gate does, so the count knob silently stops
+    /// meaning anything (production: 100 tasks x 128 MiB-1.5 GiB against a
+    /// 10 GiB budget => ~7 real slots).
+    pub fn set_dispatch_capacity(&self, mismatch: bool, task_bytes: i64) {
+        self.dispatch_capacity_mismatch.set(i64::from(mismatch));
+        self.dispatch_task_estimate_bytes.set(task_bytes);
+    }
+
     pub fn set_cluster_snapshot(
         &self,
         version: Option<u64>,
@@ -774,5 +881,23 @@ pub(crate) fn record_master_rpc(
 impl Debug for TransferMetrics {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "TransferMetrics")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dec_floor;
+    use curvine_metrics::Metrics as m;
+
+    #[test]
+    fn decrements_never_publish_a_negative_count() {
+        let gauge = m::new_gauge("test_task_gauge_floor", "decrement floor").unwrap();
+        dec_floor(&gauge);
+        assert_eq!(gauge.get(), 0, "an empty gauge must stay at zero");
+        gauge.set(2);
+        dec_floor(&gauge);
+        dec_floor(&gauge);
+        dec_floor(&gauge);
+        assert_eq!(gauge.get(), 0, "more decrements than increments must not go negative");
     }
 }

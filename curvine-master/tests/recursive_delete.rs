@@ -152,6 +152,8 @@ fn recursive_delete_collects_nonempty_blocks_before_detaching_tree() {
             worker.transfer_capabilities,
             worker.transfer_inflight_budget_bytes,
             worker.worker_max_concurrent_tasks,
+            worker.transfer_inflight_tasks,
+            worker.transfer_inflight_bytes,
             worker.software_version,
             worker.startup_time_ms,
             vec![],

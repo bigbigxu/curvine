@@ -292,6 +292,17 @@ impl ClusterMetadataCache {
         })
     }
 
+    /// Live workers together with the snapshot version they came from.
+    ///
+    /// Dispatch needs both: the workers for the decision and the version so the
+    /// in-flight ledger can tell a newer snapshot from the one it already
+    /// applied (a stale or repeated refresh must not reset local accounting).
+    pub fn live_workers_versioned(&self) -> FsResult<(u64, Vec<WorkerInfo>)> {
+        let snapshot = self.snapshot();
+        self.check_snapshot_fresh(&snapshot)?;
+        Ok((snapshot.version, snapshot.workers.clone()))
+    }
+
     pub fn live_workers(&self) -> FsResult<Vec<WorkerInfo>> {
         let snapshot = self.snapshot();
         self.check_snapshot_fresh(&snapshot)?;

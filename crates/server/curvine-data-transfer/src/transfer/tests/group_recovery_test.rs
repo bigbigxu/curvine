@@ -31,9 +31,12 @@ fn job(job_id: &str) -> TransferJobRecord {
         cv_metadata_epoch: None,
         state: TransferState::Pending,
         owner: String::new(),
-        lease_epoch: 0,
+        fence: 0,
         lease_expire_at: 0,
         cancel_requested: false,
+        expires_at: 0,
+        cancel_reason: String::new(),
+        max_runs: TransferJobRecord::DEFAULT_MAX_RUNS,
         summary: TransferProgress::default(),
         client_request_id: format!("request-{job_id}"),
         submitter: "test".to_string(),
@@ -83,7 +86,7 @@ fn planned_store<S: TransferStore>(
         .create_or_get_by_request_id_checked(job.clone())
         .unwrap();
     let lease = store
-        .acquire_runnable_transfer("owner", 60_000, 1, 8, false)
+        .claim_next_job("owner", 1, 8, false, 0, "")
         .unwrap()
         .unwrap();
     store
@@ -91,7 +94,7 @@ fn planned_store<S: TransferStore>(
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease.owner.clone(),
-            lease_epoch: lease.lease_epoch,
+            fence: lease.fence,
             tasks: totals
                 .iter()
                 .enumerate()
@@ -111,7 +114,7 @@ fn start(store: &impl TransferStore, job: &TransferJobRecord, task_id: &str, res
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease.owner.clone(),
-            lease_epoch: lease.lease_epoch,
+            fence: lease.fence,
             task_id: task_id.to_string(),
             attempt_id: 1,
             worker_id: 7,
@@ -159,7 +162,7 @@ fn terminalize(store: &impl TransferStore, job: &TransferJobRecord) {
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease.owner.clone(),
-            lease_epoch: lease.lease_epoch,
+            fence: lease.fence,
             from_states: vec![
                 TransferState::Planning,
                 TransferState::Dispatching,

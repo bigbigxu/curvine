@@ -94,6 +94,7 @@ export const TRANSFER_KNOBS = [
   { key: 'accept_jobs', kind: 'boolean' },
   { key: 'max_running_transfers', kind: 'number' },
   { key: 'worker_max_concurrent_tasks', kind: 'number' },
+  { key: 'worker_inflight_budget_bytes', kind: 'bytes' },
   { key: 'max_tasks_per_transfer', kind: 'number' },
   { key: 'max_plan_entries', kind: 'number' }
 ] as const

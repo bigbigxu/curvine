@@ -105,6 +105,11 @@ message WorkerHeartbeatRequest {
     // Runtime concurrency ceiling. Legacy workers omit it; the master
     // preserves absence as the configured scheduler limit.
     optional int64 worker_max_concurrent_tasks = 22;
+    // Live transfer load: tasks admitted (queued or running) and their bytes.
+    // This is the capacity signal the scheduler dispatches against; absence
+    // means a legacy worker whose load is unknown (treated as zero).
+    optional int64 transfer_inflight_tasks = 23;
+    optional int64 transfer_inflight_bytes = 24;
 
     // Structured version/protocol metadata reported by the worker on the
     // reserved 1000+ cross-cutting range. Legacy workers omit this field and

@@ -32,7 +32,6 @@ use crate::transfer::{
     MemoryTransferStore, TransferMetrics, TransferMountSnapshotUpdate, TransferPlannedTasks,
     TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate,
 };
-use curvine_model::WorkerInflight;
 
 pub enum TransferStoreBackend {
     Memory(MemoryTransferStore),
@@ -424,74 +423,100 @@ impl TransferStore for TransferStoreBackend {
         })
     }
 
-    fn acquire_runnable_transfer(
+    fn list_active_owned_jobs(&self, limit: usize) -> FsResult<Vec<(String, u64, String)>> {
+        self.record_store_operation("list_active_owned_jobs", || match self {
+            Self::Memory(store) => store.list_active_owned_jobs(limit),
+            Self::Sqlite(store) => store.list_active_owned_jobs(limit),
+            Self::Mysql(store) => store.list_active_owned_jobs(limit),
+            Self::Postgres(store) => store.list_active_owned_jobs(limit),
+        })
+    }
+
+    fn list_expired_jobs(&self, now_ms: i64, limit: usize) -> FsResult<Vec<(String, u64)>> {
+        self.record_store_operation("list_expired_jobs", || match self {
+            Self::Memory(store) => store.list_expired_jobs(now_ms, limit),
+            Self::Sqlite(store) => store.list_expired_jobs(now_ms, limit),
+            Self::Mysql(store) => store.list_expired_jobs(now_ms, limit),
+            Self::Postgres(store) => store.list_expired_jobs(now_ms, limit),
+        })
+    }
+
+    fn claim_next_job(
         &self,
         owner: &str,
-        lease_ms: i64,
         now_ms: i64,
         max_executing_transfers: u64,
         prefer_pending: bool,
+        lease_ms: i64,
+        after_job_id: &str,
     ) -> FsResult<Option<TransferLease>> {
-        self.record_store_operation("acquire_runnable_transfer", || match self {
-            Self::Memory(store) => store.acquire_runnable_transfer(
+        self.record_store_operation("claim_next_job", || match self {
+            Self::Memory(store) => store.claim_next_job(
                 owner,
-                lease_ms,
                 now_ms,
                 max_executing_transfers,
                 prefer_pending,
+                lease_ms,
+                after_job_id,
             ),
-            #[cfg(feature = "transfer-store-sqlite")]
-            Self::Sqlite(store) => store.acquire_runnable_transfer(
+            Self::Sqlite(store) => store.claim_next_job(
                 owner,
-                lease_ms,
                 now_ms,
                 max_executing_transfers,
                 prefer_pending,
+                lease_ms,
+                after_job_id,
             ),
-            #[cfg(feature = "transfer-store-mysql")]
-            Self::Mysql(store) => store.acquire_runnable_transfer(
+            Self::Mysql(store) => store.claim_next_job(
                 owner,
-                lease_ms,
                 now_ms,
                 max_executing_transfers,
                 prefer_pending,
+                lease_ms,
+                after_job_id,
             ),
-            #[cfg(feature = "transfer-store-postgres")]
-            Self::Postgres(store) => store.acquire_runnable_transfer(
+            Self::Postgres(store) => store.claim_next_job(
                 owner,
-                lease_ms,
                 now_ms,
                 max_executing_transfers,
                 prefer_pending,
+                lease_ms,
+                after_job_id,
             ),
         })
     }
 
-    fn renew_lease(
+    fn mark_canceling(
         &self,
         job_id: &str,
         run_id: u64,
         owner: &str,
-        lease_epoch: u64,
-        lease_ms: i64,
+        reason: &str,
         now_ms: i64,
     ) -> FsResult<bool> {
-        self.record_store_operation("renew_lease", || match self {
-            Self::Memory(store) => {
-                store.renew_lease(job_id, run_id, owner, lease_epoch, lease_ms, now_ms)
-            }
-            #[cfg(feature = "transfer-store-sqlite")]
-            Self::Sqlite(store) => {
-                store.renew_lease(job_id, run_id, owner, lease_epoch, lease_ms, now_ms)
-            }
-            #[cfg(feature = "transfer-store-mysql")]
-            Self::Mysql(store) => {
-                store.renew_lease(job_id, run_id, owner, lease_epoch, lease_ms, now_ms)
-            }
-            #[cfg(feature = "transfer-store-postgres")]
-            Self::Postgres(store) => {
-                store.renew_lease(job_id, run_id, owner, lease_epoch, lease_ms, now_ms)
-            }
+        self.record_store_operation("mark_canceling", || match self {
+            Self::Memory(store) => store.mark_canceling(job_id, run_id, owner, reason, now_ms),
+            Self::Sqlite(store) => store.mark_canceling(job_id, run_id, owner, reason, now_ms),
+            Self::Mysql(store) => store.mark_canceling(job_id, run_id, owner, reason, now_ms),
+            Self::Postgres(store) => store.mark_canceling(job_id, run_id, owner, reason, now_ms),
+        })
+    }
+
+    fn revive_run(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool> {
+        self.record_store_operation("revive_run", || match self {
+            Self::Memory(store) => store.revive_run(job_id, run_id, now_ms),
+            Self::Sqlite(store) => store.revive_run(job_id, run_id, now_ms),
+            Self::Mysql(store) => store.revive_run(job_id, run_id, now_ms),
+            Self::Postgres(store) => store.revive_run(job_id, run_id, now_ms),
+        })
+    }
+
+    fn fail_job(&self, job_id: &str, run_id: u64, reason: &str, now_ms: i64) -> FsResult<bool> {
+        self.record_store_operation("fail_job", || match self {
+            Self::Memory(store) => store.fail_job(job_id, run_id, reason, now_ms),
+            Self::Sqlite(store) => store.fail_job(job_id, run_id, reason, now_ms),
+            Self::Mysql(store) => store.fail_job(job_id, run_id, reason, now_ms),
+            Self::Postgres(store) => store.fail_job(job_id, run_id, reason, now_ms),
         })
     }
 
@@ -542,7 +567,7 @@ impl TransferStore for TransferStoreBackend {
         job_id: &str,
         run_id: u64,
         owner: &str,
-        lease_epoch: u64,
+        fence: u64,
         cv_metadata_epoch: u64,
         now_ms: i64,
     ) -> FsResult<bool> {
@@ -551,7 +576,7 @@ impl TransferStore for TransferStoreBackend {
                 job_id,
                 run_id,
                 owner,
-                lease_epoch,
+                fence,
                 cv_metadata_epoch,
                 now_ms,
             ),
@@ -560,7 +585,7 @@ impl TransferStore for TransferStoreBackend {
                 job_id,
                 run_id,
                 owner,
-                lease_epoch,
+                fence,
                 cv_metadata_epoch,
                 now_ms,
             ),
@@ -569,7 +594,7 @@ impl TransferStore for TransferStoreBackend {
                 job_id,
                 run_id,
                 owner,
-                lease_epoch,
+                fence,
                 cv_metadata_epoch,
                 now_ms,
             ),
@@ -578,7 +603,7 @@ impl TransferStore for TransferStoreBackend {
                 job_id,
                 run_id,
                 owner,
-                lease_epoch,
+                fence,
                 cv_metadata_epoch,
                 now_ms,
             ),
@@ -674,42 +699,30 @@ impl TransferStore for TransferStoreBackend {
         })
     }
 
-    fn select_inflight_by_worker(&self) -> FsResult<Vec<WorkerInflight>> {
-        self.record_store_operation("select_inflight_by_worker", || match self {
-            Self::Memory(store) => store.select_inflight_by_worker(),
-            #[cfg(feature = "transfer-store-sqlite")]
-            Self::Sqlite(store) => store.select_inflight_by_worker(),
-            #[cfg(feature = "transfer-store-mysql")]
-            Self::Mysql(store) => store.select_inflight_by_worker(),
-            #[cfg(feature = "transfer-store-postgres")]
-            Self::Postgres(store) => store.select_inflight_by_worker(),
-        })
-    }
-
     fn mark_stale_attempts(
         &self,
         job_id: &str,
         run_id: u64,
         owner: &str,
-        lease_epoch: u64,
+        fence: u64,
         now_ms: i64,
         candidates: Vec<TransferTaskRecord>,
     ) -> FsResult<Vec<StaleTaskAttempt>> {
         self.record_store_operation("mark_stale_attempts", || match self {
             Self::Memory(store) => {
-                store.mark_stale_attempts(job_id, run_id, owner, lease_epoch, now_ms, candidates)
+                store.mark_stale_attempts(job_id, run_id, owner, fence, now_ms, candidates)
             }
             #[cfg(feature = "transfer-store-sqlite")]
             Self::Sqlite(store) => {
-                store.mark_stale_attempts(job_id, run_id, owner, lease_epoch, now_ms, candidates)
+                store.mark_stale_attempts(job_id, run_id, owner, fence, now_ms, candidates)
             }
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => {
-                store.mark_stale_attempts(job_id, run_id, owner, lease_epoch, now_ms, candidates)
+                store.mark_stale_attempts(job_id, run_id, owner, fence, now_ms, candidates)
             }
             #[cfg(feature = "transfer-store-postgres")]
             Self::Postgres(store) => {
-                store.mark_stale_attempts(job_id, run_id, owner, lease_epoch, now_ms, candidates)
+                store.mark_stale_attempts(job_id, run_id, owner, fence, now_ms, candidates)
             }
         })
     }
@@ -978,9 +991,12 @@ mod tests {
             cv_metadata_epoch: None,
             state: TransferState::Pending,
             owner: String::new(),
-            lease_epoch: 0,
+            fence: 0,
             lease_expire_at: 0,
             cancel_requested: false,
+            expires_at: 0,
+            cancel_reason: String::new(),
+            max_runs: TransferJobRecord::DEFAULT_MAX_RUNS,
             summary: TransferProgress::default(),
             client_request_id: format!("req-{job_id}"),
             submitter: "test".to_string(),

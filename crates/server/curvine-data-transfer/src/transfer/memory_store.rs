@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use curvine_error::FsError;
 use curvine_error::FsResult;
@@ -21,7 +21,7 @@ use curvine_model::{
     TransferCountFilter, TransferJobRecord, TransferLease, TransferListFilter, TransferProgress,
     TransferState, TransferStateCounts, TransferStateUpdate, TransferTaskCounts,
     TransferTaskRecord, TransferTaskReport, TransferTaskState, TransferTaskStatus,
-    TransferTenantSummary, WorkerInflight,
+    TransferTenantSummary,
 };
 use parking_lot::Mutex;
 
@@ -30,33 +30,6 @@ use crate::transfer::{
     TransferRequeueUpdate, TransferStore, TransferTaskStateUpdate, MAX_JOBS_PER_STORE_TRANSACTION,
     MAX_TASKS_PER_STORE_TRANSACTION,
 };
-
-fn running_job_needs_scheduler(
-    state: &MemoryTransferState,
-    job: &TransferJobRecord,
-    now_ms: i64,
-) -> bool {
-    let mut has_running = false;
-    for task in state
-        .tasks
-        .values()
-        .filter(|task| task.job_id == job.job_id && task.run_id == job.run_id)
-    {
-        match task.state {
-            TransferTaskState::Pending | TransferTaskState::Stale | TransferTaskState::Failed => {
-                return true;
-            }
-            TransferTaskState::Running => {
-                if task.stale_deadline_at < now_ms {
-                    return true;
-                }
-                has_running = true;
-            }
-            TransferTaskState::Completed | TransferTaskState::Canceled => {}
-        }
-    }
-    !has_running
-}
 
 #[derive(Default)]
 pub struct MemoryTransferStore {
@@ -81,6 +54,17 @@ impl MemoryTransferStore {
         if let Some(job) = self.inner.lock().jobs.get_mut(job_id) {
             job.state = state;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_expires_at_for_test(&self, job_id: &str, expires_at: i64) -> FsResult<()> {
+        let mut inner = self.inner.lock();
+        let job = inner
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| curvine_error::FsError::job_not_found(job_id))?;
+        job.expires_at = expires_at;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -543,190 +527,241 @@ impl TransferStore for MemoryTransferStore {
         Ok(true)
     }
 
-    fn acquire_runnable_transfer(
+    fn list_active_owned_jobs(&self, limit: usize) -> FsResult<Vec<(String, u64, String)>> {
+        let inner = self.inner.lock();
+        let mut rows: Vec<(i64, String, u64, String)> = inner
+            .jobs
+            .values()
+            .filter(|job| {
+                !job.owner.is_empty()
+                    && matches!(
+                        job.state,
+                        TransferState::Planning
+                            | TransferState::Dispatching
+                            | TransferState::Running
+                            | TransferState::Canceling
+                    )
+            })
+            .map(|job| (job.updated_at, job.job_id.clone(), job.run_id, job.owner.clone()))
+            .collect();
+        rows.sort();
+        rows.truncate(limit.max(1));
+        Ok(rows
+            .into_iter()
+            .map(|(_, job_id, run_id, owner)| (job_id, run_id, owner))
+            .collect())
+    }
+
+    fn list_expired_jobs(&self, now_ms: i64, limit: usize) -> FsResult<Vec<(String, u64)>> {
+        let inner = self.inner.lock();
+        let mut rows: Vec<(i64, String, u64)> = inner
+            .jobs
+            .values()
+            .filter(|job| {
+                job.expires_at > 0
+                    && job.expires_at <= now_ms
+                    && !job.state.is_terminal()
+                    && job.state != TransferState::Canceling
+            })
+            .map(|job| (job.expires_at, job.job_id.clone(), job.run_id))
+            .collect();
+        rows.sort();
+        rows.truncate(limit.max(1));
+        Ok(rows.into_iter().map(|(_, id, run)| (id, run)).collect())
+    }
+
+    fn claim_next_job(
         &self,
         owner: &str,
-        lease_ms: i64,
         now_ms: i64,
         max_executing_transfers: u64,
         prefer_pending: bool,
+        _lease_ms: i64,
+        after_job_id: &str,
     ) -> FsResult<Option<TransferLease>> {
         let mut inner = self.inner.lock();
-        let running_check_interval_ms =
-            crate::transfer::running_transfer_check_interval_ms(lease_ms);
-        let running_event_lease_before_ms =
-            now_ms.saturating_add(lease_ms.saturating_sub(running_check_interval_ms));
-        let running_renew_lease_before_ms = now_ms.saturating_add(lease_ms / 2);
-        let candidate_id = if !prefer_pending {
-            inner
+        // 1) Re-tick a job this owner already holds. There is no lease to renew:
+        // owning the job is the only requirement, and `updated_at` is bumped so
+        // the next tick round-robins to a different job.
+        if !prefer_pending {
+            let mine = inner
                 .jobs
                 .values()
                 .filter(|job| {
+                    job.job_id.as_str() > after_job_id
+                        && {
+                    // Only re-tick a job this instance still has work for:
+                    // cancellation, or tasks waiting to be dispatched. Owning a
+                    // job is not by itself a reason to hand it back, or every
+                    // later claim would starve the Pending queue behind it.
                     job.owner == owner
-                        && job.lease_expire_at > now_ms
-                        && ((job.state == TransferState::Canceling && job.updated_at < now_ms)
-                            || (job.state == TransferState::Running
-                                && (job.lease_expire_at <= running_renew_lease_before_ms
-                                    || (job.lease_expire_at <= running_event_lease_before_ms
-                                        && running_job_needs_scheduler(&inner, job, now_ms)))))
+                        && (job.state == TransferState::Canceling
+                            || (matches!(
+                                job.state,
+                                TransferState::Dispatching | TransferState::Running
+                            ) && inner.tasks.iter().any(|((task_job, task_run, _), task)| {
+                                *task_job == job.job_id
+                                    && *task_run == job.run_id
+                                    && matches!(
+                                        task.state,
+                                        TransferTaskState::Pending | TransferTaskState::Stale
+                                    )
+                            })))
+                        }
                 })
-                .min_by_key(|job| job.updated_at)
-                .map(|job| job.job_id.clone())
-        } else {
-            None
-        };
-        // Whether the candidate came from the renewal query (same owner) rather
-        // than from an expired lease belonging to someone else.
-        let mut renewal = candidate_id.is_some();
-        let candidate_id =
-            candidate_id
-                .or_else(|| {
-                    inner
-                        .jobs
-                        .values()
-                        .filter(|job| {
-                            job.state.is_runnable()
-                                && job.state != TransferState::Pending
-                                && job.lease_expire_at <= now_ms
-                        })
-                        .min_by_key(|job| job.updated_at)
-                        .map(|job| job.job_id.clone())
-                })
-                .or_else(|| {
-                    if !inner.jobs.values().any(|job| {
-                        job.state == TransferState::Pending && job.lease_expire_at <= now_ms
-                    }) {
-                        return None;
-                    }
-                    let executing = inner
-                        .jobs
-                        .values()
-                        .filter(|job| job.state.is_executing())
-                        .collect::<Vec<_>>();
-                    // Every executing job takes a slot; fs_mode jobs only skip
-                    // the target-overlap check, like in the SQL stores.
-                    if executing.len() as u64 >= max_executing_transfers {
-                        return None;
-                    }
-                    // This fallback branch never renews: the candidate is a
-                    // pending job, so a takeover counter bump cannot apply.
-                    renewal = false;
-                    let executing_targets = executing
-                        .iter()
-                        .filter(|job| !TransferCommand::is_fs_mode_submitter(&job.submitter))
-                        .map(|job| job.target_path.as_str())
-                        .collect::<Vec<_>>();
-                    let executing_tenants = inner
-                        .jobs
-                        .values()
-                        .filter(|job| job.state.is_executing())
-                        .map(|job| job.tenant.as_str())
-                        .collect::<HashSet<_>>();
-                    inner
-                        .jobs
-                        .values()
-                        .filter(|job| {
-                            job.state == TransferState::Pending
-                                && job.lease_expire_at <= now_ms
-                                && (TransferCommand::is_fs_mode_submitter(&job.submitter)
-                                    || !executing_targets.iter().any(|target_path| {
-                                        target_paths_conflict(&job.target_path, target_path)
-                                    }))
-                        })
-                        .min_by_key(|job| {
-                            let tenant_pressure =
-                                u64::from(executing_tenants.contains(job.tenant.as_str()));
-                            (tenant_pressure, job.updated_at, job.job_id.clone())
-                        })
-                        .map(|job| job.job_id.clone())
-                });
-        let Some(candidate_id) = candidate_id else {
-            return Ok(None);
-        };
-
-        let conflict = inner
-            .jobs
-            .get(&candidate_id)
-            .filter(|candidate| candidate.state != TransferState::Pending)
-            .and_then(|candidate| {
-                if TransferCommand::is_fs_mode_submitter(&candidate.submitter) {
-                    return None;
-                }
-                inner
-                    .jobs
-                    .values()
-                    .find(|existing| {
-                        existing.job_id != candidate.job_id
-                            && existing.state.is_executing()
-                            && !TransferCommand::is_fs_mode_submitter(&existing.submitter)
-                            && target_paths_conflict(&candidate.target_path, &existing.target_path)
-                    })
-                    .cloned()
-            });
-        if let Some(existing) = conflict {
-            let job = inner
+                .min_by_key(|job| (job.updated_at, job.job_id.clone()))
+                .map(|job| (job.job_id.clone(), job.run_id));
+            // Fair round-robin: only take my own job first when it is strictly
+            // older than the oldest Pending candidate. Without that, a job that
+            // keeps having work would starve the Pending queue forever, which is
+            // what the old lease window accidentally prevented.
+            let pending_first = inner
                 .jobs
-                .get_mut(&candidate_id)
-                .ok_or_else(|| FsError::job_not_found(&candidate_id))?;
-            job.state = TransferState::Failed;
-            job.summary.message = format!(
-                "target {} conflicts with active transfer {} target {}",
-                job.target_path, existing.job_id, existing.target_path
-            );
-            job.summary.update_time = now_ms;
-            job.updated_at = now_ms;
+                .values()
+                .filter(|job| job.state == TransferState::Pending)
+                .map(|job| (job.updated_at, job.job_id.clone()))
+                .min();
+            let take_mine = match (&mine, &pending_first) {
+                (Some(_), None) => true,
+                (Some(_), Some(_)) => {
+                    let mine_key = mine
+                        .as_ref()
+                        .and_then(|(job_id, _)| inner.jobs.get(job_id))
+                        .map(|job| (job.updated_at, job.job_id.clone()));
+                    match (mine_key, pending_first) {
+                        (Some(key), Some(first)) => key < first,
+                        _ => false,
+                    }
+                }
+                (None, _) => false,
+            };
+            if take_mine {
+                if let Some((job_id, run_id)) = mine {
+                    // Read-only re-tick (R1): the cursor is the caller's keyset.
+                    return Ok(Some(TransferLease {
+                        job_id,
+                        run_id,
+                        owner: owner.to_string(),
+                        // Fence token: the run generation the owner was granted.
+                        fence: run_id,
+                    }));
+                }
+            }
+        }
+        // 2) Claim a Pending job, bounded by this instance's executing ceiling.
+        let executing = inner
+            .jobs
+            .values()
+            .filter(|job| {
+                job.owner == owner
+                    && matches!(
+                        job.state,
+                        TransferState::Planning
+                            | TransferState::Dispatching
+                            | TransferState::Running
+                            | TransferState::Canceling
+                    )
+            })
+            .count() as u64;
+        if executing >= max_executing_transfers {
             return Ok(None);
         }
-
-        let Some(job) = inner.jobs.get_mut(&candidate_id) else {
+        let candidate = inner
+            .jobs
+            .values()
+            .filter(|job| job.state == TransferState::Pending)
+            .min_by_key(|job| (job.updated_at, job.job_id.clone()))
+            .map(|job| (job.job_id.clone(), job.run_id));
+        let Some((job_id, run_id)) = candidate else {
             return Ok(None);
         };
-        // A takeover is an expired lease on an executing job that this owner
-        // did not hold; renewals must not inflate the counter.
-        if !renewal && job.state.is_executing() && job.owner != owner {
-            job.takeover_count = job.takeover_count.saturating_add(1);
+        let Some(job) = inner.jobs.get_mut(&job_id) else {
+            return Ok(None);
+        };
+        if job.state != TransferState::Pending {
+            return Ok(None);
         }
-
-        if job.state == TransferState::Pending {
-            job.state = TransferState::Planning;
-            job.summary.message = "acquired for planning".to_string();
-            job.summary.update_time = now_ms;
-        }
+        job.state = TransferState::Planning;
         job.owner = owner.to_string();
-        job.lease_epoch = job.lease_epoch.saturating_add(1);
-        job.lease_expire_at = now_ms.saturating_add(lease_ms);
+        job.lease_expire_at = TransferJobRecord::LEASE_NEVER_EXPIRES;
+        job.summary.message = "acquired for planning".to_string();
+        job.summary.update_time = now_ms;
         job.updated_at = now_ms;
         Ok(Some(TransferLease {
-            job_id: job.job_id.clone(),
-            run_id: job.run_id,
-            owner: job.owner.clone(),
-            lease_epoch: job.lease_epoch,
+            job_id,
+            run_id,
+            owner: owner.to_string(),
+            fence: run_id,
         }))
     }
 
-    fn renew_lease(
+    fn mark_canceling(
         &self,
         job_id: &str,
         run_id: u64,
         owner: &str,
-        lease_epoch: u64,
-        lease_ms: i64,
+        reason: &str,
         now_ms: i64,
     ) -> FsResult<bool> {
         let mut inner = self.inner.lock();
         let Some(job) = inner.jobs.get_mut(job_id) else {
             return Ok(false);
         };
+        // Same fence as the SQL backends: a job already in Canceling is not
+        // moved again, so two instances sweeping the same owner produce exactly
+        // one transition.
         if job.run_id != run_id
-            || job.owner != owner
-            || job.lease_epoch != lease_epoch
-            || job.lease_expire_at <= now_ms
             || job.state.is_terminal()
+            || job.state == TransferState::Canceling
         {
             return Ok(false);
         }
+        job.state = TransferState::Canceling;
+        job.cancel_requested = reason == "user";
+        job.cancel_reason = reason.to_string();
+        if !owner.is_empty() {
+            job.owner = owner.to_string();
+        }
+        job.summary.message = format!("canceling: {}", reason);
+        job.summary.update_time = now_ms;
+        job.updated_at = now_ms;
+        Ok(true)
+    }
 
-        job.lease_expire_at = now_ms.saturating_add(lease_ms);
+    fn revive_run(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool> {
+        let mut inner = self.inner.lock();
+        let Some(job) = inner.jobs.get_mut(job_id) else {
+            return Ok(false);
+        };
+        if job.run_id != run_id || job.state.is_terminal() {
+            return Ok(false);
+        }
+        job.run_id = run_id.saturating_add(1);
+        job.state = TransferState::Pending;
+        job.owner.clear();
+        job.cancel_requested = false;
+        job.cancel_reason.clear();
+        job.summary = TransferProgress {
+            update_time: now_ms,
+            message: format!("re-planning run {}", job.run_id),
+            ..Default::default()
+        };
+        job.updated_at = now_ms;
+        Ok(true)
+    }
+
+    fn fail_job(&self, job_id: &str, run_id: u64, reason: &str, now_ms: i64) -> FsResult<bool> {
+        let mut inner = self.inner.lock();
+        let Some(job) = inner.jobs.get_mut(job_id) else {
+            return Ok(false);
+        };
+        if job.run_id != run_id || job.state.is_terminal() {
+            return Ok(false);
+        }
+        job.state = TransferState::Failed;
+        job.cancel_reason = reason.to_string();
+        job.summary.message = reason.to_string();
+        job.summary.update_time = now_ms;
         job.updated_at = now_ms;
         Ok(true)
     }
@@ -747,8 +782,6 @@ impl TransferStore for MemoryTransferStore {
         };
         if job.run_id != update.run_id
             || job.owner != update.owner
-            || job.lease_epoch != update.lease_epoch
-            || job.lease_expire_at <= update.now_ms
             || !update.from_states.contains(&job.state)
         {
             return Ok(false);
@@ -767,8 +800,6 @@ impl TransferStore for MemoryTransferStore {
         };
         if job.run_id != update.run_id
             || job.owner != update.owner
-            || job.lease_epoch != update.lease_epoch
-            || job.lease_expire_at <= update.now_ms
             || job.state != TransferState::Planning
         {
             return Ok(false);
@@ -794,7 +825,7 @@ impl TransferStore for MemoryTransferStore {
         job_id: &str,
         run_id: u64,
         owner: &str,
-        lease_epoch: u64,
+        _fence: u64,
         cv_metadata_epoch: u64,
         now_ms: i64,
     ) -> FsResult<bool> {
@@ -804,8 +835,6 @@ impl TransferStore for MemoryTransferStore {
         };
         if job.run_id != run_id
             || job.owner != owner
-            || job.lease_epoch != lease_epoch
-            || job.lease_expire_at <= now_ms
             || job.state.is_terminal()
         {
             return Ok(false);
@@ -829,8 +858,6 @@ impl TransferStore for MemoryTransferStore {
         };
         if job.run_id != update.run_id
             || job.owner != update.owner
-            || job.lease_epoch != update.lease_epoch
-            || job.lease_expire_at <= update.now_ms
             || job.state.is_terminal()
         {
             return Ok(false);
@@ -860,8 +887,6 @@ impl TransferStore for MemoryTransferStore {
         let valid_owner = inner.jobs.get(&update.job_id).is_some_and(|job| {
             job.run_id == update.run_id
                 && job.owner == update.owner
-                && job.lease_epoch == update.lease_epoch
-                && job.lease_expire_at > update.now_ms
                 && job.state == TransferState::Planning
         });
         if !valid_owner {
@@ -880,8 +905,6 @@ impl TransferStore for MemoryTransferStore {
         let valid_owner = inner.jobs.get(&update.job_id).is_some_and(|job| {
             job.run_id == update.run_id
                 && job.owner == update.owner
-                && job.lease_epoch == update.lease_epoch
-                && job.lease_expire_at > update.now_ms
                 && job.state == TransferState::Planning
         });
         if !valid_owner {
@@ -918,8 +941,6 @@ impl TransferStore for MemoryTransferStore {
         };
         if job.run_id != update.run_id
             || job.owner != update.owner
-            || job.lease_epoch != update.lease_epoch
-            || job.lease_expire_at <= update.now_ms
             || job.state.is_terminal()
         {
             return Ok(false);
@@ -959,41 +980,12 @@ impl TransferStore for MemoryTransferStore {
             .collect())
     }
 
-    fn select_inflight_by_worker(&self) -> FsResult<Vec<WorkerInflight>> {
-        let inner = self.inner.lock();
-        let mut by_worker: std::collections::BTreeMap<u32, WorkerInflight> = Default::default();
-        for task in inner.tasks.values() {
-            if task.state != TransferTaskState::Running {
-                continue;
-            }
-            let entry = by_worker
-                .entry(task.worker_id)
-                .or_insert_with(|| WorkerInflight {
-                    worker_id: task.worker_id,
-                    task_count: 0,
-                    estimated_bytes: 0,
-                    unknown_bytes_count: 0,
-                });
-            entry.task_count += 1;
-            let bytes = if task.estimated_size > 0 {
-                task.estimated_size
-            } else {
-                task.progress.total_size
-            };
-            if bytes <= 0 {
-                entry.unknown_bytes_count += 1;
-            }
-            entry.estimated_bytes += bytes;
-        }
-        Ok(by_worker.into_values().collect())
-    }
-
     fn mark_stale_attempts(
         &self,
         job_id: &str,
         run_id: u64,
         owner: &str,
-        lease_epoch: u64,
+        _fence: u64,
         now_ms: i64,
         candidates: Vec<TransferTaskRecord>,
     ) -> FsResult<Vec<StaleTaskAttempt>> {
@@ -1005,8 +997,6 @@ impl TransferStore for MemoryTransferStore {
         let owner_valid = inner.jobs.get(job_id).is_some_and(|job| {
             job.run_id == run_id
                 && job.owner == owner
-                && job.lease_epoch == lease_epoch
-                && job.lease_expire_at > now_ms
         });
         if !owner_valid {
             return Ok(Vec::new());
@@ -1131,8 +1121,6 @@ impl TransferStore for MemoryTransferStore {
         };
         if job.run_id != start.run_id
             || job.owner != start.owner
-            || job.lease_epoch != start.lease_epoch
-            || job.lease_expire_at <= start.now_ms
             || job.cancel_requested
             || job.state.is_terminal()
         {
@@ -1361,9 +1349,12 @@ mod tests {
             cv_metadata_epoch: None,
             state: TransferState::Pending,
             owner: String::new(),
-            lease_epoch: 0,
+            fence: 0,
             lease_expire_at: 0,
             cancel_requested: false,
+            expires_at: 0,
+            cancel_reason: String::new(),
+            max_runs: TransferJobRecord::DEFAULT_MAX_RUNS,
             summary: TransferProgress::default(),
             client_request_id: format!("req-{job_id}"),
             submitter: "test".to_string(),
@@ -1452,58 +1443,6 @@ mod tests {
         assert_eq!(ids, vec!["t3", "t2", "t1"]);
     }
 
-    fn running_store(task_state: TransferTaskState) -> (MemoryTransferStore, TransferJobRecord) {
-        let store = MemoryTransferStore::new();
-        let job = sample_job("running-check");
-        store
-            .create_or_get_by_request_id_checked(job.clone())
-            .unwrap();
-        let mut task = sample_task(&job, "t1");
-        task.state = task_state;
-        task.stale_deadline_at = 60_001;
-
-        let mut inner = store.inner.lock();
-        let record = inner.jobs.get_mut(&job.job_id).unwrap();
-        record.state = TransferState::Running;
-        record.owner = "owner".to_string();
-        record.lease_epoch = 1;
-        record.lease_expire_at = 60_000;
-        inner
-            .tasks
-            .insert((job.job_id.clone(), job.run_id, task.task_id.clone()), task);
-        drop(inner);
-        (store, job)
-    }
-
-    #[test]
-    fn healthy_running_task_is_reacquired_only_for_lease_renewal() {
-        let (store, _) = running_store(TransferTaskState::Running);
-
-        assert!(store
-            .acquire_runnable_transfer("owner", 60_000, 29_999, 10, false)
-            .unwrap()
-            .is_none());
-        let lease = store
-            .acquire_runnable_transfer("owner", 60_000, 30_000, 10, false)
-            .unwrap()
-            .unwrap();
-        assert_eq!(lease.lease_epoch, 2);
-    }
-
-    #[test]
-    fn completed_running_job_is_reacquired_after_check_interval() {
-        let (store, _) = running_store(TransferTaskState::Completed);
-
-        assert!(store
-            .acquire_runnable_transfer("owner", 60_000, 4_999, 10, false)
-            .unwrap()
-            .is_none());
-        assert!(store
-            .acquire_runnable_transfer("owner", 60_000, 5_000, 10, false)
-            .unwrap()
-            .is_some());
-    }
-
     #[test]
     fn progress_report_updates_task_without_job_summary_until_flush() {
         let store = MemoryTransferStore::new();
@@ -1512,7 +1451,7 @@ mod tests {
             .create_or_get_by_request_id_checked(job.clone())
             .unwrap();
         let lease = store
-            .acquire_runnable_transfer("owner", 60_000, 2, 10, false)
+            .claim_next_job("owner", 2, 10, true, 0, "")
             .unwrap()
             .unwrap();
         assert!(store
@@ -1520,7 +1459,7 @@ mod tests {
                 job_id: job.job_id.clone(),
                 run_id: job.run_id,
                 owner: lease.owner.clone(),
-                lease_epoch: lease.lease_epoch,
+                fence: lease.fence,
                 tasks: vec![sample_task(&job, "t1"), sample_task(&job, "t2")],
                 message: "planned".to_string(),
                 now_ms: 3,
@@ -1532,7 +1471,7 @@ mod tests {
                     job_id: job.job_id.clone(),
                     run_id: job.run_id,
                     owner: lease.owner.clone(),
-                    lease_epoch: lease.lease_epoch,
+                    fence: lease.fence,
                     task_id: task_id.to_string(),
                     attempt_id: 1,
                     worker_id: 7,

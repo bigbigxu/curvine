@@ -152,6 +152,8 @@ impl BlockActor {
         startup_time_ms: u64,
         transfer_inflight_budget_bytes: Arc<AtomicI64>,
         worker_max_concurrent_tasks: Arc<AtomicUsize>,
+        transfer_inflight_tasks: Arc<AtomicUsize>,
+        transfer_inflight_bytes: Arc<AtomicI64>,
         registration: MasterRegistration,
     ) -> CommonResult<BlockActor> {
         let context = FsContext::with_rt(conf.clone(), rt)?;
@@ -166,6 +168,8 @@ impl BlockActor {
             startup_time_ms,
             transfer_inflight_budget_bytes,
             worker_max_concurrent_tasks,
+            transfer_inflight_tasks,
+            transfer_inflight_bytes,
             registration,
         );
         let executor = GroupExecutor::new(

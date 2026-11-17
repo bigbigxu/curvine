@@ -239,6 +239,10 @@ impl TransferServer {
             conf.transfer.task_report_queue_size(),
             conf.transfer.worker_threads,
         )?
+        .with_job_defaults(
+            i64::try_from(conf.transfer.job_default_ttl.as_millis()).unwrap_or(86_400_000),
+            conf.transfer.job_default_max_runs,
+        )
         .with_task_cache(task_cache.clone())
         // The submit brake and the executing ceiling live here, so the service
         // must read the same object the config registry writes.

@@ -90,6 +90,8 @@ export default {
       reset: 'Reset',
       mixed: 'Mixed',
       hint: 'Values are pushed to every instance in transfer.endpoints; the file value is what a reset returns to.',
+      bytesHint:
+        'worker_inflight_budget_bytes takes a size (10GB, 512MB, 1.5GB, or a bare byte count). It is the only admission ceiling the scheduler dispatches against.',
       acceptJobsHint:
         'accept_jobs=false closes the service to new submissions with "temporarily closed, retry later". The process, its scheduler and running jobs are untouched.',
       closedBanner: '{count} instance(s) are closed to new submissions (`accept_jobs=false`). In-flight jobs keep running.',

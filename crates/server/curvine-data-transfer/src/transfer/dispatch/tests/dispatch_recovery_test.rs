@@ -4,7 +4,7 @@ use crate::transfer::memory_store::MemoryTransferStore;
 use crate::transfer::plan::TransferPlanner;
 use crate::transfer::store::TransferStore;
 use crate::transfer::ClusterMetadataCache;
-use crate::transfer::TransferRuntimeConfig;
+use crate::transfer::{TransferMetrics, TransferRuntimeConfig};
 use curvine_client_core::file::CurvineFileSystem;
 use curvine_config::{ClusterConf, TransferConf};
 use curvine_model::{
@@ -72,9 +72,12 @@ fn running_job(job_id: &str) -> TransferJobRecord {
         cv_metadata_epoch: None,
         state: TransferState::Running,
         owner: "test-owner".to_string(),
-        lease_epoch: 1,
+        fence: 1,
         lease_expire_at: now_ms().saturating_add(60_000),
         cancel_requested: false,
+        expires_at: 0,
+        cancel_reason: String::new(),
+        max_runs: TransferJobRecord::DEFAULT_MAX_RUNS,
         summary: TransferProgress::default(),
         client_request_id: format!("request-{job_id}"),
         submitter: "test".to_string(),
@@ -116,7 +119,7 @@ fn lease(job: &TransferJobRecord) -> TransferLease {
         job_id: job.job_id.clone(),
         run_id: job.run_id,
         owner: "test-owner".to_string(),
-        lease_epoch: 1,
+        fence: 1,
     }
 }
 
@@ -294,18 +297,35 @@ fn dispatch_reads_the_live_worker_task_limit() {
     let state = Arc::new(TransferRuntimeConfig::with_limit(1));
     let scheduler = scheduler_with_state(Arc::new(MemoryTransferStore::new()), state.clone());
     let workers = [WorkerInfo::new(Default::default(), 1)];
+    // The admission gate itself, which is what the live limit has to move. The
+    // decision below falls back to a probe when the gate excludes everything,
+    // so the ceiling is only observable here.
+    let admitted = |scheduler: &TransferScheduler<MemoryTransferStore>, state: &TransferRuntimeConfig| {
+        super::super::choose_worker_admitted(
+            &workers,
+            10,
+            state.worker_task_limit(),
+            TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES,
+            |id| scheduler.inflight.get(id),
+        )
+        .len()
+    };
 
     // Ceiling 1: the first decision admits the idle worker and debits the
-    // ledger; the second one must be blocked by the same 1-slot ceiling.
+    // ledger; the same 1-slot ceiling then excludes it from the gate.
+    assert_eq!(admitted(&scheduler, &state), 1);
     assert!(scheduler.choose_worker(&workers, 10).is_some());
-    assert!(scheduler.choose_worker(&workers, 10).is_none());
+    assert_eq!(admitted(&scheduler, &state), 0);
+    // A saturated ledger dispatches nothing: capacity comes from the heartbeat
+    // snapshot, not from aiming at a worker we already estimated as full.
+    assert!(
+        scheduler.choose_worker(&workers, 10).is_none(),
+        "a saturated ledger must stop dispatching, not probe"
+    );
 
     // Raising the live value alone (no new scheduler) admits the next decision.
-    assert_eq!(state.update_worker_task_limit(2).unwrap(), 1);
-    assert!(
-        scheduler.choose_worker(&workers, 10).is_some(),
-        "scheduler must observe the raised live limit without being rebuilt"
-    );
+    assert_eq!(state.update_worker_task_limit(3).unwrap(), 1);
+    assert_eq!(admitted(&scheduler, &state), 1);
 
     // The registry is the production write path and must move the same atomic.
     let registry = build_transfer_runtime_registry(state.clone(), &conf);
@@ -313,12 +333,11 @@ fn dispatch_reads_the_live_worker_task_limit() {
         .set(WORKER_MAX_CONCURRENT_TASKS_CONFIG, "1", None)
         .unwrap();
     assert_eq!(state.worker_task_limit(), 1);
-    // Two tasks are already in flight, so a ceiling of 1 blocks dispatch again.
-    assert!(scheduler.choose_worker(&workers, 10).is_none());
+    assert_eq!(admitted(&scheduler, &state), 0);
     registry
         .set(WORKER_MAX_CONCURRENT_TASKS_CONFIG, "9", None)
         .unwrap();
-    assert!(scheduler.choose_worker(&workers, 10).is_some());
+    assert_eq!(admitted(&scheduler, &state), 1);
 }
 
 fn scheduler_with_placement(
@@ -513,7 +532,7 @@ async fn placement_that_never_claims_the_lease_is_planned_locally() {
         after.state, before.state,
         "a takeover must keep the lease, not requeue the row"
     );
-    assert_eq!(after.lease_epoch, before.lease_epoch);
+    assert_eq!(after.fence, before.fence);
     // The takeover has to stick: a job that failed to plan and came back must
     // not spend another five ticks handing the lease to the same dead address.
     assert!(
@@ -521,5 +540,234 @@ async fn placement_that_never_claims_the_lease_is_planned_locally() {
             .hand_back_to_placement(&job, &lease(&job), now_ms())
             .unwrap(),
         "the takeover must survive the job being re-acquired"
+    );
+}
+
+/// Cancelling must cost one store operation for the whole plan and must leave a
+/// task alone while its worker is still reporting it (that worker gets a cancel
+/// RPC instead). Regression guard for the 114k-transaction cancel of CV-86.
+#[tokio::test]
+async fn cancel_stops_recoverable_tasks_and_keeps_live_runs() {
+    let store = Arc::new(MemoryTransferStore::new());
+    let job = running_job("cancel-batch");
+    store.create_or_get_by_request_id(job.clone()).unwrap();
+
+    let now = now_ms();
+    let pending = task(&job.job_id, "pending", TransferTaskState::Pending);
+    let stale = task(&job.job_id, "stale", TransferTaskState::Stale);
+
+    let mut stale_running = task(&job.job_id, "stale-running", TransferTaskState::Running);
+    stale_running.stale_deadline_at = now.saturating_sub(1_000);
+    stale_running.worker_id = 11;
+    stale_running.worker_session_id = "s11".to_string();
+
+    let mut live = task(&job.job_id, "live", TransferTaskState::Running);
+    live.stale_deadline_at = now.saturating_add(60_000);
+    live.worker_id = 22;
+    live.worker_session_id = "s22".to_string();
+
+    let completed = task(&job.job_id, "done", TransferTaskState::Completed);
+    store
+        .insert_tasks(vec![pending, stale, stale_running, live, completed])
+        .unwrap();
+
+    scheduler(store.clone())
+        .stop_recoverable_tasks(&job, &lease(&job), "transfer canceled")
+        .await
+        .unwrap();
+
+    let tasks = store.list_transfer_tasks(&job.job_id, job.run_id).unwrap();
+    let state_of = |task_id: &str| {
+        tasks
+            .iter()
+            .find(|task| task.task_id == task_id)
+            .map(|task| task.state)
+            .unwrap()
+    };
+    assert_eq!(state_of("pending"), TransferTaskState::Canceled);
+    assert_eq!(state_of("stale"), TransferTaskState::Canceled);
+    assert_eq!(state_of("stale-running"), TransferTaskState::Canceled);
+    assert_eq!(
+        state_of("live"),
+        TransferTaskState::Running,
+        "a task whose worker is still reporting must not be canceled behind its back"
+    );
+    assert_eq!(state_of("done"), TransferTaskState::Completed);
+    assert_eq!(
+        store.running_task_workers(&job.job_id, job.run_id).unwrap(),
+        vec![(22u32, "s22".to_string())]
+    );
+}
+
+/// The task-state gauges are process-global, so the two tests that assert on
+/// them must not interleave (other tests may still debit a gauge concurrently,
+/// which is why the assertions are one-sided).
+static GAUGE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Reads a registered gauge straight out of the Prometheus registry.
+fn gauge_value(name: &str) -> i64 {
+    curvine_metrics::Metrics::registry()
+        .gather()
+        .iter()
+        .find(|family| family.get_name() == name)
+        .and_then(|family| family.get_metric().first())
+        .map(|metric| metric.get_gauge().get_value() as i64)
+        .unwrap_or(0)
+}
+
+/// `transfer_tasks_pending` must reflect file-level tasks, which have no
+/// `transfer_tasks` rows: the store-side scan alone reports 0 and the dashboard
+/// then drifts to a negative count as dispatches debit it.
+#[test]
+fn task_count_calibration_includes_in_memory_tasks() {
+    let scheduler = scheduler(Arc::new(MemoryTransferStore::new()));
+    let job = running_job("calibrated");
+    scheduler.task_cache.seed(
+        &job.job_id,
+        job.run_id,
+        vec![
+            task(&job.job_id, "p1", TransferTaskState::Pending),
+            task(&job.job_id, "p2", TransferTaskState::Pending),
+            task(&job.job_id, "r1", TransferTaskState::Running),
+        ],
+    );
+
+    // The store holds no rows at all, so everything reported here comes from
+    // the in-memory task cache.
+    let counts = scheduler.calibrated_task_counts(now_ms()).unwrap();
+    assert_eq!((counts.pending, counts.running), (2, 1));
+}
+
+/// A dispatch that no process ever planned (takeover, restart, redelivery) debits
+/// `pending` without a matching credit. The gauge must drift towards zero, never
+/// below it: `-302` is what an operator saw on a live dashboard.
+#[test]
+fn task_gauges_never_go_negative() {
+    let _guard = GAUGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let metrics = TransferMetrics::get().unwrap();
+    let before_pending = gauge_value("transfer_tasks_pending");
+    let before_running = gauge_value("transfer_tasks_running");
+    for _ in 0..(before_pending + 5) {
+        metrics.task_assigned();
+    }
+    for _ in 0..(before_running + 5) {
+        metrics.task_terminal(TransferTaskState::Completed);
+    }
+    // Another test may have credited these gauges concurrently, so only the
+    // invariant is asserted: an over-decremented gauge floors at zero.
+    assert!(gauge_value("transfer_tasks_pending") >= 0);
+    assert!(gauge_value("transfer_tasks_running") >= 0);
+}
+
+/// A worker that refuses a file-level task must not cost a whole
+/// `task_stale_timeout`: file-level tasks have no `transfer_tasks` row, so the
+/// store write answers "not found" and the task used to sit in Running until a
+/// stale deadline expired. The rejection has to release the cache attempt.
+#[test]
+fn rejected_file_level_task_returns_to_pending_immediately() {
+    use crate::transfer::dispatch::requeue_rejected_task;
+
+    let job = running_job("rejected-cache-task");
+    let task_cache = Arc::new(crate::transfer::TaskCache::new());
+    let mut task = task(&job.job_id, "t1", TransferTaskState::Running);
+    task.worker_id = 7;
+    task.stale_deadline_at = now_ms() + 60_000;
+    task_cache.seed(&job.job_id, job.run_id, vec![task.clone()]);
+    let store = Arc::new(MemoryTransferStore::new());
+
+    let accepted = requeue_rejected_task(
+        store.as_ref(),
+        &task_cache,
+        &task,
+        "test-owner",
+        1,
+        "worker_at_capacity: inflight bytes",
+        false,
+        now_ms(),
+    )
+    .unwrap();
+    assert!(accepted, "the cache release must count as requeued");
+
+    let cached = task_cache
+        .tasks_by_state(&job.job_id, job.run_id, TransferTaskState::Pending)
+        .into_iter()
+        .map(|task| task.task_id)
+        .collect::<Vec<_>>();
+    assert_eq!(cached, vec!["t1".to_string()]);
+    assert!(
+        task_cache
+            .tasks_by_state(&job.job_id, job.run_id, TransferTaskState::Running)
+            .is_empty(),
+        "the rejected attempt must not stay Running in the cache"
+    );
+}
+
+/// The same rejection for a row-backed (segment) task goes through the store.
+#[test]
+fn rejected_row_backed_task_is_requeued_in_the_store() {
+    use crate::transfer::dispatch::requeue_rejected_task;
+
+    let job = running_job("rejected-row-task");
+    let mut task = task(&job.job_id, "t1", TransferTaskState::Running);
+    task.worker_id = 7;
+    let store = Arc::new(MemoryTransferStore::new());
+    // The store validates owner/lease against the job row, so the row has to
+    // exist exactly like it would in production.
+    store.create_or_get_by_request_id(job.clone()).unwrap();
+    store.insert_tasks(vec![task.clone()]).unwrap();
+    let task_cache = Arc::new(crate::transfer::TaskCache::new());
+
+    let accepted = requeue_rejected_task(
+        store.as_ref(),
+        &task_cache,
+        &task,
+        &job.owner,
+        job.fence,
+        "worker_at_capacity: inflight bytes",
+        false,
+        now_ms(),
+    )
+    .unwrap();
+    assert!(accepted);
+    let pending = store
+        .list_tasks_by_state(&job.job_id, job.run_id, TransferTaskState::Pending, 10)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].task_id, "t1");
+}
+
+/// Capacity can never wedge dispatch permanently: a ledger that overshot (a
+/// burst of dispatches, or refusals counted as in-flight) is replaced by the
+/// next heartbeat snapshot, and the very next decision sees the freed room
+/// again. This is the invariant the old "rebase on submit answers" design broke:
+/// its only correction path was the submit it had just stopped making.
+#[test]
+fn oversized_ledger_recovers_on_the_next_snapshot() {
+    let scheduler = scheduler(Arc::new(MemoryTransferStore::new()));
+    let worker = {
+        use curvine_model::{WorkerAddress, WorkerInfo};
+        WorkerInfo::new(
+            WorkerAddress {
+                worker_id: 9,
+                ..Default::default()
+            },
+            1,
+        )
+    };
+    let workers = [worker.clone()];
+
+    // Snapshot says the worker is idle, ceiling is 1: the first decision is
+    // admitted and debits the ledger.
+    scheduler.inflight.apply_snapshot(1, &workers);
+    assert!(scheduler.choose_worker(&workers, 10).is_some());
+    // ...and the second one is refused: dispatch stops instead of probing.
+    assert!(scheduler.choose_worker(&workers, 10).is_none());
+
+    // The worker drained, but the ledger's local delta still says "busy". The
+    // next snapshot (a plain 10s tick, no submit involved) clears it.
+    scheduler.inflight.apply_snapshot(2, &workers);
+    assert!(
+        scheduler.choose_worker(&workers, 10).is_some(),
+        "a new snapshot must reopen dispatch without any submit answer"
     );
 }

@@ -220,9 +220,9 @@ fn batch_flush_triggers_on_file_count_threshold() {
 
 #[test]
 fn batch_flush_triggers_on_byte_threshold() {
-    use super::plan::{batch_should_flush, BATCH_TARGET_BYTES};
-    assert!(!batch_should_flush(1, BATCH_TARGET_BYTES - 1));
-    assert!(batch_should_flush(1, BATCH_TARGET_BYTES));
+    use super::plan::{batch_should_flush, TASK_TARGET_BYTES};
+    assert!(!batch_should_flush(1, TASK_TARGET_BYTES - 1));
+    assert!(batch_should_flush(1, TASK_TARGET_BYTES));
 }
 
 #[test]
@@ -532,9 +532,12 @@ fn load_replicas_override_mount_and_service_defaults() {
         cv_metadata_epoch: None,
         state: TransferState::Pending,
         owner: String::new(),
-        lease_epoch: 0,
+        fence: 0,
         lease_expire_at: 0,
         cancel_requested: false,
+        expires_at: 0,
+        cancel_reason: String::new(),
+        max_runs: TransferJobRecord::DEFAULT_MAX_RUNS,
         summary: TransferProgress::default(),
         client_request_id: "request-1".to_string(),
         submitter: "test".to_string(),
@@ -621,7 +624,7 @@ fn transfer_jobs_carry_the_configured_transfer_tuning() {
         cv_metadata_epoch: None,
         state: TransferState::Pending,
         owner: String::new(),
-        lease_epoch: 0,
+        fence: 0,
         lease_expire_at: 0,
         cancel_requested: false,
         summary: TransferProgress::default(),
@@ -637,6 +640,9 @@ fn transfer_jobs_carry_the_configured_transfer_tuning() {
         owner_addr: String::new(),
         terminal_summary: None,
         terminal_counts: None,
+        expires_at: 0,
+        cancel_reason: String::new(),
+        max_runs: TransferJobRecord::DEFAULT_MAX_RUNS,
     };
 
     let mut mount = MountInfo::default();

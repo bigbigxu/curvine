@@ -20,11 +20,10 @@ use curvine_model::{
     TransferLease, TransferListFilter, TransferProgress, TransferState, TransferStateCounts,
     TransferStateUpdate, TransferTaskCounts, TransferTaskRecord, TransferTaskReport,
     TransferTaskState, TransferTaskStatus, TransferTaskSummary, TransferTenantSummary,
-    WorkerInflight,
 };
 use mysql::prelude::*;
-use mysql::{params, IsolationLevel, Opts, OptsBuilder, Params, Pool, PooledConn, TxOpts};
-use std::collections::{BTreeMap, BTreeSet};
+use mysql::{params, Opts, OptsBuilder, Params, Pool, PooledConn, TxOpts};
+use std::collections::BTreeMap;
 use std::thread;
 use std::time::Duration;
 
@@ -596,179 +595,122 @@ impl TransferStore for MysqlTransferStore {
         Ok(updated)
     }
 
-    fn acquire_runnable_transfer(
+    fn list_active_owned_jobs(&self, limit: usize) -> FsResult<Vec<(String, u64, String)>> {
+        let mut conn = self.conn()?;
+        let rows: Vec<(String, u64, String)> = conn
+            .exec(
+                "select job_id, run_id, owner from transfer_jobs
+                 where owner <> '' and state in (2, 3, 4, 5)
+                 order by updated_at asc limit :limit",
+                params! { "limit" => limit.max(1) as u64 },
+            )
+            .map_err(mysql_err)?;
+        Ok(rows)
+    }
+
+    fn list_expired_jobs(&self, now_ms: i64, limit: usize) -> FsResult<Vec<(String, u64)>> {
+        let mut conn = self.conn()?;
+        let rows: Vec<(String, u64)> = conn
+            .exec(
+                "select job_id, run_id from transfer_jobs
+                 where expires_at > 0 and expires_at <= :now_ms
+                   and state not in (5, 6, 7, 8, 9)
+                 order by expires_at asc limit :limit",
+                params! { "now_ms" => now_ms, "limit" => limit.max(1) as u64 },
+            )
+            .map_err(mysql_err)?;
+        Ok(rows)
+    }
+
+    fn claim_next_job(
         &self,
         owner: &str,
-        lease_ms: i64,
         now_ms: i64,
         max_executing_transfers: u64,
         prefer_pending: bool,
+        _lease_ms: i64,
+        after_job_id: &str,
     ) -> FsResult<Option<TransferLease>> {
         let mut conn = self.conn()?;
-        let running_check_interval_ms =
-            crate::transfer::running_transfer_check_interval_ms(lease_ms);
-        let running_event_lease_before_ms =
-            now_ms.saturating_add(lease_ms.saturating_sub(running_check_interval_ms));
-        let running_renew_lease_before_ms = now_ms.saturating_add(lease_ms / 2);
-        // Conflict reads below are non-locking, so they need fresh committed state.
-        let mut tx = conn
-            .start_transaction(
-                TxOpts::default().set_isolation_level(Some(IsolationLevel::ReadCommitted)),
-            )
-            .map_err(mysql_err)?;
-
-        tx.exec_first::<u64, _, _>(
-            "select version from transfer_schema_version where id = 1 for update",
-            Params::Empty,
-        )
-        .map_err(mysql_err)?
-        .ok_or_else(|| FsError::common("Missing mysql transfer schema version"))?;
-        let mut job: Option<(String, u64, u64, i32)> = if !prefer_pending {
-            tx.exec_first(
-                "select job_id, run_id, lease_epoch, state
-                 from transfer_jobs as job
-                 where job.owner = :owner and job.lease_expire_at > :now_ms
-                   and (
-                        (job.state = 5 and job.updated_at < :now_ms)
-                        or (
-                            job.state = 4 and (
-                                job.lease_expire_at <= :running_renew_lease_before_ms
-                                or (
-                                    job.lease_expire_at <= :running_event_lease_before_ms and (
-                                        exists (
-                                            select 1 from transfer_tasks as task
-                                            where task.job_id = job.job_id and task.run_id = job.run_id
-                                              and task.state in (1, 4, 6)
-                                        )
-                                        or exists (
-                                            select 1 from transfer_tasks as task
-                                            where task.job_id = job.job_id and task.run_id = job.run_id
-                                              and task.state = 2 and task.stale_deadline_at < :now_ms
-                                        )
-                                        or not exists (
-                                            select 1 from transfer_tasks as task
-                                            where task.job_id = job.job_id and task.run_id = job.run_id
-                                              and task.state in (1, 2, 6)
-                                        )
-                                    )
-                                )
-                            )
-                        )
-                   )
-                 order by job.updated_at asc
-                 limit 1",
-                params! {
-                    "owner" => owner,
-                    "now_ms" => now_ms,
-                    "running_event_lease_before_ms" => running_event_lease_before_ms,
-                    "running_renew_lease_before_ms" => running_renew_lease_before_ms,
-                },
-            )
-            .map_err(mysql_err)?
-        } else {
-            None
-        };
-        // Whether the candidate came from the renewal query (this owner already
-        // holds the lease) rather than from a takeover of an expired lease.
-        let mut renewal = job.is_some();
-        if job.is_none() {
-            job = tx
+        // Re-tick a job this owner already holds. No lock row, no lease
+        // Re-tick one of my own jobs. The rotation cursor lives in memory on the
+        // scheduler (`after_job_id` keyset), so this path is **read-only**: the
+        // old implementation bumped `updated_at` on every tick, which at ~18
+        // ticks/s per instance was the bulk of the measured write amplification.
+        if !prefer_pending {
+            let mine: Option<(String, u64)> = conn
                 .exec_first(
-                    "select job_id, run_id, lease_epoch, state
-                 from transfer_jobs
-                 where state in (2, 3, 4, 5) and lease_expire_at <= :now_ms
-                 order by updated_at asc
-                 limit 1",
-                    params! { "now_ms" => now_ms },
+                    "select job_id, run_id from transfer_jobs
+                     where owner = :owner and state in (2, 3, 4, 5)
+                       and job_id > :after
+                     order by job_id asc limit 1",
+                    params! { "owner" => owner, "after" => after_job_id },
                 )
                 .map_err(mysql_err)?;
-            renewal = false;
-        }
-        if job.is_none() && has_pending_transfer(&mut tx, now_ms)? {
-            let executing = tx
-                .exec_first::<u64, _, _>(
-                    "select count(*) from transfer_jobs where state in (2, 3, 4, 5)",
-                    Params::Empty,
-                )
-                .map_err(mysql_err)?
-                .ok_or_else(|| FsError::common("Failed to count executing transfer jobs"))?;
-            if executing < max_executing_transfers {
-                let active_targets = select_executing_targets(&mut tx)?;
-                job = select_pending_transfer(&mut tx, now_ms, &active_targets)?;
-                renewal = false;
+            if let Some((job_id, run_id)) = mine {
+                return Ok(Some(TransferLease {
+                    job_id,
+                    run_id,
+                    owner: owner.to_string(),
+                    // Fence token: the run generation this owner was granted.
+                    fence: run_id,
+                }));
             }
         }
-        let Some((job_id, run_id, lease_epoch, state)) = job else {
-            tx.commit().map_err(mysql_err)?;
-            return Ok(None);
-        };
-        let mut record =
-            select_job_by_id(&mut tx, &job_id)?.ok_or_else(|| FsError::job_not_found(&job_id))?;
-        let conflict = if state != TransferState::Pending as i32 {
-            select_conflicting_active_transfer(
-                &mut tx,
-                &record.target_path,
-                &record.submitter,
-                &record.client_request_id,
-            )?
-        } else {
-            None
-        };
-        if let Some(existing) = conflict {
-            record.state = TransferState::Failed;
-            record.owner.clear();
-            record.lease_expire_at = 0;
-            record.summary.message = format!(
-                "target {} conflicts with active transfer {} target {}",
-                record.target_path, existing.job_id, existing.target_path
-            );
-            record.summary.update_time = now_ms;
-            record.updated_at = now_ms;
-            exec_update_job(&mut tx, &record)?;
-            tx.commit().map_err(mysql_err)?;
-            return Ok(None);
-        }
-        // A lease won over an expired one while the job was still executing
-        // means the previous owner stopped renewing: this acquisition is a
-        // takeover, and it is the only user-visible sign that work was
-        // interrupted. Ordinary renewals by the same owner must not count, or
-        // the counter would grow on every running-status tick.
-        if !renewal
-            && matches!(
-                TransferState::from(state),
-                TransferState::Dispatching | TransferState::Running
+        // Claim a Pending job, bounded by this instance's executing ceiling.
+        let executing: u64 = conn
+            .exec_first(
+                "select count(*) from transfer_jobs
+                 where owner = :owner and state in (2, 3, 4, 5)",
+                params! { "owner" => owner },
             )
-        {
-            record.takeover_count = record.takeover_count.saturating_add(1);
+            .map_err(mysql_err)?
+            .unwrap_or(0);
+        if executing >= max_executing_transfers {
+            return Ok(None);
         }
-        if state == TransferState::Pending as i32 {
-            record.state = TransferState::Planning;
-            record.summary.message = "acquired for planning".to_string();
-            record.summary.update_time = now_ms;
-        }
+        let candidate: Option<(String, u64)> = conn
+            .exec_first(
+                "select job_id, run_id from transfer_jobs
+                 where state = 1
+                 order by updated_at asc, job_id asc limit 1",
+                Params::Empty,
+            )
+            .map_err(mysql_err)?;
+        let Some((job_id, run_id)) = candidate else {
+            return Ok(None);
+        };
+        // The CAS is the state predicate: two instances may pick the same
+        // candidate, only one update matches `state = 1`.
+        let mut record = match select_job_by_id(&mut conn, &job_id)? {
+            Some(record) => record,
+            None => return Ok(None),
+        };
+        record.state = TransferState::Planning;
         record.owner = owner.to_string();
-        record.lease_epoch = lease_epoch.saturating_add(1);
-        record.lease_expire_at = now_ms.saturating_add(lease_ms);
+        record.fence = run_id;
+        record.lease_expire_at = TransferJobRecord::LEASE_NEVER_EXPIRES;
         record.updated_at = now_ms;
+        record.summary.message = "acquired for planning".to_string();
+        record.summary.update_time = now_ms;
         let affected = exec_affected(
-            &mut tx,
+            &mut conn,
             "update transfer_jobs
-             set state = :state, owner = :owner, lease_epoch = :new_epoch, lease_expire_at = :lease_expire_at,
+             set state = :state, owner = :owner, fence = :fence,
+                 lease_expire_at = :lease_expire_at,
                  record_json = :record_json, updated_at = :updated_at
-             where job_id = :job_id and run_id = :run_id and lease_epoch = :old_epoch",
+             where job_id = :job_id and run_id = :run_id and state = 1",
             params! {
                 "state" => record.state as i32,
                 "owner" => owner,
-                "new_epoch" => record.lease_epoch,
+                "fence" => run_id,
                 "lease_expire_at" => record.lease_expire_at,
                 "record_json" => json(&record)?,
                 "updated_at" => now_ms,
                 "job_id" => &job_id,
                 "run_id" => run_id,
-                "old_epoch" => lease_epoch,
             },
         )?;
-        tx.commit().map_err(mysql_err)?;
         if affected == 0 {
             return Ok(None);
         }
@@ -776,43 +718,122 @@ impl TransferStore for MysqlTransferStore {
             job_id,
             run_id,
             owner: owner.to_string(),
-            lease_epoch: record.lease_epoch,
+            fence: run_id,
         }))
     }
 
-    fn renew_lease(
+    fn mark_canceling(
         &self,
         job_id: &str,
         run_id: u64,
         owner: &str,
-        lease_epoch: u64,
-        lease_ms: i64,
+        reason: &str,
         now_ms: i64,
     ) -> FsResult<bool> {
         let mut conn = self.conn()?;
-        let mut tx = conn
-            .start_transaction(TxOpts::default())
-            .map_err(mysql_err)?;
-        let mut job = match select_job_by_id_for_update(&mut tx, job_id)? {
-            Some(job)
-                if job.run_id == run_id
-                    && job.owner == owner
-                    && job.lease_epoch == lease_epoch
-                    && job.lease_expire_at > now_ms
-                    && !job.state.is_terminal() =>
-            {
-                job
-            }
-            _ => {
-                tx.commit().map_err(mysql_err)?;
-                return Ok(false);
-            }
+        let Some(mut record) = select_job_by_id_for_update(&mut conn, job_id)? else {
+            return Ok(false);
         };
-        job.lease_expire_at = now_ms.saturating_add(lease_ms);
-        job.updated_at = now_ms;
-        let updated = exec_update_job(&mut tx, &job)?;
-        tx.commit().map_err(mysql_err)?;
-        Ok(updated)
+        if record.run_id != run_id || record.state.is_terminal() {
+            return Ok(false);
+        }
+        record.state = TransferState::Canceling;
+        // `cancel_requested` means "the submitter asked for this". An owner-lost
+        // or TTL cancellation must not take the user-cancel path, or the two
+        // tick branches race and a job can be Canceled instead of re-planned.
+        record.cancel_requested = reason == "user";
+        record.cancel_reason = reason.to_string();
+        if !owner.is_empty() {
+            record.owner = owner.to_string();
+        }
+        record.summary.message = format!("canceling: {}", reason);
+        record.summary.update_time = now_ms;
+        record.updated_at = now_ms;
+        let affected = exec_affected(
+            &mut conn,
+            "update transfer_jobs
+             set state = :state, owner = :owner, cancel_requested = :cancel_requested,
+                 cancel_reason = :cancel_reason, record_json = :record_json, updated_at = :updated_at
+             where job_id = :job_id and run_id = :run_id and state not in (5, 6, 7, 8, 9)",
+            params! {
+                "state" => record.state as i32,
+                "owner" => &record.owner,
+                "cancel_requested" => record.cancel_requested,
+                "cancel_reason" => &record.cancel_reason,
+                "record_json" => json(&record)?,
+                "updated_at" => now_ms,
+                "job_id" => job_id,
+                "run_id" => run_id,
+            },
+        )?;
+        Ok(affected > 0)
+    }
+
+    fn revive_run(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool> {
+        let mut conn = self.conn()?;
+        let Some(mut record) = select_job_by_id_for_update(&mut conn, job_id)? else {
+            return Ok(false);
+        };
+        if record.run_id != run_id || record.state.is_terminal() {
+            return Ok(false);
+        }
+        let next_run = run_id.saturating_add(1);
+        record.run_id = next_run;
+        record.state = TransferState::Pending;
+        record.owner.clear();
+        record.cancel_requested = false;
+        record.cancel_reason.clear();
+        record.fence = 0;
+        record.summary.message = format!("re-planning run {}", next_run);
+        record.summary.update_time = now_ms;
+        record.updated_at = now_ms;
+        let affected = exec_affected(
+            &mut conn,
+            "update transfer_jobs
+             set run_id = :new_run, state = :state, owner = '', cancel_requested = 0,
+                 cancel_reason = '', fence = 0, record_json = :record_json, updated_at = :updated_at
+             where job_id = :job_id and run_id = :run_id and state not in (6, 7, 8, 9)",
+            params! {
+                "new_run" => next_run,
+                "state" => record.state as i32,
+                "record_json" => json(&record)?,
+                "updated_at" => now_ms,
+                "job_id" => job_id,
+                "run_id" => run_id,
+            },
+        )?;
+        Ok(affected > 0)
+    }
+
+    fn fail_job(&self, job_id: &str, run_id: u64, reason: &str, now_ms: i64) -> FsResult<bool> {
+        let mut conn = self.conn()?;
+        let Some(mut record) = select_job_by_id_for_update(&mut conn, job_id)? else {
+            return Ok(false);
+        };
+        if record.run_id != run_id || record.state.is_terminal() {
+            return Ok(false);
+        }
+        record.state = TransferState::Failed;
+        record.cancel_reason = reason.to_string();
+        record.summary.message = reason.to_string();
+        record.summary.update_time = now_ms;
+        record.updated_at = now_ms;
+        let affected = exec_affected(
+            &mut conn,
+            "update transfer_jobs
+             set state = :state, cancel_reason = :cancel_reason, record_json = :record_json,
+                 updated_at = :updated_at
+             where job_id = :job_id and run_id = :run_id and state not in (6, 7, 8, 9)",
+            params! {
+                "state" => record.state as i32,
+                "cancel_reason" => &record.cancel_reason,
+                "record_json" => json(&record)?,
+                "updated_at" => now_ms,
+                "job_id" => job_id,
+                "run_id" => run_id,
+            },
+        )?;
+        Ok(affected > 0)
     }
 
     fn set_owner_addr(&self, job_id: &str, run_id: u64, owner_addr: &str) -> FsResult<()> {
@@ -840,7 +861,7 @@ impl TransferStore for MysqlTransferStore {
             Some(job)
                 if job.run_id == update.run_id
                     && job.owner == update.owner
-                    && job.lease_epoch == update.lease_epoch
+                    && job.fence == update.fence
                     && job.lease_expire_at > update.now_ms
                     && update.from_states.contains(&job.state) =>
             {
@@ -869,7 +890,7 @@ impl TransferStore for MysqlTransferStore {
             Some(job)
                 if job.run_id == update.run_id
                     && job.owner == update.owner
-                    && job.lease_epoch == update.lease_epoch
+                    && job.fence == update.fence
                     && job.lease_expire_at > update.now_ms
                     && job.state == TransferState::Planning =>
             {
@@ -902,7 +923,7 @@ impl TransferStore for MysqlTransferStore {
         job_id: &str,
         run_id: u64,
         owner: &str,
-        lease_epoch: u64,
+        fence: u64,
         cv_metadata_epoch: u64,
         now_ms: i64,
     ) -> FsResult<bool> {
@@ -914,7 +935,7 @@ impl TransferStore for MysqlTransferStore {
             Some(job)
                 if job.run_id == run_id
                     && job.owner == owner
-                    && job.lease_epoch == lease_epoch
+                    && job.fence == fence
                     && job.lease_expire_at > now_ms
                     && !job.state.is_terminal()
                     && job
@@ -946,7 +967,7 @@ impl TransferStore for MysqlTransferStore {
         };
         if job.run_id != update.run_id
             || job.owner != update.owner
-            || job.lease_epoch != update.lease_epoch
+            || job.fence != update.fence
             || job.lease_expire_at <= update.now_ms
             || job.state.is_terminal()
         {
@@ -966,7 +987,7 @@ impl TransferStore for MysqlTransferStore {
             "update transfer_jobs
              set record_json = :record_json, updated_at = :updated_at
              where job_id = :job_id and run_id = :run_id and owner = :owner
-               and lease_epoch = :lease_epoch and lease_expire_at > :updated_at
+               and fence = :fence
                and state not in (6, 7, 8, 9)",
             params! {
                 "record_json" => json(&job)?,
@@ -974,7 +995,7 @@ impl TransferStore for MysqlTransferStore {
                 "job_id" => &job.job_id,
                 "run_id" => job.run_id,
                 "owner" => &job.owner,
-                "lease_epoch" => job.lease_epoch,
+                "fence" => job.fence,
             },
         )? > 0;
         tx.commit().map_err(mysql_err)?;
@@ -1004,7 +1025,7 @@ impl TransferStore for MysqlTransferStore {
             Some(job)
                 if job.run_id == update.run_id
                     && job.owner == update.owner
-                    && job.lease_epoch == update.lease_epoch
+                    && job.fence == update.fence
                     && job.lease_expire_at > update.now_ms
                     && job.state == TransferState::Planning => {}
             _ => {
@@ -1029,7 +1050,7 @@ impl TransferStore for MysqlTransferStore {
             Some(job)
                 if job.run_id == update.run_id
                     && job.owner == update.owner
-                    && job.lease_epoch == update.lease_epoch
+                    && job.fence == update.fence
                     && job.lease_expire_at > update.now_ms
                     && job.state == TransferState::Planning =>
             {
@@ -1071,7 +1092,7 @@ impl TransferStore for MysqlTransferStore {
             Some(job)
                 if job.run_id == update.run_id
                     && job.owner == update.owner
-                    && job.lease_epoch == update.lease_epoch
+                    && job.fence == update.fence
                     && job.lease_expire_at > update.now_ms
                     && !job.state.is_terminal() =>
             {
@@ -1127,38 +1148,12 @@ impl TransferStore for MysqlTransferStore {
         )
     }
 
-    fn select_inflight_by_worker(&self) -> FsResult<Vec<WorkerInflight>> {
-        // 0-byte rows (legacy tasks whose size is unknown) are counted and the
-        // scheduler substitutes the configured default estimate per row, so a
-        // batch of unknown tasks cannot bypass the byte budget (design §3.1).
-        let sql = if self.task_runtime_projection_ready() {
-            "select worker_id, count(*), coalesce(sum(progress_total_size), 0), count(nullif(progress_total_size, 0))
-             from transfer_tasks where state = 2
-             group by worker_id"
-        } else {
-            "select worker_id, count(*), coalesce(sum(cast(json_unquote(json_extract(record_json, '$.progress.total_size')) as signed)), 0), count(nullif(cast(json_unquote(json_extract(record_json, '$.progress.total_size')) as signed), 0))
-             from transfer_tasks where state = 2
-             group by worker_id"
-        };
-        let rows: Vec<(u32, i64, Option<i64>, i64)> =
-            self.conn()?.exec(sql, ()).map_err(mysql_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|(worker_id, task_count, bytes, nonzero)| WorkerInflight {
-                worker_id,
-                task_count: u64::try_from(task_count).unwrap_or(u64::MAX),
-                estimated_bytes: bytes.unwrap_or(0),
-                unknown_bytes_count: u64::try_from(task_count.saturating_sub(nonzero)).unwrap_or(0),
-            })
-            .collect())
-    }
-
     fn mark_stale_attempts(
         &self,
         job_id: &str,
         run_id: u64,
         owner: &str,
-        lease_epoch: u64,
+        fence: u64,
         now_ms: i64,
         candidates: Vec<TransferTaskRecord>,
     ) -> FsResult<Vec<StaleTaskAttempt>> {
@@ -1174,12 +1169,12 @@ impl TransferStore for MysqlTransferStore {
             .exec_first(
                 "select 1 from transfer_jobs
                  where job_id = :job_id and run_id = :run_id and owner = :owner
-                   and lease_epoch = :lease_epoch and lease_expire_at > :now_ms",
+                   and fence = :fence",
                 params! {
                     "job_id" => job_id,
                     "run_id" => run_id,
                     "owner" => owner,
-                    "lease_epoch" => lease_epoch,
+                    "fence" => fence,
                     "now_ms" => now_ms,
                 },
             )
@@ -1217,7 +1212,7 @@ impl TransferStore for MysqlTransferStore {
                    and exists (
                        select 1 from transfer_jobs
                        where job_id = :job_id and run_id = :run_id and owner = :owner
-                         and lease_epoch = :lease_epoch and lease_expire_at > :now_ms
+                         and fence = :fence
                    )",
                 params! {
                     "state" => task.state as i32,
@@ -1235,7 +1230,7 @@ impl TransferStore for MysqlTransferStore {
                     "stale_deadline_at" => candidate.stale_deadline_at,
                     "now_ms" => now_ms,
                     "owner" => owner,
-                    "lease_epoch" => lease_epoch,
+                    "fence" => fence,
                 },
             )? > 0;
             if updated {
@@ -1356,6 +1351,80 @@ impl TransferStore for MysqlTransferStore {
         Ok(result.is_some())
     }
 
+    /// One statement instead of one transaction per task: cancelling a 114k-task
+    /// job used to take ~13 minutes (CV-86).
+    fn cancel_recoverable_tasks(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        owner: &str,
+        fence: u64,
+        message: &str,
+        now_ms: i64,
+    ) -> FsResult<usize> {
+        let mut conn = self.conn()?;
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(mysql_err)?;
+        // Same fencing as the per-row path, paid once for the whole batch.
+        let Some(job) = select_job_by_id_for_update(&mut tx, job_id)? else {
+            tx.commit().map_err(mysql_err)?;
+            return Ok(0);
+        };
+        if job.run_id != run_id
+            || job.owner != owner
+            || job.fence != fence
+            || job.lease_expire_at <= now_ms
+            || job.state.is_terminal()
+        {
+            tx.commit().map_err(mysql_err)?;
+            return Ok(0);
+        }
+        let affected = exec_affected(
+            &mut tx,
+            "update transfer_tasks
+             set state = :canceled, progress_message = :message,
+                 record_json = json_set(record_json, '$.state', :canceled,
+                                        '$.progress.message', :message,
+                                        '$.updated_at', :now_ms),
+                 updated_at = :now_ms
+             where job_id = :job_id and run_id = :run_id
+               and (state in (:pending, :stale)
+                    or (state = :running and stale_deadline_at <= :now_ms))",
+            params! {
+                "canceled" => TransferTaskState::Canceled as i32,
+                "pending" => TransferTaskState::Pending as i32,
+                "stale" => TransferTaskState::Stale as i32,
+                "running" => TransferTaskState::Running as i32,
+                "message" => message,
+                "now_ms" => now_ms,
+                "job_id" => job_id,
+                "run_id" => run_id,
+            },
+        )?;
+        tx.commit().map_err(mysql_err)?;
+        Ok(usize::try_from(affected).unwrap_or(usize::MAX))
+    }
+
+    /// Only the sessions that still owe this run a report: a cancel then targets
+    /// those workers instead of every worker in the cluster.
+    fn running_task_workers(&self, job_id: &str, run_id: u64) -> FsResult<Vec<(u32, String)>> {
+        let rows: Vec<(u32, String)> = self
+            .conn()?
+            .exec(
+                "select distinct worker_id, worker_session_id from transfer_tasks
+                 where job_id = :job_id and run_id = :run_id and state = :running
+                   and worker_id <> 0",
+                params! {
+                    "job_id" => job_id,
+                    "run_id" => run_id,
+                    "running" => TransferTaskState::Running as i32,
+                },
+            )
+            .map_err(mysql_err)?;
+        Ok(rows)
+    }
+
     fn start_task_attempt(&self, start: TaskAttemptStart) -> FsResult<bool> {
         let mut conn = self.conn()?;
         let mut tx = conn
@@ -1367,7 +1436,7 @@ impl TransferStore for MysqlTransferStore {
         };
         if job.run_id != start.run_id
             || job.owner != start.owner
-            || job.lease_epoch != start.lease_epoch
+            || job.fence != start.fence
             || job.lease_expire_at <= start.now_ms
             || job.cancel_requested
             || job.state.is_terminal()
@@ -1658,9 +1727,12 @@ fn init_schema_locked(conn: &mut PooledConn, now_ms: u64) -> FsResult<()> {
             kind int not null,
             state int not null,
             owner varchar(255) not null,
-            lease_epoch bigint unsigned not null,
+            fence bigint unsigned not null,
             lease_expire_at bigint not null,
             cancel_requested tinyint not null,
+            expires_at bigint not null default 0,
+            cancel_reason varchar(255) not null default '',
+            max_runs integer not null default 2,
             record_json longtext not null,
             created_at bigint not null,
             updated_at bigint not null,
@@ -1668,6 +1740,7 @@ fn init_schema_locked(conn: &mut PooledConn, now_ms: u64) -> FsResult<()> {
             key transfer_jobs_job_key_state_idx(job_key(255), state),
             key transfer_jobs_target_state_idx(target_path(255), state),
             key transfer_jobs_state_lease_idx(state, lease_expire_at),
+            key transfer_jobs_state_expires_idx(state, expires_at),
             key transfer_jobs_state_updated_idx(state, updated_at),
             key transfer_jobs_owner_state_updated_idx(owner, state, updated_at),
             key transfer_jobs_tenant_state_updated_idx(tenant, state, updated_at),
@@ -1740,6 +1813,7 @@ fn migrate_mysql_schema(conn: &mut PooledConn, mut version: u64, now_ms: u64) ->
         )));
     }
     migrate_mysql_task_runtime_columns(conn)?;
+    migrate_mysql_job_columns(conn)?;
     ensure_mysql_ttl_purge_index(conn)
 }
 
@@ -1943,6 +2017,30 @@ fn mysql_index_exists(conn: &mut PooledConn, table: &str, index: &str) -> FsResu
     .map_err(mysql_err)
 }
 
+/// Job columns added by CV-105. `record_json` stays authoritative; the columns
+/// exist so expiry scans and owner lookups never deserialize the whole record.
+fn migrate_mysql_job_columns(conn: &mut PooledConn) -> FsResult<()> {
+    for &(column, definition) in &[
+        ("expires_at", "bigint not null default 0"),
+        ("cancel_reason", "varchar(255) not null default ''"),
+        ("max_runs", "integer not null default 2"),
+    ] {
+        if !mysql_column_exists(conn, "transfer_jobs", column)? {
+            conn.query_drop(format!(
+                "alter table transfer_jobs add column {column} {definition}"
+            ))
+            .map_err(mysql_err)?;
+        }
+    }
+    if !mysql_index_exists(conn, "transfer_jobs", "transfer_jobs_state_expires_idx")? {
+        conn.query_drop(
+            "create index transfer_jobs_state_expires_idx on transfer_jobs(state, expires_at)",
+        )
+        .map_err(mysql_err)?;
+    }
+    Ok(())
+}
+
 fn ensure_mysql_ttl_purge_index(conn: &mut PooledConn) -> FsResult<()> {
     if !mysql_index_exists(conn, "transfer_jobs", "transfer_jobs_state_updated_idx")? {
         conn.query_drop(
@@ -1981,11 +2079,13 @@ fn mysql_schema_ready(conn: &mut PooledConn) -> FsResult<bool> {
 fn insert_job_raw(conn: &mut impl Queryable, params: mysql::Params) -> Result<(), mysql::Error> {
     conn.exec_drop(
         "insert into transfer_jobs (
-            job_id, submitter, tenant, client_request_id, job_key, target_path, run_id, kind, state, owner, lease_epoch,
-            lease_expire_at, cancel_requested, record_json, created_at, updated_at
+            job_id, submitter, tenant, client_request_id, job_key, target_path, run_id, kind, state, owner, fence,
+            lease_expire_at, cancel_requested, expires_at, cancel_reason, max_runs,
+            record_json, created_at, updated_at
         ) values (
             :job_id, :submitter, :tenant, :client_request_id, :job_key, :target_path, :run_id, :kind, :state, :owner,
-            :lease_epoch, :lease_expire_at, :cancel_requested, :record_json, :created_at, :updated_at
+            :fence, :lease_expire_at, :cancel_requested, :expires_at, :cancel_reason, :max_runs,
+            :record_json, :created_at, :updated_at
         )",
         params,
     )
@@ -2083,67 +2183,6 @@ fn select_conflicting_active_transfer(
             && target_paths_conflict(&job.target_path, target_path)
     });
     Ok(conflict)
-}
-
-fn select_executing_targets(conn: &mut impl Queryable) -> FsResult<Vec<(String, String)>> {
-    Ok(select_jobs(
-        conn,
-        "select record_json from transfer_jobs
-         where state in (2, 3, 4, 5) and submitter not like 'fs-mode:%'",
-        Params::Empty,
-    )?
-    .into_iter()
-    .map(|job| (job.target_path, job.tenant))
-    .collect())
-}
-
-fn has_pending_transfer(conn: &mut impl Queryable, now_ms: i64) -> FsResult<bool> {
-    conn.exec_first::<u8, _, _>(
-        "select 1 from transfer_jobs where state = 1 and lease_expire_at <= :now_ms limit 1",
-        params! { "now_ms" => now_ms },
-    )
-    .map(|value| value.is_some())
-    .map_err(mysql_err)
-}
-
-fn select_pending_transfer(
-    conn: &mut impl Queryable,
-    now_ms: i64,
-    active_targets: &[(String, String)],
-) -> FsResult<Option<(String, u64, u64, i32)>> {
-    let active_tenants = active_targets
-        .iter()
-        .map(|(_, tenant)| tenant.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut preferred = None;
-    let mut fallback = None;
-    for job in select_jobs(
-        conn,
-        "select record_json from transfer_jobs
-         where state = 1 and lease_expire_at <= :now_ms",
-        params! { "now_ms" => now_ms },
-    )? {
-        if !TransferCommand::is_fs_mode_submitter(&job.submitter)
-            && active_targets
-                .iter()
-                .any(|(target_path, _)| target_paths_conflict(&job.target_path, target_path))
-        {
-            continue;
-        }
-        let slot = if active_tenants.contains(job.tenant.as_str()) {
-            &mut fallback
-        } else {
-            &mut preferred
-        };
-        if slot.as_ref().is_none_or(|current: &TransferJobRecord| {
-            (job.updated_at, &job.job_id) < (current.updated_at, &current.job_id)
-        }) {
-            *slot = Some(job);
-        }
-    }
-    Ok(preferred
-        .or(fallback)
-        .map(|job| (job.job_id, job.run_id, job.lease_epoch, job.state as i32)))
 }
 
 fn select_job(
@@ -2489,8 +2528,9 @@ fn exec_update_job(conn: &mut impl Queryable, job: &TransferJobRecord) -> FsResu
     let affected = exec_affected(
         conn,
         "update transfer_jobs
-         set tenant = :tenant, target_path = :target_path, kind = :kind, state = :state, owner = :owner, lease_epoch = :lease_epoch,
+         set tenant = :tenant, target_path = :target_path, kind = :kind, state = :state, owner = :owner, fence = :fence,
              lease_expire_at = :lease_expire_at, cancel_requested = :cancel_requested,
+             expires_at = :expires_at, cancel_reason = :cancel_reason, max_runs = :max_runs,
              record_json = :record_json, created_at = :created_at, updated_at = :updated_at
          where job_id = :job_id and run_id = :run_id",
         job_params(job)?,
@@ -2534,9 +2574,12 @@ fn job_params(job: &TransferJobRecord) -> FsResult<mysql::Params> {
         "kind" => job.kind as i32,
         "state" => job.state as i32,
         "owner" => &job.owner,
-        "lease_epoch" => job.lease_epoch,
+        "fence" => job.fence,
         "lease_expire_at" => job.lease_expire_at,
         "cancel_requested" => job.cancel_requested,
+        "expires_at" => job.expires_at,
+        "cancel_reason" => &job.cancel_reason,
+        "max_runs" => job.max_runs as i32,
         "record_json" => json(job)?,
         "created_at" => job.created_at,
         "updated_at" => job.updated_at,

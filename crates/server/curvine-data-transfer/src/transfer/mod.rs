@@ -36,6 +36,7 @@ mod postgres_store;
 pub use self::postgres_store::{postgres_rustls_connector, PostgresTransferStore};
 
 mod metrics;
+mod ownership;
 pub(crate) use self::metrics::record_master_rpc;
 pub use self::metrics::TransferMetrics;
 
@@ -113,8 +114,8 @@ mod report_phase_test;
 mod service_test;
 
 #[cfg(test)]
-#[path = "tests/planning_lease_test.rs"]
-mod planning_lease_test;
+#[path = "tests/claim_store_test.rs"]
+mod claim_store_test;
 
 #[cfg(test)]
 #[path = "tests/fs_mode_command_test.rs"]
@@ -127,12 +128,6 @@ mod fs_mode_store_test;
 pub use self::dispatch::TransferScheduler;
 
 // Running jobs only need scheduler attention for task state changes or lease renewal.
-pub(crate) const RUNNING_TRANSFER_CHECK_INTERVAL_MS: i64 = 5_000;
-
-pub(crate) fn running_transfer_check_interval_ms(lease_ms: i64) -> i64 {
-    RUNNING_TRANSFER_CHECK_INTERVAL_MS.min((lease_ms / 2).max(1))
-}
-
 /// Renders an error with its source chain.
 ///
 /// Store backends report one stable "unavailable" message so callers can match

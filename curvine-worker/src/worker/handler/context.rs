@@ -14,7 +14,7 @@
 
 use crate::worker::WorkerMetrics;
 use curvine_error::FsResult;
-use curvine_metrics::Counter;
+use curvine_metrics::{Counter, Histogram};
 use curvine_model::ExtendedBlock;
 use curvine_model::ProtoUtils;
 use curvine_proto::{BlockReadRequest, BlockWriteRequest};
@@ -27,6 +27,7 @@ pub struct DirWriteMetrics {
     pub(crate) dir_id: u32,
     pub(crate) write_bytes: Counter,
     pub(crate) write_time_us: Counter,
+    pub(crate) write_duration_us: Histogram,
     pub(crate) write_count: Counter,
     pub(crate) slow_write_count: Counter,
 }
@@ -39,6 +40,7 @@ impl DirWriteMetrics {
             dir_id,
             write_bytes: metrics.write_bytes.with_label_values(&[label]),
             write_time_us: metrics.write_time_us.with_label_values(&[label]),
+            write_duration_us: metrics.write_duration_us.with_label_values(&[label]),
             write_count: metrics.write_count.with_label_values(&[label]),
             slow_write_count: metrics.slow_write_count.with_label_values(&[label]),
         }

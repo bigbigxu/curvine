@@ -907,7 +907,7 @@ impl LoadJobRunner {
                 }
             };
 
-            if let Err(err) = client.cancel_job(job_id).await {
+            if let Err(err) = client.cancel_job(job_id, 0).await {
                 error!(
                     "failed to send cancel request to worker {}: {}",
                     worker, err

@@ -46,12 +46,39 @@ pub struct TransferConf {
     #[serde(skip, default = "TransferConf::default_worker_threads")]
     pub worker_threads: usize,
     pub endpoints: Vec<String>,
+    /// Default job lifetime when a submitter gives no TTL (CV-105 §3.4).
+    #[serde(
+        rename = "job_default_ttl",
+        alias = "job_default_ttl_str",
+        default = "TransferConf::default_job_ttl_str"
+    )]
+    pub job_default_ttl_str: String,
+    #[serde(skip)]
+    pub job_default_ttl: Duration,
+    /// Default total run budget: the first run plus re-plans after owner loss.
+    #[serde(default = "TransferConf::default_job_max_runs")]
+    pub job_default_max_runs: u32,
+    /// How often peers are probed for liveness (CV-105 §3.2).
+    #[serde(
+        rename = "peer_probe_interval",
+        alias = "peer_probe_interval_str",
+        default = "TransferConf::default_peer_probe_interval_str"
+    )]
+    pub peer_probe_interval_str: String,
+    #[serde(skip)]
+    pub peer_probe_interval: Duration,
+    /// Consecutive probe failures before a peer is judged dead.
+    #[serde(default = "TransferConf::default_peer_miss_threshold")]
+    pub peer_miss_threshold: u32,
     #[serde(skip_serializing)]
     pub sqlite_path: String,
     #[serde(skip_serializing)]
     pub mysql_url: String,
     #[serde(skip)]
     pub allow_submit_with_stale_snapshot: bool,
+    /// Executing ceiling **per instance**, not per cluster: the claim counts
+    /// `owner = me`, so a fleet of N instances can run up to N x this value.
+    /// Size the cluster as `ceil(desired_concurrency / instances)` (R3).
     pub max_running_transfers: usize,
     /// Whether this instance accepts new transfer submissions.
     ///
@@ -145,6 +172,13 @@ pub struct TransferConf {
 }
 
 impl TransferConf {
+    /// Default job lifetime when the submitter gives no TTL (CV-105 §3.4).
+    pub const DEFAULT_JOB_TTL: &'static str = "1d";
+    /// Peer liveness knobs (CV-105 §3.2).
+    pub const DEFAULT_PEER_PROBE_INTERVAL: &'static str = "5s";
+    pub const DEFAULT_PEER_MISS_THRESHOLD: u32 = 3;
+    /// Default total run budget: the first run plus one re-plan after owner loss.
+    pub const DEFAULT_JOB_MAX_RUNS: u32 = 2;
     pub const DEFAULT_TASK_REPORT_INTERVAL: &'static str = "10s";
     pub const DEFAULT_TASK_STALE_TIMEOUT: &'static str = "60s";
     pub const DEFAULT_LEASE_TIMEOUT: &'static str = "120s";
@@ -202,6 +236,22 @@ impl TransferConf {
         }
         self.lease_timeout = DurationUnit::from_str(&self.lease_timeout_str)?.as_duration();
         self.task_stale_timeout = Self::derive_task_stale_timeout(self.lease_timeout);
+        self.job_default_ttl = DurationUnit::from_str(&self.job_default_ttl_str)?.as_duration();
+        self.peer_probe_interval =
+            DurationUnit::from_str(&self.peer_probe_interval_str)?.as_duration();
+        if self.job_default_max_runs == 0 {
+            self.job_default_max_runs = Self::DEFAULT_JOB_MAX_RUNS;
+        }
+        if self.peer_probe_interval < Duration::from_secs(1) {
+            return Err(FsError::common(
+                "transfer.peer_probe_interval must be at least 1s",
+            ));
+        }
+        if self.peer_miss_threshold == 0 {
+            return Err(FsError::common(
+                "transfer.peer_miss_threshold must be at least 1",
+            ));
+        }
         self.task_report_interval = Self::derive_task_report_interval(self.task_stale_timeout);
         self.cluster_snapshot_max_staleness =
             DurationUnit::from_str(&self.cluster_snapshot_max_staleness_str)?.as_duration();
@@ -452,6 +502,22 @@ impl TransferConf {
         Self::DEFAULT_TASK_REPORT_INTERVAL.to_string()
     }
 
+    fn default_job_ttl_str() -> String {
+        Self::DEFAULT_JOB_TTL.to_string()
+    }
+
+    fn default_job_max_runs() -> u32 {
+        Self::DEFAULT_JOB_MAX_RUNS
+    }
+
+    fn default_peer_probe_interval_str() -> String {
+        Self::DEFAULT_PEER_PROBE_INTERVAL.to_string()
+    }
+
+    fn default_peer_miss_threshold() -> u32 {
+        Self::DEFAULT_PEER_MISS_THRESHOLD
+    }
+
     fn default_task_stale_timeout_str() -> String {
         Self::DEFAULT_TASK_STALE_TIMEOUT.to_string()
     }
@@ -552,6 +618,12 @@ impl Default for TransferConf {
             task_max_retries: Self::DEFAULT_TASK_MAX_RETRIES,
             task_report_interval: Duration::default(),
             task_report_interval_str: Self::DEFAULT_TASK_REPORT_INTERVAL.to_string(),
+            job_default_ttl_str: Self::default_job_ttl_str(),
+            job_default_ttl: Duration::default(),
+            job_default_max_runs: Self::DEFAULT_JOB_MAX_RUNS,
+            peer_probe_interval_str: Self::default_peer_probe_interval_str(),
+            peer_probe_interval: Duration::default(),
+            peer_miss_threshold: Self::DEFAULT_PEER_MISS_THRESHOLD,
             task_stale_timeout: Duration::default(),
             task_stale_timeout_str: Self::DEFAULT_TASK_STALE_TIMEOUT.to_string(),
             lease_timeout: Duration::default(),

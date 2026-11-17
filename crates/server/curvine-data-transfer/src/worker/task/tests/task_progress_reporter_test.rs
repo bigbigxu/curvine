@@ -50,6 +50,7 @@ fn progress_report(task_id: &str, loaded_size: i64) -> ProgressReport {
             },
         },
         log_context: task_id.to_string(),
+        abort: std::sync::Arc::new(crate::worker::task::TaskStore::new()),
     }
 }
 

@@ -559,7 +559,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             owner: None,
-            lease_epoch: None,
+            fence: None,
             lease_expire_at: None,
             cv_metadata_epoch: None,
             task_summary: None,
@@ -614,7 +614,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             owner: None,
-            lease_epoch: None,
+            fence: None,
             lease_expire_at: None,
             cv_metadata_epoch: None,
             task_summary: Some(TransferTaskSummaryProto {

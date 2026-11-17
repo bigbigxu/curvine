@@ -167,9 +167,12 @@ fn transfer_job(id: &str, target_path: &str) -> TransferJobRecord {
         cv_metadata_epoch: None,
         state: TransferState::Pending,
         owner: String::new(),
-        lease_epoch: 0,
+        fence: 0,
         lease_expire_at: 0,
         cancel_requested: false,
+        expires_at: 0,
+        cancel_reason: String::new(),
+        max_runs: TransferJobRecord::DEFAULT_MAX_RUNS,
         summary: TransferProgress::default(),
         client_request_id: format!("request-{id}"),
         submitter: "postgres-store-test".to_string(),
@@ -257,7 +260,7 @@ fn postgres_store_persists_transfer_lifecycle() {
         .unwrap();
 
     let lease = store
-        .acquire_runnable_transfer("postgres-store-test", 60_000, 2, 1, false)
+        .claim_next_job("postgres-store-test", 2, 1, false, 0, "")
         .unwrap()
         .unwrap();
     assert_eq!(lease.job_id, job.job_id);
@@ -267,7 +270,7 @@ fn postgres_store_persists_transfer_lifecycle() {
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease.owner.clone(),
-            lease_epoch: lease.lease_epoch,
+            fence: lease.fence,
             tasks: vec![task],
             message: "planned".to_string(),
             now_ms: 3,
@@ -278,7 +281,7 @@ fn postgres_store_persists_transfer_lifecycle() {
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease.owner.clone(),
-            lease_epoch: lease.lease_epoch,
+            fence: lease.fence,
             task_id: "task-1".to_string(),
             attempt_id: 1,
             worker_id: 7,
@@ -413,7 +416,7 @@ fn postgres_store_marks_only_probed_missing_attempts() {
         .create_or_get_by_request_id_checked(job.clone())
         .unwrap();
     let lease = store
-        .acquire_runnable_transfer("owner", 60_000, 1, 1, false)
+        .claim_next_job("owner", 1, 1, false, 0, "")
         .unwrap()
         .unwrap();
     let task_1 = transfer_task(&job);
@@ -425,7 +428,7 @@ fn postgres_store_marks_only_probed_missing_attempts() {
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease.owner.clone(),
-            lease_epoch: lease.lease_epoch,
+            fence: lease.fence,
             tasks: vec![task_1, task_2],
             message: "planned".to_string(),
             now_ms: 2,
@@ -437,7 +440,7 @@ fn postgres_store_marks_only_probed_missing_attempts() {
                 job_id: job.job_id.clone(),
                 run_id: job.run_id,
                 owner: lease.owner.clone(),
-                lease_epoch: lease.lease_epoch,
+                fence: lease.fence,
                 task_id: task_id.to_string(),
                 attempt_id: 1,
                 worker_id: 7,
@@ -467,7 +470,7 @@ fn postgres_store_marks_only_probed_missing_attempts() {
                 &job.job_id,
                 job.run_id,
                 &lease.owner,
-                lease.lease_epoch,
+                lease.fence,
                 1_001,
                 vec![task_1],
             )
@@ -523,7 +526,7 @@ fn postgres_store_marks_only_probed_missing_attempts() {
             &job.job_id,
             job.run_id,
             &lease.owner,
-            lease.lease_epoch,
+            lease.fence,
             1_001,
             vec![task_2],
         )
@@ -538,7 +541,7 @@ fn postgres_store_marks_only_probed_missing_attempts() {
                 job_id: job.job_id.clone(),
                 run_id: job.run_id,
                 owner: lease.owner.clone(),
-                lease_epoch: lease.lease_epoch,
+                fence: lease.fence,
                 task_id: task_id.to_string(),
                 from_states: vec![from_state],
                 state: TransferTaskState::Failed,
@@ -583,12 +586,12 @@ fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retri
     }
 
     let parent_lease = store
-        .acquire_runnable_transfer("owner-parent", 60_000, 10, 10, false)
+        .claim_next_job("owner-parent", 10, 10, false, 0, "")
         .unwrap()
         .unwrap();
     assert_eq!(parent_lease.job_id, parent.job_id);
     let adjacent_lease = store
-        .acquire_runnable_transfer("owner-adjacent", 60_000, 11, 10, false)
+        .claim_next_job("owner-adjacent", 11, 10, false, 0, "")
         .unwrap()
         .unwrap();
     assert_eq!(adjacent_lease.job_id, adjacent.job_id);
@@ -602,7 +605,7 @@ fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retri
             job_id: parent.job_id.clone(),
             run_id: parent.run_id,
             owner: parent_lease.owner.clone(),
-            lease_epoch: parent_lease.lease_epoch,
+            fence: parent_lease.fence,
             from_states: vec![TransferState::Planning],
             to_state: TransferState::Completed,
             message: "parent complete".to_string(),
@@ -610,7 +613,7 @@ fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retri
         })
         .unwrap());
     let child_lease = store
-        .acquire_runnable_transfer("owner-child", 60_000, 13, 10, false)
+        .claim_next_job("owner-child", 13, 10, false, 0, "")
         .unwrap()
         .unwrap();
     assert_eq!(child_lease.job_id, child.job_id);
@@ -621,7 +624,7 @@ fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retri
                 job_id: job.job_id.clone(),
                 run_id: job.run_id,
                 owner: lease.owner.clone(),
-                lease_epoch: lease.lease_epoch,
+                fence: lease.fence,
                 from_states: vec![TransferState::Planning],
                 to_state: TransferState::Completed,
                 message: "complete".to_string(),
@@ -640,12 +643,12 @@ fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retri
             .unwrap();
     }
     let root_lease = store
-        .acquire_runnable_transfer("owner-root", 60_000, 18, 10, false)
+        .claim_next_job("owner-root", 18, 10, false, 0, "")
         .unwrap()
         .unwrap();
     assert_eq!(root_lease.job_id, root.job_id);
     assert!(store
-        .acquire_runnable_transfer("owner-root-child", 60_000, 19, 10, false)
+        .claim_next_job("owner-root-child", 19, 10, false, 0, "")
         .unwrap()
         .is_none());
     assert!(store
@@ -653,7 +656,7 @@ fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retri
             job_id: root.job_id.clone(),
             run_id: root.run_id,
             owner: root_lease.owner.clone(),
-            lease_epoch: root_lease.lease_epoch,
+            fence: root_lease.fence,
             from_states: vec![TransferState::Planning],
             to_state: TransferState::Completed,
             message: "root complete".to_string(),
@@ -662,7 +665,7 @@ fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retri
         .unwrap());
     assert_eq!(
         store
-            .acquire_runnable_transfer("owner-root-child", 60_000, 21, 10, false)
+            .claim_next_job("owner-root-child", 21, 10, false, 0, "")
             .unwrap()
             .unwrap()
             .job_id,
@@ -675,7 +678,7 @@ fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retri
         .create_or_get_by_request_id_checked(snapshot.clone())
         .unwrap();
     let snapshot_lease = store
-        .acquire_runnable_transfer("owner-snapshot", 60_000, 23, 10, false)
+        .claim_next_job("owner-snapshot", 23, 10, false, 0, "")
         .unwrap()
         .unwrap();
     assert!(store
@@ -683,7 +686,7 @@ fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retri
             job_id: snapshot.job_id.clone(),
             run_id: snapshot.run_id,
             owner: snapshot_lease.owner.clone(),
-            lease_epoch: snapshot_lease.lease_epoch,
+            fence: snapshot_lease.fence,
             mount_snapshot_json: "{\"mount\":\"snapshot\"}".to_string(),
             cluster_snapshot_version: 2,
             now_ms: 24,
@@ -694,7 +697,7 @@ fn postgres_store_keeps_conflicting_requests_pending_and_persists_snapshot_retri
             job_id: snapshot.job_id.clone(),
             run_id: snapshot.run_id,
             owner: snapshot_lease.owner,
-            lease_epoch: snapshot_lease.lease_epoch,
+            fence: snapshot_lease.fence,
             message: "mount snapshot refresh delayed".to_string(),
             next_attempt_at_ms: 30,
             mount_snapshot_attempts: Some(1),
@@ -934,7 +937,7 @@ fn pg_report(job: &TransferJobRecord, loaded: i64, now_ms: i64) -> TransferTaskR
 
 fn pg_plan_one(store: &PostgresTransferStore, job: &TransferJobRecord, total: i64) {
     let lease = store
-        .acquire_runnable_transfer("owner", 60_000, 1, 8, false)
+        .claim_next_job("owner", 1, 8, false, 0, "")
         .unwrap()
         .unwrap();
     let mut task = transfer_task(job);
@@ -945,7 +948,7 @@ fn pg_plan_one(store: &PostgresTransferStore, job: &TransferJobRecord, total: i6
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease.owner.clone(),
-            lease_epoch: lease.lease_epoch,
+            fence: lease.fence,
             tasks: vec![task],
             message: "planned".to_string(),
             now_ms: 2,
@@ -957,7 +960,7 @@ fn pg_plan_one(store: &PostgresTransferStore, job: &TransferJobRecord, total: i6
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease_now.owner.clone(),
-            lease_epoch: lease_now.lease_epoch,
+            fence: lease_now.fence,
             task_id: "task-1".to_string(),
             attempt_id: 1,
             worker_id: 7,
@@ -1032,7 +1035,7 @@ fn postgres_store_purge_requires_snapshot_and_empty_tasks() {
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease.owner.clone(),
-            lease_epoch: lease.lease_epoch,
+            fence: lease.fence,
             from_states: vec![
                 TransferState::Planning,
                 TransferState::Dispatching,

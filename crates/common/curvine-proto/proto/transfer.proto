@@ -74,8 +74,8 @@ message TransferJobStatusProto {
   required int64 created_at = 10;
   required int64 updated_at = 11;
   optional string owner = 12;
-  optional uint64 lease_epoch = 13;
-  optional int64 lease_expire_at = 14;
+  optional uint64 fence = 13;
+  optional int64 expires_at = 14;
   // Takeovers from a dead owner; non-zero means the job was interrupted.
   optional uint32 takeover_count = 20 [default = 0];
   optional uint64 cv_metadata_epoch = 15;
@@ -107,6 +107,13 @@ message SubmitTransferRequest {
   // Set by an instance relaying this submit to the job's hash owner. A
   // forwarded submit is always served locally, so the relay is one hop.
   optional bool forwarded = 9 [default = false];
+  // Hard job lifetime in milliseconds. 0 (or absent) means "use the service
+  // default" (1 day). The deadline is fixed at submit and never extended, not
+  // even by a re-plan (CV-105 §3.4).
+  optional int64 ttl_ms = 10 [default = 0];
+  // Total run budget: the first run plus re-plans after the owner is declared
+  // lost. 0 (or absent) means the service default (2).
+  optional uint32 max_runs = 11 [default = 0];
 }
 
 message SubmitTransferResponse {
@@ -139,8 +146,8 @@ message GetTransferStatusResponse {
   optional int64 created_at = 12;
   optional int64 updated_at = 13;
   optional string owner = 14;
-  optional uint64 lease_epoch = 15;
-  optional int64 lease_expire_at = 16;
+  optional uint64 fence = 15;
+  optional int64 expires_at = 16;
   optional uint64 cv_metadata_epoch = 17;
   optional TransferTaskSummaryProto task_summary = 18;
   optional bool task_details_expired = 19;
@@ -224,8 +231,8 @@ message WatchTransferResponse {
   optional string source_path = 10;
   optional string target_path = 11;
   optional string owner = 12;
-  optional uint64 lease_epoch = 13;
-  optional int64 lease_expire_at = 14;
+  optional uint64 fence = 13;
+  optional int64 expires_at = 14;
   optional uint64 cv_metadata_epoch = 15;
   optional TransferTaskSummaryProto task_summary = 16;
   optional bool task_details_expired = 17;

@@ -305,6 +305,21 @@ pub struct TransferProgress {
     pub message: String,
 }
 
+impl TransferJobRecord {
+    /// Default total run budget: the first run plus one re-plan after the owner
+    /// is declared lost. A submitter may override it per job.
+    pub const DEFAULT_MAX_RUNS: u32 = 2;
+
+    /// Transitional value for the legacy `lease_expire_at` column.
+    ///
+    /// CV-105 removed lease renewal, so the column can no longer be refreshed by
+    /// anything. Write paths still fenced on `lease_expire_at > now` would then
+    /// reject a running job's own updates, so the claim writes this sentinel
+    /// instead of a deadline: "owned until the process goes away". The column and
+    /// those predicates are dropped once every backend stops reading it.
+    pub const LEASE_NEVER_EXPIRES: i64 = i64::MAX / 2;
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferJobRecord {
     pub job_key: String,
@@ -322,7 +337,16 @@ pub struct TransferJobRecord {
     pub cv_metadata_epoch: Option<u64>,
     pub state: TransferState,
     pub owner: String,
-    pub lease_epoch: u64,
+    /// Fence token (CV-105): the run generation this owner was granted.
+    ///
+    /// Renamed from `lease_epoch`; `alias` keeps rows written by older processes
+    /// readable and `default` covers payloads written before either name existed.
+    #[serde(default, alias = "lease_epoch")]
+    pub fence: u64,
+    /// Legacy lease deadline. Nothing refreshes it any more (CV-105 removed
+    /// renewal); the field stays only so rows written by an older process keep
+    /// deserializing, hence the default.
+    #[serde(default)]
     pub lease_expire_at: i64,
     pub cancel_requested: bool,
     pub summary: TransferProgress,
@@ -360,6 +384,24 @@ pub struct TransferJobRecord {
     pub terminal_summary: Option<TransferProgress>,
     #[serde(default)]
     pub terminal_counts: Option<TransferTaskCounts>,
+    /// Hard deadline for the whole job, `0` = no TTL (legacy rows and jobs
+    /// submitted without one). Written from the submitter's `ttl`; the owner
+    /// turns an expired job into `Canceling(ttl_expired)`. Additive JSON field.
+    #[serde(default)]
+    pub expires_at: i64,
+    /// Why the job is `Canceling` / failed: `user`, `owner_lost`, `ttl_expired`.
+    /// Empty for jobs that were never cancelled. Additive JSON field.
+    #[serde(default)]
+    pub cancel_reason: String,
+    /// How many runs (generations) this job may have in total: the initial run
+    /// plus re-plans after an owner is declared lost. Defaults to
+    /// [`TransferJobRecord::DEFAULT_MAX_RUNS`]; a submitter can override it.
+    #[serde(default = "default_job_max_runs")]
+    pub max_runs: u32,
+}
+
+fn default_job_max_runs() -> u32 {
+    TransferJobRecord::DEFAULT_MAX_RUNS
 }
 
 /// Multi-file batch manifest carried in a batch task's `source_read_plan_json`
@@ -918,7 +960,7 @@ pub struct TransferLease {
     pub job_id: String,
     pub run_id: u64,
     pub owner: String,
-    pub lease_epoch: u64,
+    pub fence: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -926,7 +968,7 @@ pub struct TransferStateUpdate {
     pub job_id: String,
     pub run_id: u64,
     pub owner: String,
-    pub lease_epoch: u64,
+    pub fence: u64,
     pub from_states: Vec<TransferState>,
     pub to_state: TransferState,
     pub message: String,
@@ -938,7 +980,7 @@ pub struct TaskAttemptStart {
     pub job_id: String,
     pub run_id: u64,
     pub owner: String,
-    pub lease_epoch: u64,
+    pub fence: u64,
     pub task_id: String,
     pub attempt_id: u64,
     pub worker_id: u32,
@@ -1214,4 +1256,77 @@ pub fn transfer_failure_message(
     format!(
         "{direction} failed during {phase}: source={source_path}; target={target_path}; cause={cause}"
     )
+}
+
+#[cfg(test)]
+mod record_compat_tests {
+    use super::*;
+
+    /// Minimal record as an *older* process wrote it: the fence token is still
+    /// called `lease_epoch` and the deadline is still `lease_expire_at`.
+    fn legacy_json() -> String {
+        serde_json::json!({
+            "job_key": "k",
+            "job_id": "j",
+            "run_id": 2,
+            "kind": TransferKind::Load,
+            "source_path": "s",
+            "target_path": "t",
+            "command_json": "{}",
+            "mount_snapshot_json": "{}",
+            "secret_ref_json": "{}",
+            "cluster_snapshot_version": 1,
+            "cv_metadata_epoch": null,
+            "state": TransferState::Running,
+            "owner": "old-owner",
+            "lease_epoch": 7,
+            "lease_expire_at": 5_000,
+            "cancel_requested": false,
+            "summary": {"loaded_size": 0, "total_size": 0, "update_time": 0, "message": ""},
+            "client_request_id": "r",
+            "submitter": "s",
+            "tenant": "t",
+            "created_at": 1,
+            "updated_at": 2
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_legacy_row_still_reads_its_fence_and_deadline() {
+        let record: TransferJobRecord =
+            serde_json::from_str(&legacy_json()).expect("legacy row must deserialize");
+        assert_eq!(record.fence, 7, "lease_epoch is read as the fence token");
+        // The old `lease_expire_at` column/JSON key is still parsed into the
+        // legacy struct field; the new deadline defaults to "no TTL".
+        assert_eq!(record.lease_expire_at, 5_000);
+        assert_eq!(record.expires_at, 0, "a row without expires_at has no TTL");
+        assert_eq!(record.max_runs, TransferJobRecord::DEFAULT_MAX_RUNS);
+        assert!(record.cancel_reason.is_empty());
+    }
+
+    #[test]
+    fn a_current_row_reads_the_new_keys() {
+        let mut value: serde_json::Value = serde_json::from_str(&legacy_json()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("lease_epoch");
+        object.remove("lease_expire_at");
+        object.insert("fence".to_string(), serde_json::json!(9));
+        object.insert("expires_at".to_string(), serde_json::json!(4_242));
+        object.insert("cancel_reason".to_string(), serde_json::json!("ttl_expired"));
+        object.insert("max_runs".to_string(), serde_json::json!(3));
+        let record: TransferJobRecord = serde_json::from_value(value).expect("current row");
+        assert_eq!(record.fence, 9);
+        assert_eq!(record.expires_at, 4_242);
+        assert_eq!(record.cancel_reason, "ttl_expired");
+        assert_eq!(record.max_runs, 3);
+    }
+
+    #[test]
+    fn a_row_missing_the_fence_token_entirely_still_loads() {
+        let mut value: serde_json::Value = serde_json::from_str(&legacy_json()).unwrap();
+        value.as_object_mut().unwrap().remove("lease_epoch");
+        let record: TransferJobRecord = serde_json::from_value(value).expect("row without fence");
+        assert_eq!(record.fence, 0, "default keeps pre-fence payloads readable");
+    }
 }

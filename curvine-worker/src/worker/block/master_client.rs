@@ -74,6 +74,10 @@ pub struct MasterClient {
     pub(crate) startup_time_ms: u64,
     /// Runtime budget shared with TaskManager and reported on every heartbeat.
     pub(crate) transfer_inflight_budget_bytes: Arc<AtomicI64>,
+    /// Live admitted task count/bytes, relayed to the master so the transfer
+    /// role can dispatch on real load instead of guessing.
+    pub(crate) transfer_inflight_tasks: Arc<AtomicUsize>,
+    pub(crate) transfer_inflight_bytes: Arc<AtomicI64>,
     /// Runtime concurrency ceiling shared with TaskManager, reported on every
     /// heartbeat.
     pub(crate) worker_max_concurrent_tasks: Arc<AtomicUsize>,
@@ -96,6 +100,8 @@ impl MasterClient {
         startup_time_ms: u64,
         transfer_inflight_budget_bytes: Arc<AtomicI64>,
         worker_max_concurrent_tasks: Arc<AtomicUsize>,
+        transfer_inflight_tasks: Arc<AtomicUsize>,
+        transfer_inflight_bytes: Arc<AtomicI64>,
         registration: MasterRegistration,
     ) -> Self {
         // Directly reused file system client service.
@@ -113,6 +119,8 @@ impl MasterClient {
             startup_time_ms,
             transfer_inflight_budget_bytes,
             worker_max_concurrent_tasks,
+            transfer_inflight_tasks,
+            transfer_inflight_bytes,
             component_info,
             registration,
         }
@@ -144,6 +152,11 @@ impl MasterClient {
             worker_max_concurrent_tasks: Some(
                 self.worker_max_concurrent_tasks.load(Ordering::Acquire) as i64,
             ),
+            // Live load: the only capacity signal the scheduler dispatches on.
+            transfer_inflight_tasks: Some(
+                self.transfer_inflight_tasks.load(Ordering::Acquire) as i64,
+            ),
+            transfer_inflight_bytes: Some(self.transfer_inflight_bytes.load(Ordering::Acquire)),
             software_version: self.software_version.clone(),
             fs_ctime: self.startup_time_ms as i64,
             component_info: Some(self.component_info.clone()),

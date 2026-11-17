@@ -57,6 +57,15 @@ enum TransferSubCommand {
     Tenants(TransferTenantsCommand),
 
     /// Read or change the transfer service's runtime knobs on every instance
+    ///
+    /// Keys: accept_jobs, max_running_transfers, worker_max_concurrent_tasks,
+    /// max_tasks_per_transfer, max_plan_entries,
+    /// worker_inflight_budget_bytes.
+    ///
+    /// `worker_inflight_budget_bytes` is the per-worker in-flight byte ceiling
+    /// the scheduler dispatches against (the only admission authority). It takes
+    /// a size, not a raw count: `10GB`, `512MB`, `1.5GB`; a bare number is read
+    /// as bytes. `cv transfer config get` prints every key it does not know.
     Config(TransferConfigCommand),
 }
 
@@ -241,6 +250,9 @@ enum TransferConfigSubCommand {
         key: Option<String>,
     },
     /// Set a knob on every instance (non-persistent, applies immediately)
+    ///
+    /// Sizes such as worker_inflight_budget_bytes accept `10GB` / `512MB` /
+    /// `1.5GB`; other keys take plain integers or true/false.
     Set {
         key: String,
         value: String,
@@ -274,7 +286,9 @@ impl TransferConfigCommand {
                 for addr in targets {
                     let client =
                         TransferClient::with_single_endpoint(conf, rt.clone(), addr.clone())?;
-                    match client.get_runtime_config(key.as_deref()).await {
+                    // Same per-instance budget as set/reset: one dead instance
+                    // must not hold the whole read for the client's retry policy.
+                    match instance_call(&addr, client.get_runtime_config(key.as_deref())).await {
                         Ok(response) => {
                             for entry in response.entries {
                                 table.add_row(vec![
@@ -676,6 +690,35 @@ fn parse_watch_interval(value: &str) -> CommonResult<Duration> {
     Ok(interval)
 }
 
+/// `run_id` is the run generation: 1 is the original run, 2 the first re-plan
+/// after an owner loss, and so on (CV-105).
+fn run_display(run_id: u64) -> String {
+    match run_id {
+        0 | 1 => "1 (first run)".to_string(),
+        n => format!("{} (re-planned {} time{})", n, n - 1, if n - 1 == 1 { "" } else { "s" }),
+    }
+}
+
+/// Job deadline: absolute time plus how long is left, so an operator does not
+/// have to subtract timestamps. 0 means the job was submitted without a TTL.
+fn deadline_text(expires_at: i64) -> String {
+    if expires_at <= 0 {
+        return "none (no TTL)".to_string();
+    }
+    let now = curvine_runtime::common::LocalTime::mills() as i64;
+    let remaining_ms = expires_at.saturating_sub(now);
+    if remaining_ms <= 0 {
+        return format!("{} (expired)", format_timestamp(expires_at));
+    }
+    let minutes = remaining_ms / 60_000;
+    let human = if minutes >= 60 {
+        format!("{}h{}m left", minutes / 60, minutes % 60)
+    } else {
+        format!("{}m left", minutes)
+    };
+    format!("{} ({})", format_timestamp(expires_at), human)
+}
+
 fn status_to_job(response: &GetTransferStatusResponse) -> TransferJobStatusProto {
     TransferJobStatusProto {
         job_id: response.job_id.clone(),
@@ -690,8 +733,8 @@ fn status_to_job(response: &GetTransferStatusResponse) -> TransferJobStatusProto
         created_at: response.created_at.unwrap_or_default(),
         updated_at: response.updated_at.unwrap_or_default(),
         owner: response.owner.clone(),
-        lease_epoch: response.lease_epoch,
-        lease_expire_at: response.lease_expire_at,
+        fence: response.fence,
+        expires_at: response.expires_at,
         takeover_count: response.takeover_count,
         cv_metadata_epoch: response.cv_metadata_epoch,
         placement_addr: response.placement_addr.clone(),
@@ -828,7 +871,7 @@ fn print_status_summary(
     let mut table = md_table();
     table.set_header(["FIELD", "VALUE"]);
     table.add_row(["Job ID".to_string(), job.job_id.clone()]);
-    table.add_row(["Run".to_string(), job.run_id.to_string()]);
+    table.add_row(["Run".to_string(), run_display(job.run_id)]);
     if job.kind != 0 {
         table.add_row(["Kind".to_string(), kind_name(job.kind).to_string()]);
     }
@@ -907,11 +950,11 @@ fn print_status_summary(
                 table.add_row(["Owner".to_string(), owner.clone()]);
             }
         }
-        if let Some(epoch) = job.lease_epoch {
-            table.add_row(["Lease".to_string(), epoch.to_string()]);
+        if let Some(fence) = job.fence {
+            table.add_row(["Fence".to_string(), fence.to_string()]);
         }
-        if let Some(expire_at) = job.lease_expire_at {
-            table.add_row(["Lease Expires".to_string(), format_timestamp(expire_at)]);
+        if let Some(expires_at) = job.expires_at {
+            table.add_row(["Deadline".to_string(), deadline_text(expires_at)]);
         }
         if let Some(epoch) = job.cv_metadata_epoch {
             table.add_row(["CV Metadata Epoch".to_string(), epoch.to_string()]);
@@ -1202,5 +1245,28 @@ mod config_command_tests {
             }
             _ => panic!("expected reset"),
         }
+    }
+}
+
+#[cfg(test)]
+mod deadline_text_tests {
+    use super::{deadline_text, run_display};
+
+    #[test]
+    fn run_display_reports_the_replan_count() {
+        assert_eq!(run_display(1), "1 (first run)");
+        assert_eq!(run_display(2), "2 (re-planned 1 time)");
+        assert_eq!(run_display(3), "3 (re-planned 2 times)");
+    }
+
+    #[test]
+    fn a_job_without_a_ttl_says_so() {
+        assert_eq!(deadline_text(0), "none (no TTL)");
+        assert_eq!(deadline_text(-1), "none (no TTL)");
+    }
+
+    #[test]
+    fn an_expired_deadline_is_marked_expired() {
+        assert!(deadline_text(1).ends_with("(expired)"));
     }
 }

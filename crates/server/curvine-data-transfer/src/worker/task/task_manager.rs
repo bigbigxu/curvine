@@ -66,6 +66,22 @@ pub struct TaskManager {
     /// updated without restarting this worker.
     inflight_budget_bytes: Arc<AtomicI64>,
     inflight_bytes: Arc<AtomicI64>,
+    /// Tasks admitted and not yet retired: queued plus running. The semaphore
+    /// below only bounds *running* tasks, so admission has to be counted at
+    /// submit time - otherwise `inflight_tasks` under-reports a worker that has
+    /// a queue and the scheduler keeps filling it.
+    admitted_tasks: Arc<AtomicUsize>,
+}
+
+/// RAII release of one admitted task slot, dropped when the runner exits.
+struct AdmittedTaskGuard {
+    admitted_tasks: Arc<AtomicUsize>,
+}
+
+impl Drop for AdmittedTaskGuard {
+    fn drop(&mut self) {
+        self.admitted_tasks.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub struct TaskSubmitResult {
@@ -233,6 +249,7 @@ impl TaskManager {
                 curvine_config::TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES,
             )),
             inflight_bytes: Arc::new(AtomicI64::new(0)),
+            admitted_tasks: Arc::new(AtomicUsize::new(0)),
         };
         record_metric(|metrics| {
             metrics.set_inflight_budget_bytes(mgr.transfer_inflight_budget_bytes())
@@ -331,6 +348,33 @@ impl TaskManager {
         let estimated_bytes = context.info.estimated_size.max(0);
         let budget_bytes = self.transfer_inflight_budget_bytes();
         let inflight_bytes = self.inflight_bytes.clone();
+        let reserve_admitted = || -> Result<AdmittedTaskGuard, TaskSubmitResult> {
+            let limit = self.worker_max_concurrent_tasks.load(Ordering::Acquire);
+            loop {
+                let current = self.admitted_tasks.load(Ordering::Acquire);
+                if limit > 0 && current >= limit {
+                    record_metric(|metrics| metrics.inc_submit_rejected("inflight_tasks"));
+                    return Err(TaskSubmitResult::rejected(format!(
+                        "{}: {} admitted tasks reached the concurrency limit {}",
+                        WORKER_AT_CAPACITY_REJECT_PREFIX, current, limit
+                    )));
+                }
+                if self
+                    .admitted_tasks
+                    .compare_exchange_weak(
+                        current,
+                        current + 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return Ok(AdmittedTaskGuard {
+                        admitted_tasks: self.admitted_tasks.clone(),
+                    });
+                }
+            }
+        };
         let reserve_inflight = || -> Result<Option<InflightByteGuard>, TaskSubmitResult> {
             if budget_bytes <= 0 {
                 return Ok(None);
@@ -350,6 +394,10 @@ impl TaskManager {
         // Reserve before replacing an existing context. A capacity rejection
         // must leave the current task runnable; otherwise a rejected retry
         // could cancel it and strand a Loading map entry without a runner.
+        let admitted_guard = match reserve_admitted() {
+            Ok(guard) => guard,
+            Err(result) => return Ok(result),
+        };
         let byte_guard = match self.tasks.entry(task_id.clone()) {
             Entry::Occupied(mut occ) => {
                 if let Some(new_report) = &context.info.transfer_report {
@@ -508,9 +556,10 @@ impl TaskManager {
                     log::error!("task {} failed to acquire permit: {}", task_id, e);
                 }
             }
-            // `byte_guard` drops here (RAII), releasing the admitted bytes even
-            // if `runner.run()` panicked above.
+            // `byte_guard`/`admitted_guard` drop here (RAII), releasing the
+            // admitted bytes and the task slot even if `runner.run()` panicked.
             drop(byte_guard);
+            drop(admitted_guard);
 
             if remove_task
                 && tasks
@@ -524,14 +573,24 @@ impl TaskManager {
         Ok(TaskSubmitResult::accepted())
     }
 
-    pub fn cancel_job(&self, job_id: impl AsRef<str>) -> FsResult<()> {
+    /// Stop the tasks of one job, optionally fenced to one run / one attempt.
+    /// A zero fence keeps the historical "cancel everything for this job"
+    /// behaviour, which is what an older sender produces.
+    pub fn cancel_job(
+        &self,
+        job_id: impl AsRef<str>,
+        run_id: u64,
+        attempt_id: u64,
+    ) -> FsResult<()> {
         let job_id = job_id.as_ref();
-        let all_task = self.tasks.cancel(job_id);
+        let all_task = self.tasks.cancel_fenced(job_id, run_id, attempt_id);
 
         debug!(
-            "Successfully canceled {} tasks for job {}",
+            "Successfully canceled {} tasks for job {} (run fence {}, attempt fence {})",
             all_task.len(),
-            job_id
+            job_id,
+            run_id,
+            attempt_id
         );
         Ok(())
     }
@@ -566,9 +625,31 @@ impl TaskManager {
         self.inflight_budget_bytes.load(Ordering::Acquire)
     }
 
+    /// Bytes currently admitted (running or queued) against the byte budget.
+    pub fn inflight_bytes(&self) -> i64 {
+        self.inflight_bytes.load(Ordering::Acquire).max(0)
+    }
+
+    /// Admitted task count, derived from the admission semaphore: the permits
+    /// held are exactly the tasks this worker accepted and has not retired yet.
+    pub fn inflight_tasks(&self) -> usize {
+        // Admitted, not just running: a queued task is work this worker has
+        // already promised to do, and the scheduler must see it.
+        self.admitted_tasks.load(Ordering::Acquire)
+    }
+
     /// Shared budget read by the worker heartbeat on every report.
     pub fn inflight_budget_bytes(&self) -> Arc<AtomicI64> {
         self.inflight_budget_bytes.clone()
+    }
+
+    /// Shared live load (admitted tasks / admitted bytes) for the heartbeat.
+    ///
+    /// The master relays these to the transfer role, which is the only place
+    /// that turns them into a dispatch decision; reading them here costs one
+    /// atomic load per heartbeat.
+    pub fn inflight_load_shared(&self) -> (Arc<AtomicUsize>, Arc<AtomicI64>) {
+        (self.admitted_tasks.clone(), self.inflight_bytes.clone())
     }
 
     /// Shared concurrency ceiling read by the worker heartbeat on every
@@ -653,6 +734,7 @@ impl TaskManager {
         };
         Some(TaskProgressReporter::new(
             batcher,
+            Arc::new(self.tasks.clone()),
             task.info.job.job_id.clone(),
             task.info.task_id.clone(),
             report_info.clone(),

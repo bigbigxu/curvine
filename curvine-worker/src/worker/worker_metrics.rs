@@ -15,7 +15,9 @@
 use crate::worker::block::BlockStore;
 use crate::worker::storage::Dataset;
 use curvine_core_error::CommonResult;
-use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics, Metrics as m};
+use curvine_metrics::{
+    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Metrics, Metrics as m,
+};
 use std::fmt::{Debug, Formatter};
 
 pub struct WorkerMetrics {
@@ -31,6 +33,13 @@ pub struct WorkerMetrics {
     pub(crate) read_bytes: Counter,
     pub(crate) read_time_us: Counter,
     pub(crate) read_count: Counter,
+    /// Block read latency distribution. `read_time_us / read_count` mixes a
+    /// multi-second disk stall with a million fast chunks into one number, so
+    /// the dashboard reports quantiles over this histogram instead.
+    pub(crate) read_duration_us: Histogram,
+    /// Block write latency distribution, per storage directory like
+    /// `write_time_us` so a single bad disk stays visible.
+    pub(crate) write_duration_us: HistogramVec,
     pub(crate) read_blocks: CounterVec,
     pub(crate) read_error_count: CounterVec,
     pub(crate) checksum_invalidated_count: Counter,
@@ -76,6 +85,27 @@ pub struct WorkerMetrics {
     pub(crate) admission_reject_total: CounterVec,
 }
 
+/// Per-chunk block IO latency buckets, in microseconds.
+///
+/// One sample is one block read/write RPC chunk, so the range runs from a
+/// sub-millisecond page-cache hit to a multi-second disk stall. The tail is
+/// the part operators act on, which is why the sparse region is at the top.
+fn io_latency_buckets() -> Vec<f64> {
+    vec![
+        100.0,
+        500.0,
+        1_000.0,
+        5_000.0,
+        10_000.0,
+        20_000.0,
+        50_000.0,
+        100_000.0,
+        500_000.0,
+        1_000_000.0,
+        5_000_000.0,
+    ]
+}
+
 impl WorkerMetrics {
     pub fn new(store: BlockStore) -> CommonResult<Self> {
         let wm = Self {
@@ -90,6 +120,12 @@ impl WorkerMetrics {
                 "write_time_us",
                 "Microseconds spent writing",
                 &["dir_id"],
+            )?,
+            write_duration_us: m::new_histogram_vec_with_buckets(
+                "write_duration_us",
+                "Per-chunk block write latency in microseconds, by storage directory",
+                &["dir_id"],
+                &io_latency_buckets(),
             )?,
             write_count: m::new_counter_vec(
                 "write_count",
@@ -111,6 +147,11 @@ impl WorkerMetrics {
             read_bytes: m::new_counter("read_bytes", "worker read total bytes")?,
             read_time_us: m::new_counter("read_time_us", "Microseconds spent read")?,
             read_count: m::new_counter("read_count", "Number of reads")?,
+            read_duration_us: m::new_histogram_with_buckets(
+                "read_duration_us",
+                "Per-chunk block read latency in microseconds",
+                &io_latency_buckets(),
+            )?,
             read_blocks: m::new_counter_vec("read_blocks", "read_blocks", &["type"])?,
             read_error_count: m::new_counter_vec(
                 "read_error_count",

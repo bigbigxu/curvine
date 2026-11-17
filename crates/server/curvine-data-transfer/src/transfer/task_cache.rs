@@ -131,6 +131,67 @@ impl TaskCache {
         true
     }
 
+    /// Running → Pending after a pre-accept rejection, so the task is retried in
+    /// a later round without a store write (memory-only tasks have no row).
+    /// Returns false when the task is unknown or the attempt no longer matches.
+    pub fn release_attempt(&self, job_id: &str, run_id: u64, task_id: &str, now_ms: i64) -> bool {
+        let Some(bucket) = self.jobs.get(&(job_id.to_string(), run_id)) else {
+            return false;
+        };
+        let Some(mut task) = bucket.tasks.get_mut(task_id) else {
+            return false;
+        };
+        if task.state != TransferTaskState::Running {
+            return false;
+        }
+        task.state = TransferTaskState::Pending;
+        task.worker_id = 0;
+        task.worker_session_id.clear();
+        task.stale_deadline_at = 0;
+        task.updated_at = now_ms;
+        true
+    }
+
+    /// Cancels every recoverable memory-only task of a run in place and returns
+    /// the `(worker_id, session)` pairs that were still reporting, so the caller
+    /// can tell those workers to stop. Terminal tasks and tasks whose worker is
+    /// still live are left alone.
+    pub fn cancel_recoverable(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        message: &str,
+        now_ms: i64,
+    ) -> Vec<(u32, String)> {
+        let Some(bucket) = self.jobs.get(&(job_id.to_string(), run_id)) else {
+            return Vec::new();
+        };
+        let mut running: Vec<(u32, String)> = Vec::new();
+        for mut task in bucket.tasks.iter_mut() {
+            match task.state {
+                TransferTaskState::Pending | TransferTaskState::Stale => {}
+                TransferTaskState::Running if task.stale_deadline_at > now_ms => {
+                    // Still reporting: cancel the work on the worker instead of
+                    // declaring the task canceled behind its back.
+                    if task.worker_id != 0 {
+                        let key = (task.worker_id, task.worker_session_id.clone());
+                        if !running.contains(&key) {
+                            running.push(key);
+                        }
+                    }
+                    continue;
+                }
+                TransferTaskState::Running => {}
+                _ => continue,
+            }
+            task.state = TransferTaskState::Canceled;
+            task.progress.message = message.to_string();
+            task.progress.update_time = now_ms;
+            task.updated_at = now_ms;
+        }
+        running
+    }
+
     /// Applies one progress/terminal report. `None` means the task is not a
     /// cache task and the caller must use the store.
     pub fn apply_report(&self, report: &TransferTaskReport) -> Option<bool> {
@@ -258,6 +319,28 @@ impl TaskCache {
         self.jobs.iter().map(|entry| entry.key().clone()).collect()
     }
 
+    /// Per-state counts of every task this instance holds in memory.
+    ///
+    /// File-level tasks never get a `transfer_tasks` row, so a store-side
+    /// calibration cannot see them; the task gauges have to add these or they
+    /// keep drifting on the increments alone.
+    pub fn counts(&self, now_ms: i64) -> TransferTaskCounts {
+        let mut total = TransferTaskCounts::default();
+        for key in self.active_jobs() {
+            let Some(summary) = self.summary(&key.0, key.1, now_ms) else {
+                continue;
+            };
+            total.pending += summary.counts.pending;
+            total.running += summary.counts.running;
+            total.completed += summary.counts.completed;
+            total.failed += summary.counts.failed;
+            total.canceled += summary.counts.canceled;
+            total.stale += summary.counts.stale;
+            total.completed_size += summary.counts.completed_size;
+        }
+        total
+    }
+
     /// Drops buckets for jobs that are no longer active. Called by the
     /// scheduler cleanup so a long-lived process does not accumulate them.
     pub fn retain_active(&self, active: &std::collections::HashSet<JobRunKey>) {
@@ -372,7 +455,7 @@ mod tests {
             job_id: "job-1".to_string(),
             run_id: 7,
             owner: "owner".to_string(),
-            lease_epoch: 1,
+            fence: 1,
             task_id: task_id.to_string(),
             attempt_id: attempt,
             worker_id: 3,
@@ -404,6 +487,72 @@ mod tests {
         assert_eq!(running[0].worker_id, 3);
         // A stale attempt id is rejected.
         assert!(!cache.start_attempt(&start("t2", 5)));
+    }
+
+    /// A cancel must not declare a task canceled while its worker is still
+    /// reporting: those tasks are returned so the caller can tell the worker to
+    /// stop, and only tasks past their stale deadline are canceled in place.
+    #[test]
+    fn cancel_recoverable_keeps_live_runs_and_reports_their_workers() {
+        let cache = TaskCache::new();
+        cache.seed("job-1", 7, vec![task("t1"), task("t2")]);
+        assert!(cache.start_attempt(&start("t1", 1))); // Running, deadline 200
+
+        // Before the deadline the run is alive: nothing canceled, worker returned.
+        assert_eq!(
+            cache.cancel_recoverable("job-1", 7, "transfer canceled", 100),
+            vec![(3u32, "s".to_string())]
+        );
+        assert_eq!(
+            cache
+                .tasks_by_state("job-1", 7, TransferTaskState::Running)
+                .len(),
+            1
+        );
+        assert_eq!(
+            cache
+                .tasks_by_state("job-1", 7, TransferTaskState::Canceled)
+                .len(),
+            1,
+            "the pending task is canceled"
+        );
+
+        // Past the deadline the attempt is treated as lost and canceled too.
+        assert!(cache
+            .cancel_recoverable("job-1", 7, "transfer canceled", 300)
+            .is_empty());
+        assert_eq!(
+            cache
+                .tasks_by_state("job-1", 7, TransferTaskState::Running)
+                .len(),
+            0
+        );
+    }
+
+    /// A worker that rejects a task before accepting it never started it, so the
+    /// task must go back to Pending in place: memory-only tasks have no row, and
+    /// waiting for the stale reaper would delay the retry by a full timeout.
+    #[test]
+    fn release_attempt_puts_a_rejected_task_back_to_pending() {
+        let cache = TaskCache::new();
+        cache.seed("job-1", 7, vec![task("t1")]);
+        assert!(cache.start_attempt(&start("t1", 1)));
+        assert_eq!(
+            cache
+                .tasks_by_state("job-1", 7, TransferTaskState::Running)
+                .len(),
+            1
+        );
+
+        assert!(cache.release_attempt("job-1", 7, "t1", 500));
+        let pending = cache.tasks_by_state("job-1", 7, TransferTaskState::Pending);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].worker_id, 0, "the worker claim must be dropped");
+        assert!(pending[0].worker_session_id.is_empty());
+        // The attempt id moved forward, so the next dispatch takes attempt 2.
+        assert!(cache.start_attempt(&start("t1", 2)));
+        // An unknown task and a non-Running task are not touched.
+        assert!(!cache.release_attempt("job-1", 7, "missing", 600));
     }
 
     #[test]

@@ -339,6 +339,8 @@ impl Worker {
             start_ms,
             service.task_manager.inflight_budget_bytes(),
             service.task_manager.worker_max_concurrent_tasks_shared(),
+            service.task_manager.inflight_load_shared().0,
+            service.task_manager.inflight_load_shared().1,
             service.registration.clone(),
         )?;
 

@@ -49,6 +49,12 @@ message SubmitJobResponse {
 // Cancel the job request
 message CancelJobRequest {
   required string job_id = 1;
+  // CV-105: fence the cancel to one run / one attempt. 0 means "no fence", which
+  // is exactly what an older sender produces and what an older receiver infers,
+  // so mixed versions keep the old "cancel everything for this job" behaviour
+  // without any version negotiation.
+  optional int64 run_id = 2 [default = 0];
+  optional int64 attempt_id = 3 [default = 0];
 }
 
 // Cancel the job response
@@ -115,6 +121,11 @@ message SubmitTaskResponse {
   required string task_id = 1;
   optional bool accepted = 2 [default = true];
   optional string reject_reason = 3 [default = ""];
+  // Live admission state of the worker, sent with every submit so the scheduler
+  // sizes its next decisions from the worker itself instead of aggregating task
+  // rows in the metadata store. Legacy workers omit both fields.
+  optional int64 transfer_inflight_bytes = 4;
+  optional int64 transfer_inflight_tasks = 5;
 }
 
 message TaskReportRequest {

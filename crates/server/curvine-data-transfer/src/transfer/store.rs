@@ -18,7 +18,6 @@ use curvine_model::{
     TransferJobRecord, TransferLease, TransferListFilter, TransferProgress, TransferStateCounts,
     TransferStateUpdate, TransferTaskCounts, TransferTaskRecord, TransferTaskReport,
     TransferTaskState, TransferTaskStatus, TransferTaskSummary, TransferTenantSummary,
-    WorkerInflight,
 };
 
 /// Every SQL write path that mutates task rows must stay below this bound in
@@ -187,24 +186,58 @@ pub trait TransferStore: Send + Sync + 'static {
 
     fn request_cancel(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool>;
 
-    fn acquire_runnable_transfer(
+    /// Jobs some instance currently owns and is expected to drive, as
+    /// `(job_id, run_id, owner)`. The ownership watchdog scans this to notice an
+    /// owner that stopped existing (CV-105 §3.2), so the query must stay narrow:
+    /// no records, no task joins, just the three columns.
+    fn list_active_owned_jobs(&self, limit: usize) -> FsResult<Vec<(String, u64, String)>>;
+
+    /// Jobs past their TTL, as `(job_id, run_id)`. `expires_at = 0` means "no
+    /// TTL" and must never be returned, and jobs already Canceling are skipped
+    /// so the sweep does not keep re-marking them (CV-105 §3.4). Backed by the
+    /// `(state, expires_at)` index.
+    fn list_expired_jobs(&self, now_ms: i64, limit: usize) -> FsResult<Vec<(String, u64)>>;
+
+    /// One-CAS claim: take ownership of a Pending job, or re-tick a job this
+    /// owner already holds. No lease expiry and no global lock row: the fence is
+    /// `(owner, run_id, state)`, and the returned `fence` carries the
+    /// claimed `run_id` (CV-105, design §3.1).
+    ///
+    /// `lease_ms` is transitional: backends that still run the legacy acquire
+    /// path use it, and it disappears once every backend implements the narrow
+    /// claim query.
+    fn claim_next_job(
         &self,
         owner: &str,
-        lease_ms: i64,
         now_ms: i64,
         max_executing_transfers: u64,
         prefer_pending: bool,
+        lease_ms: i64,
+        // Keyset cursor for the re-tick scan: only jobs with a larger id are
+        // considered, so a per-instance in-memory cursor rotates over the owned
+        // jobs without writing `updated_at` every tick (R1).
+        after_job_id: &str,
     ) -> FsResult<Option<TransferLease>>;
 
-    fn renew_lease(
+    /// Move a job into `Canceling` with a machine-readable reason
+    /// (`user` / `owner_lost` / `ttl_expired`) and take ownership of the cancel
+    /// bookkeeping. Fenced by `(owner, run_id)` only: any live instance may mark
+    /// another instance's job as owner-lost, and the row lock makes that safe.
+    fn mark_canceling(
         &self,
         job_id: &str,
         run_id: u64,
         owner: &str,
-        lease_epoch: u64,
-        lease_ms: i64,
+        reason: &str,
         now_ms: i64,
     ) -> FsResult<bool>;
+
+    /// Start the next run generation: `run_id + 1`, back to `Pending`, owner
+    /// cleared. Only called after the previous run has no recoverable tasks.
+    fn revive_run(&self, job_id: &str, run_id: u64, now_ms: i64) -> FsResult<bool>;
+
+    /// Terminal failure with a reason. Used by the owner-lost / TTL paths.
+    fn fail_job(&self, job_id: &str, run_id: u64, reason: &str, now_ms: i64) -> FsResult<bool>;
 
     fn update_transfer_state(&self, update: TransferStateUpdate) -> FsResult<bool>;
 
@@ -224,7 +257,7 @@ pub trait TransferStore: Send + Sync + 'static {
         job_id: &str,
         run_id: u64,
         owner: &str,
-        lease_epoch: u64,
+        fence: u64,
         cv_metadata_epoch: u64,
         now_ms: i64,
     ) -> FsResult<bool>;
@@ -259,12 +292,6 @@ pub trait TransferStore: Send + Sync + 'static {
         limit: usize,
     ) -> FsResult<Vec<TransferTaskRecord>>;
 
-    /// Per-worker aggregation of in-flight (Running) tasks, used by the
-    /// scheduler's least-loaded worker choice. Must count only state = 2 rows.
-    fn select_inflight_by_worker(&self) -> FsResult<Vec<WorkerInflight>> {
-        Ok(Vec::new())
-    }
-
     /// Mark only attempts that a preceding worker probe confirmed as missing.
     /// Backends must fence the update with the candidate's attempt identity and
     /// original stale deadline so a concurrent report wins.
@@ -273,7 +300,7 @@ pub trait TransferStore: Send + Sync + 'static {
         job_id: &str,
         run_id: u64,
         owner: &str,
-        lease_epoch: u64,
+        fence: u64,
         now_ms: i64,
         candidates: Vec<TransferTaskRecord>,
     ) -> FsResult<Vec<StaleTaskAttempt>>;
@@ -304,6 +331,70 @@ pub trait TransferStore: Send + Sync + 'static {
     fn has_recoverable_tasks(&self, job_id: &str, run_id: u64) -> FsResult<bool>;
 
     fn start_task_attempt(&self, start: TaskAttemptStart) -> FsResult<bool>;
+
+    /// Cancels every recoverable task of a run in one operation and returns the
+    /// affected row count.
+    ///
+    /// Recovery means Pending, Stale, or Running past its stale deadline: those
+    /// tasks have no live worker worth waiting for. Tasks that are Running and
+    /// still reporting are deliberately left alone (the caller notifies their
+    /// workers and re-checks later).
+    ///
+    /// The default implementation is the per-row loop; a backend with a batch
+    /// statement overrides it, because cancelling a plan of 100k tasks one
+    /// transaction at a time costs minutes of control-plane time.
+    fn cancel_recoverable_tasks(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        owner: &str,
+        fence: u64,
+        message: &str,
+        now_ms: i64,
+    ) -> FsResult<usize> {
+        let mut canceled = 0usize;
+        for task in self.list_transfer_tasks(job_id, run_id)? {
+            let recoverable = match task.state {
+                TransferTaskState::Pending | TransferTaskState::Stale => true,
+                TransferTaskState::Running => task.stale_deadline_at <= now_ms,
+                _ => false,
+            };
+            if !recoverable {
+                continue;
+            }
+            if self.update_task_state(TransferTaskStateUpdate {
+                job_id: task.job_id.clone(),
+                run_id: task.run_id,
+                owner: owner.to_string(),
+                fence,
+                task_id: task.task_id.clone(),
+                from_states: vec![task.state],
+                state: TransferTaskState::Canceled,
+                message: message.to_string(),
+                now_ms,
+                bump_retry: false,
+            })? {
+                canceled = canceled.saturating_add(1);
+            }
+        }
+        Ok(canceled)
+    }
+
+    /// Worker sessions that still hold a Running task of this run, so a cancel
+    /// can tell those workers to stop. Default derives it from the task list.
+    fn running_task_workers(&self, job_id: &str, run_id: u64) -> FsResult<Vec<(u32, String)>> {
+        let mut sessions: Vec<(u32, String)> = Vec::new();
+        for task in self.list_transfer_tasks(job_id, run_id)? {
+            if task.state != TransferTaskState::Running || task.worker_id == 0 {
+                continue;
+            }
+            let key = (task.worker_id, task.worker_session_id);
+            if !sessions.contains(&key) {
+                sessions.push(key);
+            }
+        }
+        Ok(sessions)
+    }
 
     /// Persist a task progress/terminal report.
     ///
@@ -371,7 +462,7 @@ pub struct TransferRequeueUpdate {
     pub job_id: String,
     pub run_id: u64,
     pub owner: String,
-    pub lease_epoch: u64,
+    pub fence: u64,
     pub message: String,
     pub next_attempt_at_ms: i64,
     /// Replaces the persisted mount snapshot retry count when this requeue is
@@ -387,7 +478,7 @@ pub struct TransferMountSnapshotUpdate {
     pub job_id: String,
     pub run_id: u64,
     pub owner: String,
-    pub lease_epoch: u64,
+    pub fence: u64,
     pub mount_snapshot_json: String,
     pub cluster_snapshot_version: u64,
     pub now_ms: i64,
@@ -397,7 +488,7 @@ pub struct TransferPlannedTasks {
     pub job_id: String,
     pub run_id: u64,
     pub owner: String,
-    pub lease_epoch: u64,
+    pub fence: u64,
     pub tasks: Vec<TransferTaskRecord>,
     pub message: String,
     pub now_ms: i64,
@@ -407,7 +498,7 @@ pub struct TransferTaskStateUpdate {
     pub job_id: String,
     pub run_id: u64,
     pub owner: String,
-    pub lease_epoch: u64,
+    pub fence: u64,
     pub task_id: String,
     pub from_states: Vec<TransferTaskState>,
     pub state: TransferTaskState,
@@ -426,7 +517,7 @@ impl TransferTaskStateUpdate {
         job_id: String,
         run_id: u64,
         owner: String,
-        lease_epoch: u64,
+        fence: u64,
         task_id: String,
         state: TransferTaskState,
         message: String,
@@ -436,7 +527,7 @@ impl TransferTaskStateUpdate {
             job_id,
             run_id,
             owner,
-            lease_epoch,
+            fence,
             task_id,
             from_states: Vec::new(),
             state,

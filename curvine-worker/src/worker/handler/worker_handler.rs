@@ -383,6 +383,10 @@ impl WorkerHandler {
             task_id,
             accepted: Some(submit.accepted),
             reject_reason: Some(submit.reject_reason),
+            // Answer with the live admission state: the scheduler rebases this
+            // worker's ledger on it instead of aggregating task rows in MySQL.
+            transfer_inflight_bytes: Some(self.task_manager.inflight_bytes()),
+            transfer_inflight_tasks: Some(self.task_manager.inflight_tasks() as i64),
         };
 
         Ok(Builder::success(msg).proto_header(response).build())
@@ -390,7 +394,11 @@ impl WorkerHandler {
 
     pub fn cancel_job(&self, msg: &Message) -> FsResult<Message> {
         let req: CancelJobRequest = msg.parse_header()?;
-        self.task_manager.cancel_job(req.job_id)?;
+        self.task_manager.cancel_job(
+            req.job_id,
+            req.run_id.unwrap_or(0) as u64,
+            req.attempt_id.unwrap_or(0) as u64,
+        )?;
         Ok(msg.success())
     }
 

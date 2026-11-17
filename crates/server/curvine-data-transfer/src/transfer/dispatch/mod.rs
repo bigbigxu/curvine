@@ -28,8 +28,8 @@ use curvine_model::{
     agreed_plan_source_mtime, classify_transfer_plan, normalize_group_resume, BatchManifest,
     BlockLocation, CommitBlock, LoadJobInfo, LoadTaskInfo, LocatedBlock, SetAttrOptsBuilder,
     TaskAttemptStart, TaskBlockLocation, TransferJobRecord, TransferLease, TransferPlanKind,
-    TransferProgress, TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport,
-    TransferTaskReportInfo, TransferTaskState, TransferTaskSummary, WorkerInflight, WorkerInfo,
+    TransferProgress, TransferState, TransferStateUpdate, TransferTaskCounts, TransferTaskRecord,
+    TransferTaskReport, TransferTaskReportInfo, TransferTaskState, TransferTaskSummary, WorkerInfo,
 };
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::RpcRuntime;
@@ -38,7 +38,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use log::{debug, error, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,17 +49,6 @@ use std::time::Duration;
 /// window the ledger only grows (dispatch-time atomic increments) — overcount
 /// means under-dispatch, which is the conservative direction. Correction
 /// happens wholesale on the next refresh; no report-path bookkeeping.
-/// Estimated in-flight bytes for a worker aggregation: unknown-size rows
-/// (count minus non-zero rows) count at the configured default estimate so
-/// they cannot bypass the byte budget (design §3.1 invariant 3).
-fn inflight_bytes_with_default(estimated_bytes: i64, unknown_count: u64, default_est: i64) -> i64 {
-    estimated_bytes.saturating_add(
-        i64::try_from(unknown_count)
-            .unwrap_or(i64::MAX)
-            .saturating_mul(default_est),
-    )
-}
-
 pub(crate) fn terminal_snapshot_progress(
     mut progress: TransferProgress,
     transition_message: &str,
@@ -246,114 +235,115 @@ impl WorkerBlacklist {
     }
 }
 
+/// Scheduler-side per-worker in-flight ledger.
+///
+/// Capacity is a *pushed* signal: the worker reports its admitted load on every
+/// heartbeat, the master relays it in the cluster snapshot, and every dispatch
+/// decision reapplies that snapshot as the base. `account` adds what this
+/// instance dispatched since then, so two writers keep the estimate honest and
+/// neither of them is a submit answer.
+///
+/// The distinction matters: an estimate derived from submit answers freezes as
+/// soon as the scheduler stops submitting, which is exactly when it is at its
+/// ceiling (the CV-86 stall). A snapshot-derived base always refreshes, so a
+/// full ledger is a bounded state, not a deadlock.
+///
+/// A lock-guarded map, not DashMap: under 8 scheduler threads the
+/// DashMap/parking_lot shard-lock path was observed to park futex waiters
+/// forever (all-scheduler freeze), and the live set is only worker-count sized.
 struct InflightLedger {
-    ttl_ms: u64,
-    refreshed_at_ms: AtomicU64,
-    // worker_id -> (task_count, estimated_bytes). A plain lock-guarded map
-    // instead of DashMap: the live set is tiny (worker count) and every
-    // critical section is a few ns, but under 8 scheduler threads the
-    // DashMap/parking_lot shard-lock path was observed to park futex_waiters
-    // forever (produced an all-scheduler freeze; see the ops runbook). std
-    // RwLock keeps the same semantics without that shard-lock parking layer.
-    entries: std::sync::RwLock<std::collections::HashMap<u32, (u64, i64)>>,
-    // Serializes refresh (clear+rebuild) against concurrent account()/get()
-    // so a refresh never wipes a just-accounted dispatch (review Required).
-    refresh_lock: std::sync::Mutex<()>,
+    entries: std::sync::RwLock<std::collections::HashMap<u32, InflightEntry>>,
+    /// Largest task estimate this scheduler has dispatched. A count ceiling is
+    /// only reachable if this many bytes also fit under the byte ceiling.
+    max_task_bytes: AtomicI64,
+}
+
+/// One worker's dispatch accounting.
+///
+/// `base_*` is the worker's own admission state as of `version` (the cluster
+/// snapshot the transfer last applied); `pending_*` counts what this instance
+/// dispatched since then. The estimate is their sum, so it can only overstate
+/// load (never understate), and it is replaced wholesale by the next snapshot:
+/// the capacity signal is the heartbeat, never a submit answer.
+#[derive(Clone, Copy, Default)]
+struct InflightEntry {
+    version: u64,
+    base_tasks: u64,
+    base_bytes: i64,
+    pending_tasks: u64,
+    pending_bytes: i64,
 }
 
 impl InflightLedger {
-    fn new(ttl: Duration) -> Self {
+    fn new(_ttl: Duration) -> Self {
         Self {
-            ttl_ms: ttl.as_millis() as u64,
-            refreshed_at_ms: AtomicU64::new(0),
             entries: std::sync::RwLock::new(Default::default()),
-            refresh_lock: std::sync::Mutex::new(()),
+            max_task_bytes: AtomicI64::new(0),
         }
     }
 
-    /// Returns true when the cached snapshot is usable for decisions.
-    fn ensure_fresh(
-        &self,
-        store: &dyn TransferStore,
-        now_ms: u64,
-        default_est: i64,
-    ) -> FsResult<()> {
-        let refreshed_at = self.refreshed_at_ms.load(Ordering::Relaxed);
-        if refreshed_at != 0 && now_ms.saturating_sub(refreshed_at) < self.ttl_ms {
-            return Ok(());
-        }
-        // Serialize refresh against concurrent account() so a dispatch that
-        // landed between clear() and insert() is not lost (review Required).
-        let _guard = self.refresh_lock.lock().unwrap_or_else(|e| e.into_inner());
-        // Re-check under the lock: another refresh may have just completed.
-        let refreshed_at = self.refreshed_at_ms.load(Ordering::Relaxed);
-        if refreshed_at != 0 && now_ms.saturating_sub(refreshed_at) < self.ttl_ms {
-            return Ok(());
-        }
-        let inflight = store.select_inflight_by_worker()?;
-        // Remember previously-reported worker ids so workers that now have no
-        // in-flight tasks get their gauges reset (review Required); otherwise
-        // per-worker gauges report stale non-zero values forever.
-        let new_entries: std::collections::HashMap<u32, (u64, i64)> = inflight
-            .into_iter()
-            .map(
-                |WorkerInflight {
-                     worker_id,
-                     task_count,
-                     estimated_bytes,
-                     unknown_bytes_count,
-                 }| {
-                    (
-                        worker_id,
-                        (
-                            task_count,
-                            inflight_bytes_with_default(
-                                estimated_bytes,
-                                unknown_bytes_count,
-                                default_est,
-                            ),
-                        ),
-                    )
-                },
-            )
-            .collect();
-        // Report the rebuilt table so the dashboard reflects the fresh snapshot;
-        // workers that vanished from the store get their gauges zeroed here.
-        {
-            let entries = self.entries.read().unwrap_or_else(|e| e.into_inner());
-            for (worker_id, (task_count, old_bytes)) in entries.iter() {
-                if let Some((_, new_bytes)) = new_entries.get(worker_id) {
-                    if old_bytes != new_bytes {
-                        record_metric(|metrics| {
-                            metrics.set_worker_inflight(*worker_id, *task_count, *new_bytes)
-                        });
-                    }
-                } else {
-                    record_metric(|metrics| metrics.set_worker_inflight(*worker_id, 0, 0));
-                }
-            }
-        }
-        *self.entries.write().unwrap_or_else(|e| e.into_inner()) = new_entries;
-        self.refreshed_at_ms.store(now_ms, Ordering::Relaxed);
-        Ok(())
+    fn max_task_bytes(&self) -> i64 {
+        self.max_task_bytes.load(Ordering::Relaxed)
     }
 
-    fn account(&self, worker_id: u32, count: u64, bytes: i64) {
+    /// Adopts a cluster snapshot as the new base for every worker in it.
+    ///
+    /// This is the only way the base moves: a scheduler with no submissions at
+    /// all still converges to the workers' own load every refresh period, which
+    /// is what makes "the ledger is full" a bounded state instead of a freeze.
+    fn apply_snapshot(&self, version: u64, workers: &[WorkerInfo]) {
         let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
-        let entry = entries.entry(worker_id).or_insert((0u64, 0i64));
-        entry.0 = entry.0.saturating_add(count);
-        entry.1 = entry.1.saturating_add(bytes);
-        let (count, bytes) = *entry;
-        drop(entries);
-        record_metric(|metrics| metrics.set_worker_inflight(worker_id, count, bytes));
+        let mut seen = std::collections::HashSet::with_capacity(workers.len());
+        for worker in workers {
+            let worker_id = worker.worker_id();
+            seen.insert(worker_id);
+            let entry = entries.entry(worker_id).or_default();
+            if version <= entry.version {
+                continue;
+            }
+            entry.version = version;
+            entry.base_tasks = worker.transfer_inflight_tasks;
+            entry.base_bytes = worker.transfer_inflight_bytes.max(0);
+            entry.pending_tasks = 0;
+            entry.pending_bytes = 0;
+            record_metric(|metrics| {
+                metrics.set_worker_inflight(worker_id, entry.base_tasks, entry.base_bytes)
+            });
+        }
+        // Workers that left the cluster must not keep a stale entry alive.
+        entries.retain(|worker_id, _| seen.contains(worker_id));
     }
 
+    /// Accounts tasks this instance just dispatched to `worker_id`.
+    fn account(&self, worker_id: u32, count: u64, bytes: i64) {
+        let seen = self.max_task_bytes.load(Ordering::Relaxed);
+        if bytes > seen {
+            self.max_task_bytes.store(bytes, Ordering::Relaxed);
+        }
+        let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
+        let entry = entries.entry(worker_id).or_default();
+        entry.pending_tasks = entry.pending_tasks.saturating_add(count);
+        entry.pending_bytes = entry.pending_bytes.saturating_add(bytes);
+        let (tasks, bytes) = (
+            entry.base_tasks.saturating_add(entry.pending_tasks),
+            entry.base_bytes.saturating_add(entry.pending_bytes),
+        );
+        drop(entries);
+        record_metric(|metrics| metrics.set_worker_inflight(worker_id, tasks, bytes));
+    }
+
+    /// Estimated in-flight load: heartbeat base plus local unacknowledged work.
     fn get(&self, worker_id: u32) -> (u64, i64) {
         self.entries
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(&worker_id)
-            .copied()
+            .map(|entry| {
+                (
+                    entry.base_tasks.saturating_add(entry.pending_tasks),
+                    entry.base_bytes.saturating_add(entry.pending_bytes),
+                )
+            })
             .unwrap_or((0, 0))
     }
 }
@@ -471,12 +461,22 @@ use crate::transfer::{
 
 const TRANSFER_CLEANUP_INTERVAL_MS: u64 = 60_000;
 const TRANSFER_METRICS_INTERVAL_MS: u64 = 10_000;
-const TRANSFER_TASK_COUNTS_INTERVAL_MS: u64 = 3_600_000;
+/// Task-state gauges are a store scan plus in-memory counts, so this is the
+/// only thing bounding how long a missed increment can survive. Drift was
+/// observed as a negative `transfer_tasks_pending` for nearly an hour.
+const TRANSFER_TASK_COUNTS_INTERVAL_MS: u64 = 30_000;
 const TRANSFER_CLEANUP_LEASE_MS: i64 = 120_000;
 /// Max terminal task rows deleted per cleanup transaction (§8 C2).
 /// A huge job spans multiple rounds instead of one giant transaction.
 const TERMINAL_TASK_PURGE_ROW_LIMIT: usize = MAX_TASKS_PER_STORE_TRANSACTION;
 const TERMINAL_JOB_PURGE_LIMIT: usize = MAX_JOBS_PER_STORE_TRANSACTION;
+/// Upper bound on the dispatch work of one tick: a job whose pending set is huge
+/// would otherwise keep this inner loop running for minutes and hold its
+/// scheduler thread. Leftovers are picked up by the next tick.
+const SCHEDULER_TICK_BUDGET: Duration = Duration::from_millis(1_000);
+/// Task ceiling per tick, independent of the clock so a fast store cannot turn
+/// the budget into an unbounded burst.
+const SCHEDULER_TICK_TASK_LIMIT: usize = 500;
 const SCHEDULER_ACTIVE_INTERVAL: Duration = Duration::from_millis(200);
 const SCHEDULER_IDLE_INTERVAL: Duration = Duration::from_secs(1);
 const SCHEDULER_MIN_IDLE_INTERVAL: Duration = Duration::from_millis(1);
@@ -541,6 +541,24 @@ pub struct TransferScheduler<S> {
     /// `job_id:run_id` -> consecutive hand-backs, see
     /// [`MAX_PLACEMENT_HAND_BACKS`].
     placement_hand_backs: Arc<DashMap<String, u32>>,
+    /// Last reported result of the two-ceiling consistency check, so the log
+    /// only fires on a transition instead of every metrics tick.
+    capacity_mismatch: Arc<std::sync::atomic::AtomicBool>,
+    /// Peer liveness for the lease-free ownership model (CV-105 §3.2):
+    /// `transfer.endpoints`, per-peer probe state, and when we probed last.
+    peers: Arc<Vec<String>>,
+    peer_health: Arc<std::sync::Mutex<crate::transfer::ownership::PeerHealth>>,
+    last_probe_ms: Arc<AtomicU64>,
+    /// The boot sweep (probe + death scan + stop-then-run drive) runs on the
+    /// first tick after start, not in the constructor, because it needs I/O.
+    boot_sweep_done: Arc<std::sync::atomic::AtomicBool>,
+    /// Keyset cursor over the jobs this instance owns, so re-ticking rotates
+    /// without writing `updated_at` on every tick (R1). Empty = start over.
+    retick_cursor: Arc<std::sync::Mutex<String>>,
+    /// Settle passes (owner-lost + TTL + cancel advance) are throttled: they scan
+    /// every owned job, so running them at the tick rate was the read
+    /// amplification measured in R2.
+    last_settle_ms: Arc<AtomicU64>,
 }
 
 impl<S> Clone for TransferScheduler<S> {
@@ -565,6 +583,13 @@ impl<S> Clone for TransferScheduler<S> {
             task_cache: self.task_cache.clone(),
             forwarder: self.forwarder.clone(),
             placement_hand_backs: self.placement_hand_backs.clone(),
+            capacity_mismatch: self.capacity_mismatch.clone(),
+            peers: self.peers.clone(),
+            peer_health: self.peer_health.clone(),
+            last_probe_ms: self.last_probe_ms.clone(),
+            boot_sweep_done: self.boot_sweep_done.clone(),
+            retick_cursor: self.retick_cursor.clone(),
+            last_settle_ms: self.last_settle_ms.clone(),
         }
     }
 }
@@ -589,6 +614,12 @@ where
     ) -> Self {
         let inflight_ttl =
             Duration::from_millis(TransferConf::DEFAULT_SCHEDULER_INFLIGHT_CACHE_TTL_MS);
+        let peer_endpoints: Vec<String> = conf
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.trim().to_string())
+            .filter(|endpoint| !endpoint.is_empty())
+            .collect();
         Self {
             store,
             planner,
@@ -609,6 +640,17 @@ where
             task_cache,
             forwarder,
             placement_hand_backs: Arc::new(DashMap::new()),
+            capacity_mismatch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            peers: Arc::new(peer_endpoints),
+            peer_health: Arc::new(std::sync::Mutex::new(
+                crate::transfer::ownership::PeerHealth::new(
+                    crate::transfer::ownership::PEER_DEAD_AFTER,
+                ),
+            )),
+            last_probe_ms: Arc::new(AtomicU64::new(0)),
+            boot_sweep_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            retick_cursor: Arc::new(std::sync::Mutex::new(String::new())),
+            last_settle_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -635,6 +677,10 @@ where
                                 SCHEDULER_ACTIVE_INTERVAL
                             }
                         };
+                        // Heartbeat: a stalled scheduler stops this counter, which
+                        // is the only externally visible sign that the control
+                        // plane stopped making progress.
+                        record_metric(|metrics| metrics.inc_scheduler_tick());
                         std::thread::sleep(delay);
                     }
                 });
@@ -647,12 +693,301 @@ where
         }
     }
 
+    /// Probe every configured peer and fold the answers into [`PeerHealth`].
+    ///
+    /// One RPC per peer, 2s timeout, at most every `PEER_PROBE_INTERVAL`. A peer
+    /// whose `ring_members` disagree with ours is reported as drift and excluded
+    /// from judgement: "I cannot see you" is then a config bug, not a death.
+    async fn probe_peers(&self, now_ms: i64, force: bool) {
+        use crate::transfer::ownership::{PeerHealth, PEER_PROBE_INTERVAL, PEER_PROBE_TIMEOUT};
+
+        if !force
+            && now_ms.saturating_sub(self.last_probe_ms.load(Ordering::Acquire) as i64)
+                < PEER_PROBE_INTERVAL.as_millis() as i64
+        {
+            return;
+        }
+        self.last_probe_ms.store(now_ms as u64, Ordering::Release);
+        if self.peers.is_empty() {
+            return;
+        }
+        let local = self.peers.as_ref().clone();
+        for peer in self.peers.iter() {
+            if peer == &self.self_report_target || peer == &self.owner {
+                continue;
+            }
+            let client = match curvine_job_client::TransferClient::with_endpoint(
+                &self.fs.fs_context(),
+                peer.as_str(),
+            ) {
+                Ok(client) => client,
+                Err(err) => {
+                    log::debug!("transfer peer probe client for {} unavailable: {}", peer, err);
+                    continue;
+                }
+            };
+            let answer = tokio::time::timeout(PEER_PROBE_TIMEOUT, client.service_info()).await;
+            let mut health = self.peer_health.lock().unwrap_or_else(|e| e.into_inner());
+            match answer {
+                Ok(Ok(info)) => {
+                    let report = crate::transfer::ownership::PeerReport {
+                        instance_id: info.instance_id.unwrap_or_default(),
+                        ring_members: info.ring_members.clone(),
+                    };
+                    let drift = {
+                        let mut reported = report.ring_members.clone();
+                        let mut configured = local.clone();
+                        reported.sort();
+                        configured.sort();
+                        !reported.is_empty() && reported != configured
+                    };
+                    if drift {
+                        if !health.is_drifted(peer) {
+                            health.observe_drift(peer, report.ring_members.clone(), &local);
+                        }
+                    } else {
+                        health.observe_ok(peer, report, &local);
+                    }
+                }
+                Ok(Err(err)) => {
+                    log::debug!("transfer peer probe {} failed: {}", peer, err);
+                    if health.observe_failure(peer) {
+                        log::warn!("transfer peer {} failed {} probes in a row", peer, 3);
+                    }
+                }
+                Err(_) => {
+                    if health.observe_failure(peer) {
+                        log::warn!(
+                            "transfer peer {} timed out {} probes in a row",
+                            peer,
+                            crate::transfer::ownership::PEER_DEAD_AFTER
+                        );
+                    }
+                }
+            }
+        }
+        self.peer_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .finish_round();
+        let drifted = self
+            .peer_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drifted_peers()
+            .len();
+        record_metric(|metrics| metrics.set_peer_config_drift(drifted));
+        let _ = std::any::type_name::<PeerHealth>();
+    }
+
+    /// Jobs whose owner is definitively gone go straight into `Canceling` and
+    /// have their tasks stopped — the first half of stop-then-run.
+    ///
+    /// Concurrency: two instances may sweep the same dead owner at once;
+    /// `mark_canceling` is fenced by `where owner = X`, so the second update
+    /// matches zero rows and does nothing. No extra coordination is needed.
+    async fn settle_owner_lost_jobs(&self, now_ms: i64) -> FsResult<()> {
+        use crate::transfer::ownership::PEER_DEAD_AFTER;
+
+        let owned = match self.store.list_active_owned_jobs(256) {
+            Ok(owned) => owned,
+            Err(err) => {
+                log::warn!("transfer ownership sweep could not list owned jobs: {}", err);
+                return Ok(());
+            }
+        };
+        if owned.is_empty() {
+            return Ok(());
+        }
+        let peers = self.peers.as_ref().clone();
+        for (job_id, run_id, owner) in owned {
+            if owner == self.owner {
+                continue;
+            }
+            let alive = {
+                let health = self.peer_health.lock().unwrap_or_else(|e| e.into_inner());
+                health.owner_is_alive(&owner, &peers)
+            };
+            if alive {
+                continue;
+            }
+            if !self
+                .store
+                .mark_canceling(&job_id, run_id, &self.owner, "owner_lost", now_ms)?
+            {
+                // Another instance got there first; the row is already moving.
+                continue;
+            }
+            record_metric(|metrics| {
+                metrics.inc_requeue("owner_lost");
+                metrics.inc_owner_lost();
+            });
+            log::warn!(
+                "transfer {} run {} owner {} is not reachable by any peer ({} failures each); \
+                 canceling it and waiting for its tasks to stop",
+                job_id,
+                run_id,
+                owner,
+                PEER_DEAD_AFTER
+            );
+            let job = match self.store.get_transfer(&job_id)? {
+                Some(job) => job,
+                None => continue,
+            };
+            let lease = TransferLease {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                owner: self.owner.clone(),
+                fence: job.run_id,
+            };
+            self.stop_recoverable_tasks(&job, &lease, "owner lost").await?;
+        }
+        Ok(())
+    }
+
+    /// Jobs past their submit deadline go through the same stop-then-run
+    /// machine with `ttl_expired`, which the convergence step refuses to revive.
+    async fn settle_expired_jobs(&self, now_ms: i64) -> FsResult<()> {
+        let expired = match self.store.list_expired_jobs(now_ms, 256) {
+            Ok(expired) => expired,
+            Err(err) => {
+                log::warn!("transfer TTL sweep could not list expired jobs: {}", err);
+                return Ok(());
+            }
+        };
+        for (job_id, run_id) in expired {
+            if !self
+                .store
+                .mark_canceling(&job_id, run_id, &self.owner, "ttl_expired", now_ms)?
+            {
+                continue;
+            }
+            record_metric(|metrics| metrics.inc_ttl_expired());
+            log::warn!(
+                "transfer {} run {} passed its deadline; canceling it",
+                job_id,
+                run_id
+            );
+            let job = match self.store.get_transfer(&job_id)? {
+                Some(job) => job,
+                None => continue,
+            };
+            let lease = TransferLease {
+                job_id: job.job_id.clone(),
+                run_id: job.run_id,
+                owner: self.owner.clone(),
+                fence: job.run_id,
+            };
+            self.stop_recoverable_tasks(&job, &lease, "ttl expired").await?;
+        }
+        Ok(())
+    }
+
+    /// Second half of stop-then-run: a job in `Canceling` either waits (tasks
+    /// still reporting somewhere) or converges into a re-plan / terminal
+    /// failure. Waiting writes nothing at all; there is no timeout that forces a
+    /// terminal state, only a warning when the wait gets long.
+    async fn advance_canceling_jobs(&self, now_ms: i64) -> FsResult<()> {
+        use crate::transfer::ownership::{cancel_outcome, CancelOutcome, CANCELING_WARN_AFTER};
+
+        let owned = match self.store.list_active_owned_jobs(256) {
+            Ok(owned) => owned,
+            Err(_) => return Ok(()),
+        };
+        for (job_id, _run_id, owner) in owned {
+            if owner != self.owner {
+                continue;
+            }
+            let job = match self.store.get_transfer(&job_id)? {
+                Some(job) => job,
+                None => continue,
+            };
+            if job.state != TransferState::Canceling {
+                continue;
+            }
+            let recoverable = self
+                .store
+                .has_recoverable_tasks(&job.job_id, job.run_id)
+                .unwrap_or(true);
+            // Only owner loss may start another run; a TTL expiry is final.
+            let replan_allowed = job.cancel_reason != "ttl_expired";
+            match cancel_outcome(recoverable, job.run_id, job.max_runs, replan_allowed) {
+                CancelOutcome::Wait => {
+                    let waited = now_ms.saturating_sub(job.updated_at);
+                    record_metric(|metrics| metrics.set_canceling_wait_seconds(waited / 1000));
+                    if waited >= CANCELING_WARN_AFTER.as_millis() as i64 {
+                        log::warn!(
+                            "transfer {} run {} has been cancelling for {}s (reason {}); \
+                             still waiting for its tasks to stop",
+                            job.job_id,
+                            job.run_id,
+                            waited / 1000,
+                            if job.cancel_reason.is_empty() {
+                                "unknown"
+                            } else {
+                                job.cancel_reason.as_str()
+                            }
+                        );
+                    }
+                }
+                CancelOutcome::Revive => {
+                    if self.store.revive_run(&job.job_id, job.run_id, now_ms)? {
+                        log::info!(
+                            "transfer {} run {} re-planning as run {} after owner loss",
+                            job.job_id,
+                            job.run_id,
+                            job.run_id + 1
+                        );
+                    }
+                }
+                CancelOutcome::Fail => {
+                    let reason = if job.cancel_reason.is_empty() {
+                        "owner_lost"
+                    } else {
+                        job.cancel_reason.as_str()
+                    };
+                    if self.store.fail_job(&job.job_id, job.run_id, reason, now_ms)? {
+                        record_metric(|metrics| metrics.inc_job_failed(reason));
+                        log::warn!(
+                            "transfer {} run {} failed after {} runs: {}",
+                            job.job_id,
+                            job.run_id,
+                            job.max_runs,
+                            reason
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn run_once(&self) -> FsResult<bool> {
         let now_ms = now_ms();
         // Store calls are blocking; keep them off the shared runtime workers.
         // The per-tick hot path (cleanup/counts/acquire/get) is bridged to the
         // blocking pool here; state handlers still run their own store calls
         // inline, but each one is now bounded by the MySQL socket timeout.
+        // Ownership watchdog (CV-105 §3.2/§3.3): probe peers, then settle every
+        // job whose owner stopped existing, then advance jobs that are waiting
+        // for their workers to stop. The first tick after start runs this
+        // unconditionally: a restarted instance's own previous jobs are owned by
+        // its old (dead) instance id, so they arrive here through the very same
+        // death-scan entry point — one state machine, two entry points.
+        let boot_sweep = !self.boot_sweep_done.swap(true, Ordering::AcqRel);
+        self.probe_peers(now_ms, boot_sweep).await;
+        // Settle passes touch every owned job, so they run at the probe cadence
+        // (5s) rather than at the tick rate (R2).
+        let settle_due = boot_sweep
+            || now_ms.saturating_sub(self.last_settle_ms.load(Ordering::Acquire) as i64)
+                >= crate::transfer::ownership::PEER_PROBE_INTERVAL.as_millis() as i64;
+        if settle_due {
+            self.last_settle_ms.store(now_ms as u64, Ordering::Release);
+            self.settle_owner_lost_jobs(now_ms).await?;
+            self.settle_expired_jobs(now_ms).await?;
+            self.advance_canceling_jobs(now_ms).await?;
+        }
+
         Self::blocking(self, move |s| s.cleanup_terminal_transfers(now_ms)).await?;
         Self::blocking(self, move |s| s.record_job_counts_if_due(now_ms)).await?;
         // Fairness: every N ticks, prefer acquiring a brand-new Pending job
@@ -666,20 +1001,35 @@ where
         // Read the live ceiling, not the file value: lowering `max_running_transfers`
         // must affect the very next acquire, and it must never abort a running job.
         let max_executing = self.runtime_config.max_running_transfers() as u64;
+        // CV-105: one CAS claim, no lease and no schema lock row. `lease_timeout`
+        // is still passed for backends that have not switched to the narrow
+        // claim query yet (postgres/SQLite), and disappears with them.
+        let after = self
+            .retick_cursor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let acquired = Self::blocking(self, move |s| {
-            s.store.acquire_runnable_transfer(
+            s.store.claim_next_job(
                 &s.owner,
-                lease_timeout,
                 now_ms,
                 max_executing,
                 prefer_pending,
+                lease_timeout,
+                &after,
             )
         })
         .await?;
         let Some(lease) = acquired else {
+            // Nothing after the cursor: restart the rotation at the beginning.
+            *self.retick_cursor.lock().unwrap_or_else(|e| e.into_inner()) = String::new();
             record_metric(|metrics| metrics.inc_acquire("empty"));
             return Ok(false);
         };
+        if lease.owner == self.owner {
+            *self.retick_cursor.lock().unwrap_or_else(|e| e.into_inner()) =
+                lease.job_id.clone();
+        }
         record_metric(|metrics| metrics.inc_acquire("ok"));
 
         let job_id = lease.job_id.clone();
@@ -689,7 +1039,11 @@ where
             return Ok(true);
         };
 
-        if job.cancel_requested {
+        // Only a user cancellation owns this path. An owner-lost / TTL job is in
+        // Canceling too, but its exit is decided by `advance_canceling_jobs`
+        // (re-plan or fail); letting it run through `cancel_transfer` here raced
+        // with that decision and could turn it into a plain Canceled job.
+        if job.cancel_requested && (job.cancel_reason.is_empty() || job.cancel_reason == "user") {
             self.cancel_transfer(&job, &lease).await?;
             return Ok(true);
         }
@@ -805,7 +1159,7 @@ where
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease.owner.clone(),
-            lease_epoch: lease.lease_epoch,
+            fence: lease.fence,
             message: job.summary.message.clone(),
             next_attempt_at_ms: now_ms,
             mount_snapshot_attempts: None,
@@ -885,11 +1239,12 @@ where
             }
         };
         self.record_job_counts(active, executing);
-        // Global task-state counts are a full-range GROUP BY on transfer_tasks
-        // (hourly calibration). Between calibrations the gauges track
-        // planning/assign/terminal deltas incrementally; cancel/purge drift
-        // is corrected by the next calibration. Observability only; failures
-        // must not perturb the scheduling path.
+        self.record_dispatch_capacity();
+        // Global task-state counts come from a full-range GROUP BY on
+        // transfer_tasks plus the tasks this instance holds only in memory
+        // (file-level tasks never get a row). The deltas above are smoothed
+        // estimates; this is the correction, and it has to run often enough
+        // that drift cannot grow into a wrong dashboard for an hour.
         let now = now_ms.max(0) as u64;
         let last_tasks = self.last_task_counts_ms.load(Ordering::Relaxed);
         if now.saturating_sub(last_tasks) >= TRANSFER_TASK_COUNTS_INTERVAL_MS
@@ -898,7 +1253,7 @@ where
                 .compare_exchange(last_tasks, now, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
-            match self.store.count_tasks_global() {
+            match self.calibrated_task_counts(now_ms) {
                 Ok(counts) => {
                     if let Ok(metrics) = TransferMetrics::get() {
                         metrics.set_task_counts(&counts);
@@ -911,6 +1266,62 @@ where
             }
         }
         Ok(())
+    }
+
+    /// Reports the two dispatch ceilings' consistency, once per metrics tick.
+    ///
+    /// Both knobs are the transfer's own runtime configuration, so this is the
+    /// only place that can notice they contradict each other: if
+    /// `count_ceiling x task_bytes` exceeds `byte_ceiling`, the byte gate closes
+    /// first and the count knob silently stops meaning anything. The metric is
+    /// the signal; the numbers go to the log on transition only.
+    fn record_dispatch_capacity(&self) {
+        let count_ceiling = self.runtime_config.worker_task_limit() as i64;
+        let byte_ceiling = self.runtime_config.worker_inflight_budget_bytes();
+        let task_bytes = match self.inflight.max_task_bytes() {
+            0 => TransferConf::DEFAULT_TASK_ESTIMATED_BYTES,
+            seen => seen,
+        };
+        let mismatch = count_ceiling > 0
+            && byte_ceiling > 0
+            && count_ceiling.saturating_mul(task_bytes) > byte_ceiling;
+        if let Ok(metrics) = TransferMetrics::get() {
+            metrics.set_dispatch_capacity(mismatch, task_bytes);
+        }
+        let previous = self.capacity_mismatch.swap(mismatch, Ordering::Relaxed);
+        if mismatch && !previous {
+            warn!(
+                "transfer dispatch ceilings contradict each other: worker_max_concurrent_tasks={} x largest task estimate {} B exceeds worker_inflight_budget_bytes={} B, so the real ceiling is ~{} tasks per worker. Raise the budget or lower the count",
+                count_ceiling,
+                task_bytes,
+                byte_ceiling,
+                if task_bytes > 0 { byte_ceiling / task_bytes } else { 0 }
+            );
+        }
+        if !mismatch && previous {
+            info!(
+                "transfer dispatch ceilings are consistent again: worker_max_concurrent_tasks={} x {} B <= worker_inflight_budget_bytes={} B",
+                count_ceiling, task_bytes, byte_ceiling
+            );
+        }
+    }
+
+    /// Task counts as the gauges should report them: persisted rows plus the
+    /// file-level tasks that only exist in this process's cache.
+    ///
+    /// File-level tasks never get a `transfer_tasks` row, so a store-only scan
+    /// reports zero for a job that is actively copying thousands of files.
+    fn calibrated_task_counts(&self, now_ms: i64) -> FsResult<TransferTaskCounts> {
+        let mut counts = self.store.count_tasks_global()?;
+        let cached = self.task_cache.counts(now_ms);
+        counts.pending += cached.pending;
+        counts.running += cached.running;
+        counts.completed += cached.completed;
+        counts.failed += cached.failed;
+        counts.canceled += cached.canceled;
+        counts.stale += cached.stale;
+        counts.completed_size += cached.completed_size;
+        Ok(counts)
     }
 
     fn cleanup_terminal_transfers(&self, tick_now_ms: i64) -> FsResult<()> {
@@ -1052,7 +1463,7 @@ where
                                 job_id: job.job_id.clone(),
                                 run_id: job.run_id,
                                 owner: lease.owner.clone(),
-                                lease_epoch: lease.lease_epoch,
+                                fence: lease.fence,
                                 message: format!("mount snapshot refresh delayed: {}", err),
                                 next_attempt_at_ms: now.saturating_add(delay_ms),
                                 mount_snapshot_attempts: Some(retry_count),
@@ -1064,13 +1475,13 @@ where
                                     metrics.inc_planning(transfer_kind_label(job.kind), "retry")
                                 });
                                 info!(
-                                    "transfer mount snapshot requeued job_id={} run_id={} kind={:?} tenant={} owner={} lease_epoch={} retry_count={} next_attempt_at_ms={} reason={}",
+                                    "transfer mount snapshot requeued job_id={} run_id={} kind={:?} tenant={} owner={} fence={} retry_count={} next_attempt_at_ms={} reason={}",
                                     job.job_id,
                                     job.run_id,
                                     job.kind,
                                     job.tenant,
                                     lease.owner,
-                                    lease.lease_epoch,
+                                    lease.fence,
                                     retry_count,
                                     now.saturating_add(delay_ms),
                                     err
@@ -1135,7 +1546,7 @@ where
                     job_id: job.job_id.clone(),
                     run_id: job.run_id,
                     owner: lease.owner.clone(),
-                    lease_epoch: lease.lease_epoch,
+                    fence: lease.fence,
                     mount_snapshot_json: snapshot_json.clone(),
                     cluster_snapshot_version: version,
                     now_ms: now_ms(),
@@ -1168,7 +1579,7 @@ where
                     job_id: job.job_id.clone(),
                     run_id: job.run_id,
                     owner: lease.owner.clone(),
-                    lease_epoch: lease.lease_epoch,
+                    fence: lease.fence,
                     message: format!("planning delayed: {}", err),
                     next_attempt_at_ms: now.saturating_add(PLANNING_REQUEUE_DELAY_MS),
                     mount_snapshot_attempts: None,
@@ -1177,13 +1588,13 @@ where
                 })?;
                 if requeued {
                     info!(
-                        "transfer state requeue job_id={} run_id={} kind={:?} tenant={} owner={} lease_epoch={} state={:?} next_attempt_at_ms={} reason={}",
+                        "transfer state requeue job_id={} run_id={} kind={:?} tenant={} owner={} fence={} state={:?} next_attempt_at_ms={} reason={}",
                         job.job_id,
                         job.run_id,
                         job.kind,
                         job.tenant,
                         lease.owner,
-                        lease.lease_epoch,
+                        lease.fence,
                         job.state,
                         now.saturating_add(PLANNING_REQUEUE_DELAY_MS),
                         err
@@ -1204,7 +1615,7 @@ where
                             job_id: job.job_id.clone(),
                             run_id: job.run_id,
                             owner: lease.owner.clone(),
-                            lease_epoch: lease.lease_epoch,
+                            fence: lease.fence,
                             message: format!(
                                 "planning throttled, retry {}/{}: {}",
                                 retry_count, PLANNING_LIST_MAX_RETRIES, err
@@ -1216,13 +1627,13 @@ where
                         })?;
                         if requeued {
                             info!(
-                                "transfer planning throttled job_id={} run_id={} kind={:?} tenant={} owner={} lease_epoch={} retry_count={} next_attempt_at_ms={} reason={}",
+                                "transfer planning throttled job_id={} run_id={} kind={:?} tenant={} owner={} fence={} retry_count={} next_attempt_at_ms={} reason={}",
                                 job.job_id,
                                 job.run_id,
                                 job.kind,
                                 job.tenant,
                                 lease.owner,
-                                lease.lease_epoch,
+                                lease.fence,
                                 retry_count,
                                 now.saturating_add(delay_ms),
                                 err
@@ -1275,7 +1686,7 @@ where
                 &job.job_id,
                 job.run_id,
                 &lease.owner,
-                lease.lease_epoch,
+                lease.fence,
                 cv_metadata_epoch,
                 now_ms(),
             )?;
@@ -1365,7 +1776,7 @@ where
                 job_id: job.job_id.clone(),
                 run_id: job.run_id,
                 owner: lease.owner.clone(),
-                lease_epoch: lease.lease_epoch,
+                fence: lease.fence,
                 tasks: tasks.to_vec(),
                 message: String::new(),
                 now_ms: now_ms(),
@@ -1373,11 +1784,8 @@ where
             if !appended {
                 warn!(
                     "stop planning transfer {} because owner {} lease epoch {} is stale",
-                    job.job_id, lease.owner, lease.lease_epoch
+                    job.job_id, lease.owner, lease.fence
                 );
-                return Ok(());
-            }
-            if !self.renew_planning_lease(&lease)? {
                 return Ok(());
             }
         }
@@ -1405,14 +1813,11 @@ where
             )?;
             return Err(err);
         }
-        if !self.renew_planning_lease(&lease)? {
-            return Ok(());
-        }
         let persisted = self.store.persist_planned_tasks(TransferPlannedTasks {
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease.owner.clone(),
-            lease_epoch: lease.lease_epoch,
+            fence: lease.fence,
             tasks: Vec::new(),
             message,
             now_ms: now_ms(),
@@ -1420,7 +1825,7 @@ where
         if !persisted {
             warn!(
                 "stop planning transfer {} because owner {} lease epoch {} is stale",
-                job.job_id, lease.owner, lease.lease_epoch
+                job.job_id, lease.owner, lease.fence
             );
             return Ok(());
         }
@@ -1437,37 +1842,17 @@ where
         self.dispatch_pending_tasks(job, lease).await
     }
 
+    /// Planning work no longer needs a lease heartbeat: ownership is
+    /// process-scoped, so a long plan simply keeps running (CV-105 §3.1).
     async fn await_with_planning_lease<T, F>(
         &self,
-        lease: &TransferLease,
+        _lease: &TransferLease,
         work: F,
     ) -> FsResult<Option<T>>
     where
         F: Future<Output = T>,
     {
-        await_with_lease_renewal(work, lease_renew_interval(self.conf.lease_timeout), || {
-            self.renew_planning_lease(lease)
-        })
-        .await
-    }
-
-    fn renew_planning_lease(&self, lease: &TransferLease) -> FsResult<bool> {
-        let renewed = self.store.renew_lease(
-            &lease.job_id,
-            lease.run_id,
-            &lease.owner,
-            lease.lease_epoch,
-            duration_ms(self.conf.lease_timeout),
-            now_ms(),
-        )?;
-        record_metric(|metrics| metrics.inc_lease_renew(if renewed { "success" } else { "stale" }));
-        if !renewed {
-            warn!(
-                "stop planning transfer {} because owner {} lease epoch {} is stale",
-                lease.job_id, lease.owner, lease.lease_epoch
-            );
-        }
-        Ok(renewed)
+        Ok(Some(work.await))
     }
 
     /// Remove targets that need replacement only after all plan rows are
@@ -1549,20 +1934,11 @@ where
     ) -> FsResult<()> {
         let mut dispatched = 0usize;
         let mut blocked_total = 0usize;
-        // Lazy ledger refresh (design §4.1): only on dispatch; a failed
-        // aggregation skips dispatch this tick (fail-safe, no blind dispatch).
-        if let Err(err) = self.inflight.ensure_fresh(
-            self.store.as_ref(),
-            now_ms() as u64,
-            TransferConf::DEFAULT_TASK_ESTIMATED_BYTES,
-        ) {
-            record_metric(|metrics| metrics.inc_dispatch("failure", 1));
-            warn!(
-                "skip dispatching transfer {} because inflight aggregation failed: {}",
-                job.job_id, err
-            );
-            return Ok(());
-        }
+        let tick_started = std::time::Instant::now();
+        // Worker capacity comes from the workers themselves (each submit response
+        // carries their live load), so the tick never queries the task table.
+        // A stale snapshot only aims at a worker that is already full, which
+        // rejects with `worker_at_capacity` and lands in the cooldown below.
         // File-level tasks live only in this process. If a restart (or a
         // failover) left a Dispatching/Running job with no tasks at all, the
         // work was never planned into the store: re-plan from the source
@@ -1584,10 +1960,20 @@ where
             return Ok(());
         }
         loop {
+            // Fairness: never let one job's task set monopolize the tick.
+            if dispatched >= SCHEDULER_TICK_TASK_LIMIT
+                || tick_started.elapsed() >= SCHEDULER_TICK_BUDGET
+            {
+                break;
+            }
             if self.cancel_requested(&job, &lease).await? {
                 return Ok(());
             }
-            let limit = self.conf.planning_batch_size();
+            let limit = self
+                .conf
+                .planning_batch_size()
+                .min(SCHEDULER_TICK_TASK_LIMIT.saturating_sub(dispatched))
+                .max(1);
             let mut tasks = self
                 .store
                 .claim_pending_tasks(&job.job_id, job.run_id, limit)?;
@@ -1637,24 +2023,6 @@ where
                 record_metric(|metrics| metrics.inc_dispatch("not_started", 1));
                 break;
             }
-            let renewed = self.store.renew_lease(
-                &lease.job_id,
-                lease.run_id,
-                &lease.owner,
-                lease.lease_epoch,
-                duration_ms(self.conf.lease_timeout),
-                now_ms(),
-            )?;
-            record_metric(|metrics| {
-                metrics.inc_lease_renew(if renewed { "success" } else { "stale" })
-            });
-            if !renewed {
-                warn!(
-                    "stop dispatching transfer {} because owner {} lease epoch {} is stale",
-                    lease.job_id, lease.owner, lease.lease_epoch
-                );
-                return Ok(());
-            }
         }
 
         if self.cancel_requested(&job, &lease).await? {
@@ -1703,8 +2071,13 @@ where
         lease: &TransferLease,
         tasks: Vec<TransferTaskRecord>,
     ) -> FsResult<(usize, usize)> {
-        let workers = match self.cache.live_workers() {
-            Ok(workers) if !workers.is_empty() => workers,
+        let workers = match self.cache.live_workers_versioned() {
+            Ok((version, workers)) if !workers.is_empty() => {
+                // The decision below must use the same snapshot it was derived
+                // from, so the ledger's base is advanced here and nowhere else.
+                self.inflight.apply_snapshot(version, &workers);
+                workers
+            }
             Ok(_) | Err(_) => {
                 // No candidate worker at all: the remaining tasks stay
                 // Pending and the caller must see why.
@@ -1732,7 +2105,7 @@ where
             let cache = self.cache.clone();
             let job_info = job_info.clone();
             let owner = lease.owner.clone();
-            let lease_epoch = lease.lease_epoch;
+            let fence = lease.fence;
             let report_endpoints = vec![self.self_report_target.clone()];
             let task_stale_timeout_ms = duration_ms(self.conf.task_stale_timeout);
             let task_cache = self.task_cache.clone();
@@ -1744,7 +2117,7 @@ where
                     cache,
                     job_info,
                     owner,
-                    lease_epoch,
+                    fence,
                     task,
                     worker,
                     report_endpoints,
@@ -1779,7 +2152,7 @@ where
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease.owner.clone(),
-            lease_epoch: lease.lease_epoch,
+            fence: lease.fence,
             message: "requeued: task state was lost across a restart".to_string(),
             next_attempt_at_ms: now_ms(),
             mount_snapshot_attempts: None,
@@ -1843,7 +2216,7 @@ where
                 job_id: task.job_id.clone(),
                 run_id: task.run_id,
                 owner: lease.owner.clone(),
-                lease_epoch: lease.lease_epoch,
+                fence: lease.fence,
                 task_id: task.task_id.clone(),
                 from_states: vec![TransferTaskState::Failed],
                 state: TransferTaskState::Pending,
@@ -1856,6 +2229,9 @@ where
             record_metric(|metrics| {
                 metrics.inc_stale_retry("transient_retry");
                 metrics.inc_requeue("transient_retry");
+                // Failed→Pending: the task is queued again, so the gauge has to
+                // leave `failed` and rejoin `pending` together with it.
+                metrics.task_retried(1);
             });
         }
         Ok(retryable_remaining)
@@ -1927,7 +2303,7 @@ where
                     &job.job_id,
                     job.run_id,
                     &lease.owner,
-                    lease.lease_epoch,
+                    lease.fence,
                     now,
                     candidates.to_vec(),
                 )?;
@@ -1951,7 +2327,7 @@ where
                     job_id: task.job_id.clone(),
                     run_id: task.run_id,
                     owner: lease.owner.clone(),
-                    lease_epoch: lease.lease_epoch,
+                    fence: lease.fence,
                     task_id: task.task_id.clone(),
                     from_states: vec![TransferTaskState::Stale],
                     state: TransferTaskState::Failed,
@@ -1984,7 +2360,7 @@ where
                 job_id: task.job_id.clone(),
                 run_id: task.run_id,
                 owner: lease.owner.clone(),
-                lease_epoch: lease.lease_epoch,
+                fence: lease.fence,
                 task_id: task.task_id.clone(),
                 from_states: vec![TransferTaskState::Stale],
                 state: TransferTaskState::Pending,
@@ -2020,7 +2396,10 @@ where
             is_task_retryable_message,
         );
         if cache_retried > 0 {
-            record_metric(|metrics| metrics.inc_stale_retry("cache_transient_retry"));
+            record_metric(|metrics| {
+                metrics.inc_stale_retry("cache_transient_retry");
+                metrics.task_retried(cache_retried);
+            });
             self.transition(
                 &job,
                 &lease,
@@ -2474,17 +2853,9 @@ where
         self.stop_recoverable_tasks(job, lease, "transfer canceled")
             .await?;
         if self.store.has_recoverable_tasks(&job.job_id, job.run_id)? {
-            let renewed = self.store.renew_lease(
-                &lease.job_id,
-                lease.run_id,
-                &lease.owner,
-                lease.lease_epoch,
-                duration_ms(self.conf.lease_timeout),
-                now_ms(),
-            )?;
-            record_metric(|metrics| {
-                metrics.inc_lease_renew(if renewed { "success" } else { "stale" })
-            });
+            // Ownership is process-scoped now: waiting for the tasks to stop
+            // needs no write at all. The next tick re-checks convergence.
+            let _ = lease;
             return Ok(());
         }
 
@@ -2509,17 +2880,9 @@ where
         self.stop_recoverable_tasks(job, lease, "transfer stopped after a task failed")
             .await?;
         if self.store.has_recoverable_tasks(&job.job_id, job.run_id)? {
-            let renewed = self.store.renew_lease(
-                &lease.job_id,
-                lease.run_id,
-                &lease.owner,
-                lease.lease_epoch,
-                duration_ms(self.conf.lease_timeout),
-                now_ms(),
-            )?;
-            record_metric(|metrics| {
-                metrics.inc_lease_renew(if renewed { "success" } else { "stale" })
-            });
+            // Ownership is process-scoped now: waiting for the tasks to stop
+            // needs no write at all. The next tick re-checks convergence.
+            let _ = lease;
             return Ok(());
         }
         let summary = self.task_summary(job)?;
@@ -2574,35 +2937,30 @@ where
         lease: &TransferLease,
         message: &str,
     ) -> FsResult<()> {
-        let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
-        let mut workers = HashSet::new();
         let now = now_ms();
-        for task in tasks {
-            if !matches!(
-                task.state,
-                TransferTaskState::Pending | TransferTaskState::Running | TransferTaskState::Stale
-            ) {
-                continue;
-            }
-            if task.state == TransferTaskState::Pending
-                || task.state == TransferTaskState::Stale
-                || (task.state == TransferTaskState::Running && task.stale_deadline_at <= now)
-            {
-                let _ = self.store.update_task_state(TransferTaskStateUpdate {
-                    job_id: task.job_id.clone(),
-                    run_id: task.run_id,
-                    owner: lease.owner.clone(),
-                    lease_epoch: lease.lease_epoch,
-                    task_id: task.task_id,
-                    from_states: vec![task.state],
-                    state: TransferTaskState::Canceled,
-                    message: message.to_string(),
-                    now_ms: now,
-                    bump_retry: false,
-                })?;
-            } else if task.worker_id != 0 {
-                workers.insert((task.worker_id, task.worker_session_id));
-            }
+        // One statement for the whole batch: cancelling a plan of 100k tasks used
+        // to be 100k transactions (measured ~110 tasks/s, CV-86).
+        let canceled = self.store.cancel_recoverable_tasks(
+            &job.job_id,
+            job.run_id,
+            &lease.owner,
+            lease.fence,
+            message,
+            now,
+        )?;
+        // Memory-only tasks have no rows, so they are cancelled in place; the ones
+        // still reporting tell us which workers must be told to stop.
+        let mut workers: HashSet<(u32, String)> = self
+            .task_cache
+            .cancel_recoverable(&job.job_id, job.run_id, message, now)
+            .into_iter()
+            .collect();
+        workers.extend(self.store.running_task_workers(&job.job_id, job.run_id)?);
+        if canceled > 0 {
+            debug!(
+                "canceled {} recoverable task rows of transfer {} in one batch",
+                canceled, job.job_id
+            );
         }
 
         let live_workers = match self.cache.live_workers() {
@@ -2619,7 +2977,7 @@ where
             if workers.contains(&(worker.worker_id(), worker.worker_session_id.clone())) {
                 match self.factory.get_worker_client(&worker.address).await {
                     Ok(client) => {
-                        if let Err(err) = client.cancel_job(&job.job_id).await {
+                        if let Err(err) = client.cancel_job(&job.job_id, job.run_id).await {
                             warn!(
                                 "cancel transfer {} on worker {} failed: {}",
                                 job.job_id, worker, err
@@ -2669,16 +3027,20 @@ where
             candidates.extend(workers.iter().cloned());
         }
         let workers = candidates.as_slice();
+        // Both limits are loaded per decision, not per scheduler: a runtime
+        // config push must change the very next dispatch. They are the transfer
+        // role's own numbers; a worker's report is load, not a ceiling.
         let admitted = choose_worker_admitted(
             workers,
             estimated_bytes,
-            // Loaded per decision, not per scheduler: a runtime-config push must
-            // change the very next dispatch, and a cached local would freeze it.
             self.runtime_config.worker_task_limit(),
-            TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES,
+            self.runtime_config.worker_inflight_budget_bytes(),
             |worker_id| self.inflight.get(worker_id),
         );
         if admitted.is_empty() {
+            // No worker has room: report backpressure and dispatch nothing.
+            // Never aim at a worker we already estimated as full; the next
+            // heartbeat snapshot is what can change this answer.
             return None;
         }
         // Tie-break among equally loaded workers via the polling cursor.
@@ -2718,7 +3080,7 @@ where
             job_id: lease.job_id.clone(),
             run_id: lease.run_id,
             owner: lease.owner.clone(),
-            lease_epoch: lease.lease_epoch,
+            fence: lease.fence,
             from_states: from_states.to_vec(),
             to_state,
             message: message.clone(),
@@ -2726,13 +3088,13 @@ where
         })?;
         if updated {
             info!(
-                "transfer state transition job_id={} run_id={} kind={:?} tenant={} owner={} lease_epoch={} from={:?} to={:?} message={}",
+                "transfer state transition job_id={} run_id={} kind={:?} tenant={} owner={} fence={} from={:?} to={:?} message={}",
                 lease.job_id,
                 lease.run_id,
                 job.kind,
                 job.tenant,
                 lease.owner,
-                lease.lease_epoch,
+                lease.fence,
                 from_states,
                 to_state,
                 message
@@ -2774,13 +3136,57 @@ struct DispatchTaskRequest<S> {
     cache: ClusterMetadataCache,
     job_info: LoadJobInfo,
     owner: String,
-    lease_epoch: u64,
+    fence: u64,
     task: TransferTaskRecord,
     worker: WorkerInfo,
     report_endpoints: Vec<String>,
     task_stale_timeout_ms: i64,
     task_cache: Arc<TaskCache>,
     worker_blacklist: Arc<WorkerBlacklist>,
+}
+
+/// Returns a task to Pending after the worker refused it before accepting.
+///
+/// File-level tasks live only in the cache and have no `transfer_tasks` row, so
+/// a store write there answers "not found" and the task would stay Running until
+/// a stale deadline expires - i.e. a rejection that costs a whole
+/// `task_stale_timeout` of latency for no reason. Release those in memory
+/// instead, which is what the cache field is for.
+#[allow(clippy::too_many_arguments)]
+fn requeue_rejected_task<S>(
+    store: &S,
+    task_cache: &TaskCache,
+    task: &TransferTaskRecord,
+    owner: &str,
+    fence: u64,
+    reason: &str,
+    bump_retry: bool,
+    now_ms: i64,
+) -> FsResult<bool>
+where
+    S: TransferStore + ?Sized,
+{
+    if task_cache.owns_task(&task.job_id, task.run_id, &task.task_id) {
+        // Memory-only: no row exists, so this is the whole bookkeeping.
+        return Ok(task_cache.release_attempt(
+            &task.job_id,
+            task.run_id,
+            &task.task_id,
+            now_ms,
+        ));
+    }
+    store.update_task_state(TransferTaskStateUpdate {
+        job_id: task.job_id.clone(),
+        run_id: task.run_id,
+        owner: owner.to_string(),
+        fence,
+        task_id: task.task_id.clone(),
+        from_states: vec![TransferTaskState::Running],
+        state: TransferTaskState::Pending,
+        message: format!("worker rejected task before accept: {}", reason),
+        now_ms,
+        bump_retry,
+    })
 }
 
 async fn dispatch_one<S>(request: DispatchTaskRequest<S>) -> FsResult<bool>
@@ -2793,7 +3199,7 @@ where
         cache,
         job_info,
         owner,
-        lease_epoch,
+        fence,
         task,
         worker,
         report_endpoints,
@@ -2837,7 +3243,7 @@ where
         job_id: task.job_id.clone(),
         run_id: task.run_id,
         owner: owner.clone(),
-        lease_epoch,
+        fence,
         task_id: task.task_id.clone(),
         attempt_id,
         worker_id: worker.worker_id(),
@@ -2883,15 +3289,28 @@ where
 
     match client.submit_load_task_response(load_task).await {
         Ok(response) if response.accepted.unwrap_or(true) => {
+            // The ledger already counted this dispatch and the next heartbeat
+            // snapshot replaces the estimate wholesale, so the answer's load
+            // numbers are deliberately not read here: capacity comes from the
+            // heartbeat, never from a submit answer.
             record_metric(|metrics| metrics.task_assigned());
             Ok(true)
         }
         Ok(response) => {
             let reason = response.reject_reason.unwrap_or_default();
-            // Capacity/session rejections are the same signal as an unreachable
-            // node for placement purposes: avoid it for a short window so the
-            // retry has a chance to land elsewhere.
-            worker_blacklist.block(worker.worker_id(), now_ms());
+            // A capacity refusal (the common case) changes nothing on the
+            // control plane: no skip, no cooldown, no refresh, and its load
+            // numbers are not read. The estimate stays whatever the last
+            // periodic snapshot said - deliberately allowed to be stale, since
+            // the worker's own gate is the backstop and the next scheduled
+            // snapshot corrects it.
+            //
+            // A session-class rejection is different: it says the cached peer
+            // session is invalid, which no cadence can fix, so the worker is
+            // parked in the short blacklist until its next heartbeat.
+            if is_session_rejection(&reason) {
+                worker_blacklist.block(worker.worker_id(), now_ms());
+            }
             warn!(
                 "worker rejected transfer task before accepting it: job={} run={} task={} attempt={} worker_id={} worker_session={} source={} target={} reason={}",
                 task.job_id,
@@ -2904,22 +3323,20 @@ where
                 task.target_path,
                 reason
             );
-            if !store.update_task_state(TransferTaskStateUpdate {
-                job_id: task.job_id.clone(),
-                run_id: task.run_id,
-                owner,
-                lease_epoch,
-                task_id: task.task_id.clone(),
-                from_states: vec![TransferTaskState::Running],
-                state: TransferTaskState::Pending,
-                message: format!("worker rejected task before accept: {}", reason),
-                now_ms: now_ms(),
-                // Capacity rejections (worker busy, temporary) must not count
-                // against the retry ceiling: the worker is healthy and will
-                // accept the task once load drops. Only session/capability
-                // rejections indicate a real problem worth bounding.
-                bump_retry: is_session_rejection(&reason),
-            })? {
+            // Capacity rejections (worker busy, temporary) must not count
+            // against the retry ceiling: the worker is healthy and will accept
+            // the task once load drops. Only session/capability rejections
+            // indicate a real problem worth bounding.
+            if !requeue_rejected_task(
+                store.as_ref(),
+                &task_cache,
+                &task,
+                &owner,
+                fence,
+                &reason,
+                is_session_rejection(&reason),
+                now_ms(),
+            )? {
                 return Ok(false);
             }
             // Capacity rejections must NOT remove the worker session: the worker
@@ -2984,37 +3401,6 @@ fn placement_hand_back_key(job: &TransferJobRecord) -> String {
     format!("{}:{}", job.job_id, job.run_id)
 }
 
-pub(crate) fn lease_renew_interval(lease_timeout: Duration) -> Duration {
-    (lease_timeout / 2).max(SCHEDULER_MIN_IDLE_INTERVAL)
-}
-
-/// Poll work while extending its fenced lease; `None` means ownership changed.
-pub(crate) async fn await_with_lease_renewal<T, F, R>(
-    work: F,
-    renew_interval: Duration,
-    mut renew: R,
-) -> FsResult<Option<T>>
-where
-    F: Future<Output = T>,
-    R: FnMut() -> FsResult<bool>,
-{
-    let mut work = std::pin::pin!(work);
-    let renewal = tokio::time::sleep(renew_interval);
-    tokio::pin!(renewal);
-
-    loop {
-        tokio::select! {
-            result = &mut work => return Ok(Some(result)),
-            _ = &mut renewal => {
-                if !renew()? {
-                    return Ok(None);
-                }
-                renewal.as_mut().reset(tokio::time::Instant::now() + renew_interval);
-            }
-        }
-    }
-}
-
 /// Message for a dispatch round: capacity backpressure must be visible in the
 /// job status Message column, so blocked reasons win over a bare count.
 /// Message for a dispatch round: capacity backpressure must be visible in the
@@ -3030,25 +3416,29 @@ pub(crate) fn dispatch_result_message(dispatched: usize, blocked: usize) -> Stri
     }
 }
 
-/// Candidates for [`TransferScheduler::choose_worker`]: workers that pass the
-/// batch-capability gate, their heartbeat-reported count/byte gates (oversize
-/// tasks only on idle workers, design §4.2). Pure - the ledger lookup is
-/// injected so the gating rules can be unit-tested without a full scheduler.
+/// Candidates for [`TransferScheduler::choose_worker`]: workers under the
+/// count/byte ceilings (oversize tasks only on idle workers, design §4.2).
+///
+/// The two ceilings are the transfer role's runtime configuration, applied to
+/// every worker alike. A worker's heartbeat carries its own numbers, but those
+/// are a load reading for operators, not an admission ceiling: one knob has to
+/// decide dispatch, or tuning a fleet means touching every worker.
+///
+/// Pure - the ledger lookup is injected so the gating rules can be unit-tested
+/// without a full scheduler.
 fn choose_worker_admitted(
     workers: &[WorkerInfo],
     estimated_bytes: i64,
-    default_count_limit: usize,
-    default_byte_limit: i64,
+    count_limit: usize,
+    byte_limit: i64,
     inflight: impl Fn(u32) -> (u64, i64),
 ) -> Vec<(i64, usize)> {
     let mut admitted: Vec<(i64, usize)> = Vec::with_capacity(workers.len());
     for (index, worker) in workers.iter().enumerate() {
         let (count, bytes) = inflight(worker.worker_id());
-        let count_limit = worker.effective_worker_max_concurrent_tasks(default_count_limit);
         if count_limit > 0 && count >= count_limit as u64 {
             continue;
         }
-        let byte_limit = worker.effective_transfer_inflight_budget_bytes(default_byte_limit);
         let oversize = byte_limit > 0 && estimated_bytes > byte_limit;
         // Oversize tasks only run on an idle worker to avoid starvation.
         let fits = byte_limit <= 0 || bytes.saturating_add(estimated_bytes) <= byte_limit;
@@ -3348,8 +3738,8 @@ mod tests {
         let admitted = choose_worker_admitted(&workers, 150, 0, 0, |_| (0, 1000));
         assert_eq!(admitted.len(), 2);
 
-        // A worker that reported 200 bytes may receive a 150-byte task while
-        // a non-idle worker that kept the legacy 100-byte default cannot.
+        // One byte ceiling for the whole fleet: the worker's own reported
+        // budget must not widen it for a single worker.
         let mut w1 = WorkerInfo::new(
             WorkerAddress {
                 worker_id: 1,
@@ -3373,7 +3763,11 @@ mod tests {
                 (0, 0)
             }
         });
-        assert_eq!(admitted, vec![(0, 1)]);
+        assert_eq!(
+            admitted,
+            vec![(0, 1)],
+            "a reported 200 budget must not admit a 150-byte task under a 100-byte ceiling"
+        );
     }
 
     #[test]
@@ -3386,47 +3780,60 @@ mod tests {
         // count_limit=0 disables the count gate.
         let admitted = choose_worker_admitted(&[w1], 10, 0, 0, |_| (2, 0));
         assert_eq!(admitted.len(), 1);
-        // A worker that reported its own ceiling overrides the default: at 4
-        // in-flight it still fits under its reported limit of 5.
+        // A worker's own report is advisory: it neither raises nor lowers the
+        // ceiling the transfer decides with.
         let mut w2 = WorkerInfo::new(Default::default(), 1);
         w2.worker_max_concurrent_tasks = 5;
-        let admitted = choose_worker_admitted(std::slice::from_ref(&w2), 10, 2, 0, |_| (4, 0));
-        assert_eq!(admitted.len(), 1);
-        // ...and is excluded once it reaches its own reported limit.
-        let admitted = choose_worker_admitted(std::slice::from_ref(&w2), 10, 2, 0, |_| (5, 0));
-        assert!(admitted.is_empty());
-    }
-
-    #[test]
-    fn unknown_size_rows_count_at_default_estimate() {
-        use super::inflight_bytes_with_default;
-        // 2 unknown rows at 256MiB default each add 512MiB to known bytes.
+        let admitted = choose_worker_admitted(std::slice::from_ref(&w2), 10, 2, 0, |_| (2, 0));
+        assert!(admitted.is_empty(), "a reported 5 must not raise a limit of 2");
+        w2.worker_max_concurrent_tasks = 1;
+        let admitted = choose_worker_admitted(std::slice::from_ref(&w2), 10, 2, 0, |_| (1, 0));
         assert_eq!(
-            inflight_bytes_with_default(100, 2, 256 * 1024 * 1024),
-            100 + 2 * 256 * 1024 * 1024
-        );
-        // No unknown rows: no addition.
-        assert_eq!(inflight_bytes_with_default(100, 0, 256 * 1024 * 1024), 100);
-        // Unknown rows with default 0 (disabled batching estimate) add nothing.
-        assert_eq!(inflight_bytes_with_default(100, 2, 0), 100);
-        // Saturation: enormous unknown counts do not overflow.
-        assert_eq!(
-            inflight_bytes_with_default(i64::MAX - 1, 1, 256 * 1024 * 1024),
-            i64::MAX
+            admitted.len(),
+            1,
+            "a reported 1 must not lower a limit of 2"
         );
     }
 
+    /// The snapshot is the only writer of the base: local dispatches add on
+    /// top, and the next snapshot replaces both.
     #[test]
-    fn ledger_refresh_replaces_snapshot_wholesale() {
+    fn snapshot_replaces_base_and_clears_local_dispatches() {
+        use curvine_model::WorkerAddress;
         let ledger = InflightLedger::new(Duration::from_secs(15));
-        ledger.account(1, 5, 5000);
-        // Simulate a store snapshot where worker 1 has less in flight.
-        *ledger.entries.write().unwrap_or_else(|e| e.into_inner()) =
-            [(1, (1, 1000))].into_iter().collect();
-        ledger
-            .refreshed_at_ms
-            .store(1, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(ledger.get(1), (1, 1000));
+        let worker = |id: u32, load: (u64, i64)| {
+            let mut info = WorkerInfo::new(
+                WorkerAddress {
+                    worker_id: id,
+                    ..Default::default()
+                },
+                1,
+            );
+            info.transfer_inflight_tasks = load.0;
+            info.transfer_inflight_bytes = load.1;
+            info
+        };
+
+        ledger.apply_snapshot(1, &[worker(1, (7, 7000))]);
+        assert_eq!(ledger.get(1), (7, 7000));
+
+        // Local dispatches add on top of the base until the next snapshot.
+        ledger.account(1, 1, 1000);
+        assert_eq!(ledger.get(1), (8, 8000));
+
+        // A stale snapshot must not move the base backwards.
+        ledger.apply_snapshot(1, &[worker(1, (0, 0))]);
+        assert_eq!(ledger.get(1), (8, 8000));
+
+        // The next snapshot wins outright and clears the local delta - this is
+        // what makes a saturated ledger recover without any submit.
+        ledger.apply_snapshot(2, &[worker(1, (2, 2000))]);
+        assert_eq!(ledger.get(1), (2, 2000));
+
+        // Dispatch decisions are a pure function of the snapshot: nothing a
+        // worker answers can mark it as skipped, only the next snapshot moves
+        // the base.
+        assert_eq!(ledger.get(1), (2, 2000));
     }
 
     #[test]

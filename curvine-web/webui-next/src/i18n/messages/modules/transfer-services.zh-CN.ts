@@ -90,6 +90,8 @@ export default {
       reset: '还原',
       mixed: '不一致',
       hint: '值会推送到 transfer.endpoints 里的每个实例；还原即回到配置文件的值。',
+      bytesHint:
+        'worker_inflight_budget_bytes 支持 10GB / 512MB / 1.5GB 或直接写字节数；它是调度器派发时唯一使用的准入上限。',
       acceptJobsHint:
         'accept_jobs=false 表示关闭新任务提交（提示"功能临时关闭，请稍后重试"），进程、调度器和已在跑的任务都不受影响。',
       closedBanner: '{count} 个实例已关闭新任务提交（`accept_jobs=false`），已在跑的任务不受影响。',

@@ -399,6 +399,7 @@ impl WriteHandler {
             if let Some(dir_metrics) = dir_metrics {
                 dir_metrics.write_bytes.inc_by(data_len);
                 dir_metrics.write_time_us.inc_by(used as i64);
+                dir_metrics.write_duration_us.observe(used as f64);
                 dir_metrics.write_count.inc();
             }
         }

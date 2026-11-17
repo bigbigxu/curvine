@@ -40,9 +40,12 @@ fn job(job_id: &str, submitter: &str, target: &str) -> TransferJobRecord {
         cv_metadata_epoch: None,
         state: TransferState::Pending,
         owner: String::new(),
-        lease_epoch: 0,
+        fence: 0,
         lease_expire_at: 0,
         cancel_requested: false,
+        expires_at: 0,
+        cancel_reason: String::new(),
+        max_runs: TransferJobRecord::DEFAULT_MAX_RUNS,
         summary: TransferProgress::default(),
         client_request_id: format!("request-{job_id}"),
         submitter: submitter.to_string(),
@@ -76,7 +79,7 @@ fn check_overlap_exemption(store: &impl TransferStore) {
         .create_or_get_by_request_id_checked(job("user", "cli", "s3://bkt/mnt"))
         .unwrap();
     let user = store
-        .acquire_runnable_transfer("o", 60_000, 10, 8, true)
+        .claim_next_job("o", 10, 8, true, 0, "")
         .unwrap()
         .expect("user job acquired");
     assert_eq!(user.job_id, "user");
@@ -85,7 +88,7 @@ fn check_overlap_exemption(store: &impl TransferStore) {
         .create_or_get_by_request_id_checked(job("fs", "fs-mode:c1", "s3://bkt/mnt/a"))
         .unwrap();
     let fs = store
-        .acquire_runnable_transfer("o", 60_000, 11, 8, true)
+        .claim_next_job("o", 11, 8, true, 0, "")
         .unwrap()
         .expect("an fs_mode job is not blocked by an overlapping user job");
     assert_eq!(fs.job_id, "fs");
@@ -107,7 +110,7 @@ fn check_slot_accounting(store: &impl TransferStore) {
         .create_or_get_by_request_id_checked(job("fs1", "fs-mode:c1", "s3://bkt/x"))
         .unwrap();
     store
-        .acquire_runnable_transfer("o", 60_000, 10, 1, true)
+        .claim_next_job("o", 10, 1, true, 0, "")
         .unwrap()
         .expect("first job acquired");
     store
@@ -115,7 +118,7 @@ fn check_slot_accounting(store: &impl TransferStore) {
         .unwrap();
     // The executing fs_mode job takes the only slot.
     assert!(store
-        .acquire_runnable_transfer("o", 60_000, 11, 1, true)
+        .claim_next_job("o", 11, 1, true, 0, "")
         .unwrap()
         .is_none());
 }

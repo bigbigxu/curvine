@@ -26,8 +26,9 @@
 use curvine_config::{ClusterConf, RuntimeConfigRegistry, TransferConf};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::{FsError, FsResult};
+use curvine_runtime::common::ByteUnit;
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Runtime key for the per-worker concurrency ceiling.
@@ -36,6 +37,16 @@ use std::sync::Arc;
 /// registry; the on-disk field it is backed by is
 /// `job.worker_max_concurrent_tasks`.
 pub const WORKER_MAX_CONCURRENT_TASKS_CONFIG: &str = "worker_max_concurrent_tasks";
+
+/// Runtime key for the per-worker in-flight byte budget.
+///
+/// The transfer role is the only authority for admission: workers report their
+/// own load and reject, but the *ceiling* used to decide whether to dispatch is
+/// this value, so tuning one place (the transfer) is enough. Like the worker's
+/// key of the same name there is no configuration-file entry - the default is
+/// `TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES` - so it resets on
+/// restart instead of pretending to be persisted.
+pub const WORKER_INFLIGHT_BUDGET_CONFIG: &str = "worker_inflight_budget_bytes";
 
 /// Runtime key for the per-job planned-task ceiling.
 ///
@@ -75,6 +86,10 @@ pub struct TransferRuntimeConfig {
     file_worker_task_limit: usize,
     /// Effective ceiling. Read on every dispatch decision (never cached).
     worker_task_limit: AtomicUsize,
+    /// Value restored by `reset_worker_inflight_budget_bytes`.
+    file_worker_inflight_budget_bytes: i64,
+    /// Effective per-worker byte ceiling. Read on every dispatch decision.
+    worker_inflight_budget_bytes: AtomicI64,
     /// Value from the configuration file, restored by `reset_max_tasks_per_transfer`.
     file_max_tasks_per_transfer: usize,
     /// Effective per-job task cap. Read on every planning cap check.
@@ -101,6 +116,11 @@ impl TransferRuntimeConfig {
             conf.transfer.max_tasks_per_transfer,
             conf.transfer.max_plan_entries,
         );
+        // No configuration-file field: the default is the constant the worker
+        // uses too, so the two sides agree until an operator tunes the transfer.
+        let budget = TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES;
+        state.file_worker_inflight_budget_bytes = budget;
+        state.worker_inflight_budget_bytes = AtomicI64::new(budget);
         state.file_accept_jobs = conf.transfer.accepts_jobs();
         state.accept_jobs = AtomicBool::new(conf.transfer.accepts_jobs());
         state.file_max_running_transfers = conf.transfer.max_running_transfers.max(1);
@@ -128,6 +148,10 @@ impl TransferRuntimeConfig {
         Self {
             file_worker_task_limit: worker_task_limit,
             worker_task_limit: AtomicUsize::new(worker_task_limit.max(1)),
+            file_worker_inflight_budget_bytes: TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES,
+            worker_inflight_budget_bytes: AtomicI64::new(
+                TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES,
+            ),
             file_max_tasks_per_transfer: max_tasks_per_transfer,
             max_tasks_per_transfer: AtomicUsize::new(max_tasks_per_transfer.max(1)),
             file_max_plan_entries: max_plan_entries,
@@ -142,6 +166,30 @@ impl TransferRuntimeConfig {
     /// Effective per-worker concurrency ceiling.
     pub fn worker_task_limit(&self) -> usize {
         self.worker_task_limit.load(Ordering::Acquire)
+    }
+
+    /// Effective per-worker in-flight byte ceiling.
+    pub fn worker_inflight_budget_bytes(&self) -> i64 {
+        self.worker_inflight_budget_bytes.load(Ordering::Acquire)
+    }
+
+    /// Applies a new per-worker byte ceiling and returns the previous one.
+    pub fn update_worker_inflight_budget_bytes(&self, target: i64) -> FsResult<i64> {
+        if target <= 0 {
+            return Err(FsError::common(format!(
+                "{} must be greater than zero",
+                WORKER_INFLIGHT_BUDGET_CONFIG
+            )));
+        }
+        Ok(self.worker_inflight_budget_bytes.swap(target, Ordering::AcqRel))
+    }
+
+    /// Restores the default budget and returns it.
+    pub fn reset_worker_inflight_budget_bytes(&self) -> i64 {
+        let restored = self.file_worker_inflight_budget_bytes.max(1);
+        self.worker_inflight_budget_bytes
+            .store(restored, Ordering::Release);
+        restored
     }
 
     /// Effective per-job planned-task ceiling.
@@ -301,6 +349,36 @@ pub fn build_transfer_runtime_registry(
             },
         )
         .register_at(
+            WORKER_INFLIGHT_BUDGET_CONFIG,
+            // No configuration-file entry: the file value is the constant the
+            // worker also uses, so this stays runtime-writable without claiming
+            // a config path (same shape as the worker's own key).
+            None,
+            {
+                let state = state.clone();
+                move || Value::from(state.worker_inflight_budget_bytes())
+            },
+            {
+                let state = state.clone();
+                move || Value::from(state.worker_inflight_budget_bytes())
+            },
+            {
+                let state = state.clone();
+                move |raw| {
+                    let target = parse_bytes(WORKER_INFLIGHT_BUDGET_CONFIG, raw)?;
+                    let previous = match state.update_worker_inflight_budget_bytes(target) {
+                        Ok(v) => v,
+                        Err(e) => return err_box!(e.to_string()),
+                    };
+                    Ok((Value::from(previous), Value::from(target)))
+                }
+            },
+            {
+                let state = state.clone();
+                move || Ok(Value::from(state.reset_worker_inflight_budget_bytes()))
+            },
+        )
+        .register_at(
             MAX_TASKS_PER_TRANSFER_CONFIG,
             // Backed by `TransferConf::max_tasks_per_transfer`, i.e. `[transfer].*`.
             Some("transfer.max_tasks_per_transfer"),
@@ -410,6 +488,26 @@ fn parse_bool(config: &str, value: &str) -> CommonResult<bool> {
             value
         ),
     }
+}
+
+/// Byte ceilings take the same spellings the configuration file uses.
+///
+/// `10GB`, `512MB`, `1.5GB` and a plain byte count all parse through
+/// [`ByteUnit`], because typing `10737418240` is both unwieldy and easy to get
+/// wrong by a digit. The stored value is always bytes.
+fn parse_bytes(config: &str, value: &str) -> CommonResult<i64> {
+    let bytes = match ByteUnit::from_str(value) {
+        Ok(v) => v,
+        Err(error) => return err_box!("invalid {} value {:?}: {}", config, value, error),
+    };
+    let bytes = match i64::try_from(bytes.as_byte()) {
+        Ok(v) => v,
+        Err(_) => return err_box!("{} exceeds the maximum supported byte value", config),
+    };
+    if bytes <= 0 {
+        return err_box!("{} must be greater than zero", config);
+    }
+    Ok(bytes)
 }
 
 fn parse_usize(config: &str, value: &str) -> CommonResult<usize> {
@@ -654,4 +752,50 @@ mod tests {
         registry.reset(MAX_TASKS_PER_TRANSFER_CONFIG, None).unwrap();
         assert_eq!(state.max_tasks_per_transfer(), original);
     }
+    /// The byte ceiling is a transfer-side knob only: the value a worker
+    /// reports must not widen or narrow it, and a pushed value has to be
+    /// visible to the very next dispatch decision.
+    #[test]
+    fn worker_inflight_budget_is_a_live_transfer_knob() {
+        let conf = ClusterConf::default();
+        let state = Arc::new(TransferRuntimeConfig::from_conf(&conf));
+        let registry = build_transfer_runtime_registry(state.clone(), &conf);
+        assert_eq!(
+            state.worker_inflight_budget_bytes(),
+            TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES
+        );
+
+        // Operators type a size, not ten digits: the stored value is bytes.
+        let pushed = registry
+            .set(WORKER_INFLIGHT_BUDGET_CONFIG, "1MB", None)
+            .unwrap();
+        assert_eq!(pushed.value, Value::from(1048576i64));
+        assert_eq!(state.worker_inflight_budget_bytes(), 1048576);
+        registry
+            .set(WORKER_INFLIGHT_BUDGET_CONFIG, "2gb", None)
+            .unwrap();
+        assert_eq!(state.worker_inflight_budget_bytes(), 2 * 1024 * 1024 * 1024);
+        registry
+            .set(WORKER_INFLIGHT_BUDGET_CONFIG, "524288", None)
+            .unwrap();
+        assert_eq!(state.worker_inflight_budget_bytes(), 524288);
+
+        // Zero and garbage are refused instead of silently disabling the gate.
+        assert!(registry.set(WORKER_INFLIGHT_BUDGET_CONFIG, "0", None).is_err());
+        assert!(registry
+            .set(WORKER_INFLIGHT_BUDGET_CONFIG, "10 buckets", None)
+            .is_err());
+        assert_eq!(state.worker_inflight_budget_bytes(), 524288);
+
+        let reset = registry.reset(WORKER_INFLIGHT_BUDGET_CONFIG, None).unwrap();
+        assert_eq!(
+            reset,
+            Value::from(TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES)
+        );
+        assert_eq!(
+            state.worker_inflight_budget_bytes(),
+            TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES
+        );
+    }
+
 }

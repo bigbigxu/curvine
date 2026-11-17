@@ -22,6 +22,11 @@ const CONFIG: TransferConfigData = {
           file_value_json: '64',
           override_value: '32',
           effective_value_json: '32'
+        },
+        {
+          key: 'worker_inflight_budget_bytes',
+          file_value_json: '10737418240',
+          effective_value_json: '10737418240'
         }
       ]
     },
@@ -63,6 +68,11 @@ describe('TransferSettingsSheet', () => {
 
     await waitFor(() => expect(screen.getByTestId('transfer-knob-accept_jobs')).toBeInTheDocument())
     expect(screen.getByTestId('transfer-knob-max_running_transfers')).toHaveTextContent('32')
+    // Byte ceilings are stored as bytes but must be readable: 10 GiB, not
+    // 10737418240.
+    expect(screen.getByTestId('transfer-knob-worker_inflight_budget_bytes')).toHaveTextContent(
+      '10.00 GB'
+    )
     expect(screen.getByTestId('transfer-settings-unreachable')).toHaveTextContent(
       'cv-transfer-1:9010'
     )
