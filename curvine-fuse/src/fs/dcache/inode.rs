@@ -386,6 +386,16 @@ impl Inode {
         self.last_access = LocalTime::mills();
     }
 
+    /// Drop a dirty lifecycle whose write-back commit failed. The backend never
+    /// accepted these bytes, so the next lookup must re-read the committed
+    /// status instead of serving the local dirty length forever.
+    pub fn mark_dirty_abort(&mut self) {
+        if matches!(self.lifecycle, Lifecycle::Dirty) {
+            self.lifecycle = Lifecycle::Invalid;
+        }
+        self.invalidate_file_blocks();
+    }
+
     pub fn dirty_set_attr(&mut self, opts: SetAttrOpts) -> FuseResult<FileStatus> {
         if !self.is_dirty() {
             return err_fuse!(libc::EIO, "inode {} is not dirty", self.ino);
@@ -528,6 +538,23 @@ mod tests {
         inode.put_file_blocks(&blocks);
         inode.update_status(file_status(11, 2));
         assert!(inode.get_file_blocks(60_000).is_none());
+    }
+
+    #[test]
+    fn mark_dirty_abort_forces_status_refetch() {
+        let mut inode = Inode::with_status(42, 1, Box::<str>::from("file"), file_status(10, 1), 1);
+        inode.mark_dirty().unwrap();
+        inode.update_dirty_len(4096).unwrap();
+        let epoch = inode.locs_epoch;
+
+        inode.mark_dirty_abort();
+
+        assert!(!inode.is_dirty());
+        assert!(
+            !inode.cache_valid(60_000),
+            "an aborted dirty status must be refetched"
+        );
+        assert_eq!(inode.locs_epoch, epoch.wrapping_add(1));
     }
 
     #[test]

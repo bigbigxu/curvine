@@ -1211,3 +1211,55 @@ fn write_back_clean_inode_keeps_committed_len() {
         assert_eq!(attr.size, 100);
     });
 }
+
+/// A failed write-back completion must not leave the dcache inode advertising
+/// a length the backend never committed.
+#[test]
+fn write_back_complete_failure_clears_dirty_inode() {
+    let rt = Arc::new(AsyncRuntime::single());
+    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
+    rt.block_on(async move {
+        let handle = ctx.create_file("abort_dirty.bin").await;
+        let ino = handle.ino();
+        assert!(ctx
+            .state
+            .dir_read()
+            .get_inode(ino, None)
+            .expect("inode is cached")
+            .is_dirty());
+
+        let cache = ctx.cm.get_cache(ino).await.unwrap();
+        let fail_path = Path::from_str("/dev/full").unwrap();
+        let page_size = ctx.conf.write_back_page_size.as_byte() as usize;
+        let fail_writer = Arc::new(FuseWriter::new(
+            &ctx.conf,
+            ctx.rt.clone(),
+            UnifiedWriter::Local(LocalWriter::new(&fail_path, page_size).unwrap()),
+        ));
+        *cache.writer.lock().await = Some(fail_writer);
+
+        let data = pattern_data(1024);
+        ctx.write_via_fuse(&handle, 0, &data).await;
+        ctx.state.update_dirty_len(ino, data.len() as u64).unwrap();
+
+        let res = ctx.cm.release_cache(&cache).await;
+        assert!(res.is_err(), "complete must fail on /dev/full");
+
+        {
+            let dir = ctx.state.dir_read();
+            let inode = dir.get_inode(ino, None).expect("inode is cached");
+            assert!(
+                !inode.is_dirty(),
+                "failed complete must drop the dirty marker"
+            );
+            assert!(
+                !inode.cache_valid(60_000),
+                "failed complete must force a status refetch"
+            );
+        }
+        assert!(
+            ctx.cm.get_cache(ino).await.is_none(),
+            "the cache entry must be released"
+        );
+    });
+}

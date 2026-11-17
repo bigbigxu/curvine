@@ -180,6 +180,13 @@ impl NodeState {
         dir.mark_dirty_commit(ino);
     }
 
+    /// Drop a dirty status whose write-back commit failed, so the next lookup
+    /// re-reads the committed metadata instead of the never-committed length.
+    pub fn mark_dirty_abort(&self, ino: u64) {
+        self.dir_write().mark_dirty_abort(ino);
+        self.mark_handles_stale(ino);
+    }
+
     pub fn update_status(&self, ino: u64, name: Option<&str>, status: &FileStatus) -> bool {
         let mut lock = self.dir_write();
         let inode = match lock.get_inode_mut(ino, name) {

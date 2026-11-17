@@ -289,8 +289,12 @@ impl CacheManager {
             .release_with_cleanup(ino, move |last| async move {
                 if last {
                     let res = cache.complete(opts).await;
-                    if res.is_ok() {
-                        state.mark_dirty_commit(ino);
+                    match &res {
+                        Ok(()) => state.mark_dirty_commit(ino),
+                        // The backend never accepted the write-back bytes; keeping
+                        // the local dirty length would advertise a size that no
+                        // reader can satisfy.
+                        Err(_) => state.mark_dirty_abort(ino),
                     }
                     res
                 } else {

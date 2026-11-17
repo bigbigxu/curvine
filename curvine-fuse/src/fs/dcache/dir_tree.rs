@@ -645,6 +645,13 @@ impl DirTree {
         }
     }
 
+    pub fn mark_dirty_abort(&mut self, ino: u64) {
+        let Some(inode) = self.get_inode_mut(ino, None) else {
+            return;
+        };
+        inode.mark_dirty_abort();
+    }
+
     pub fn get_dirty_status(&self, ino: u64, name: Option<&str>) -> (bool, Option<FileStatus>) {
         match self.get_inode(ino, name) {
             Some(inode) => {
