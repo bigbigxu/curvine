@@ -1,5 +1,6 @@
 use clap::Subcommand;
 use curvine_core_error::CommonResult;
+use curvine_error::FsError;
 use curvine_fs_api::CurvineURI;
 use curvine_model::ContentSummary;
 use curvine_unified_fs::UnifiedFileSystem;
@@ -7,6 +8,11 @@ use curvine_unified_fs::UnifiedFileSystem;
 #[derive(Subcommand, Debug)]
 pub enum DuCommand {
     /// Calculate directory space usage
+    ///
+    /// Default: live recursive walk. Without `--cache-only` the unified client
+    /// measures CV + UFS data (cache-mode mounts are measured through their
+    /// UFS storage); with `--cache-only` only the Curvine namespace is
+    /// measured.
     Du {
         #[clap(
             required = true,
@@ -21,8 +27,18 @@ pub enum DuCommand {
         #[clap(short, long, help = "Display the names of columns as a header line")]
         verbose: bool,
 
-        #[clap(long, help = "Force live recursive scan instead of dir-space snapshot")]
-        live: bool,
+        #[clap(
+            long,
+            requires = "cache_only",
+            help = "Report the dir-space snapshot value (Curvine namespace only, same as the web console). Requires --cache-only"
+        )]
+        snapshot: bool,
+
+        #[clap(
+            long,
+            help = "Measure only the Curvine namespace; cache-mode mounts are not delegated to UFS"
+        )]
+        cache_only: bool,
 
         #[clap(long, action = clap::ArgAction::Help, help = "Print help")]
         help: Option<bool>,
@@ -30,15 +46,26 @@ pub enum DuCommand {
 }
 
 impl DuCommand {
-    pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
+    pub async fn execute(&self, mut client: UnifiedFileSystem) -> CommonResult<()> {
         match self {
             DuCommand::Du {
                 paths,
                 human_readable,
                 verbose,
-                live,
+                snapshot,
+                cache_only,
                 ..
             } => {
+                if *cache_only {
+                    client.disable_unified();
+                }
+                if *snapshot && client.unified_enabled() {
+                    return Err(
+                        "--snapshot measures the Curvine namespace only; add --cache-only (e.g. `cv fs --cache-only du --snapshot <path>`)"
+                            .into(),
+                    );
+                }
+
                 // The header describes the columns, not the path, so it is
                 // printed once however many paths follow.
                 if *verbose {
@@ -60,12 +87,10 @@ impl DuCommand {
                             continue;
                         }
                     };
-                    let mut warn_fallback = true;
                     match crate::cmds::fs::common::resolve_content_summary_for_path(
                         &client,
                         &path,
-                        *live,
-                        &mut warn_fallback,
+                        *snapshot,
                     )
                     .await
                     {
@@ -96,6 +121,13 @@ impl DuCommand {
                                 "{}",
                                 format_du_row(&summary, path.full_path(), *human_readable)
                             );
+                        }
+                        Err(FsError::SnapshotNotReady(_)) => {
+                            eprintln!(
+                                "du: {}: dir-space snapshot is not ready yet (the directory is being scanned); retry after the next scan round, or drop --snapshot for a live scan",
+                                path.full_path()
+                            );
+                            failed += 1;
                         }
                         Err(e) => {
                             eprintln!("{}", failure_line(path.full_path(), &e));
@@ -150,7 +182,7 @@ fn format_du_row(summary: &ContentSummary, path: &str, human_readable: bool) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::format_du_row;
+    use super::{batch_error, format_du_row};
 
     use curvine_model::{ContentSummary, ContentSummarySnapshot, ContentSummarySource};
 
@@ -196,6 +228,15 @@ mod tests {
         assert_eq!(
             row,
             format!("{:>15}  {:>15}  {:>15}  /snap", 1024, 1024, 3072)
+        );
+    }
+
+    #[test]
+    fn batch_error_is_none_only_when_every_path_succeeded() {
+        assert_eq!(batch_error(0, 3), None);
+        assert_eq!(
+            batch_error(1, 3),
+            Some("1 of 3 paths failed".to_string())
         );
     }
 }

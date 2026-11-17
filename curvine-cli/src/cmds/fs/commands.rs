@@ -173,8 +173,18 @@ pub enum FsSubCommand {
         #[clap(short, long, help = "Display the names of columns as a header line")]
         verbose: bool,
 
-        #[clap(long, help = "Force live recursive scan instead of dir-space snapshot")]
-        live: bool,
+        #[clap(
+            long,
+            requires = "cache_only",
+            help = "Report the dir-space snapshot value (Curvine namespace only, same as the web console). Requires --cache-only"
+        )]
+        snapshot: bool,
+
+        #[clap(
+            long,
+            help = "Measure only the Curvine namespace; cache-mode mounts are not delegated to UFS"
+        )]
+        cache_only: bool,
 
         #[clap(long, action = clap::ArgAction::Help, help = "Print help")]
         help: Option<bool>,
@@ -236,8 +246,18 @@ pub enum FsSubCommand {
         #[clap(help = "Path of the directory to count")]
         path: String,
 
-        #[clap(long, help = "Force live recursive scan instead of dir-space snapshot")]
-        live: bool,
+        #[clap(
+            long,
+            requires = "cache_only",
+            help = "Report the dir-space snapshot value (Curvine namespace only, same as the web console). Requires --cache-only"
+        )]
+        snapshot: bool,
+
+        #[clap(
+            long,
+            help = "Measure only the Curvine namespace; cache-mode mounts are not delegated to UFS"
+        )]
+        cache_only: bool,
     },
 
     /// Move file or directory
@@ -399,14 +419,16 @@ impl FsCommand {
                 paths,
                 human_readable,
                 verbose,
-                live,
+                snapshot,
+                cache_only,
                 ..
             } => {
                 let du_cmd = DuCommand::Du {
                     paths: paths.clone(),
                     human_readable: *human_readable,
                     verbose: *verbose,
-                    live: *live,
+                    snapshot: *snapshot,
+                    cache_only: *cache_only,
                     help: None,
                 };
                 du_cmd.execute(client).await
@@ -447,10 +469,15 @@ impl FsCommand {
                 stat_cmd.execute(client).await
             }
 
-            FsSubCommand::Count { path, live } => {
+            FsSubCommand::Count {
+                path,
+                snapshot,
+                cache_only,
+            } => {
                 let count_cmd = CountCommand::Count {
                     path: path.clone(),
-                    live: *live,
+                    snapshot: *snapshot,
+                    cache_only: *cache_only,
                 };
                 count_cmd.execute(client).await
             }

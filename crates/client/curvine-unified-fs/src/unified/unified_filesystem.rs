@@ -891,6 +891,13 @@ impl UnifiedFileSystem {
         self.cv.cleanup().await
     }
 
+    /// Whether the unified (mount-aware, UFS-delegating) client layer is on.
+    /// Off (`--cache-only`) means every operation stays inside the CV
+    /// namespace: cache-mode mounts are not delegated to UFS.
+    pub fn unified_enabled(&self) -> bool {
+        self.enable_unified
+    }
+
     pub fn disable_unified(&mut self) {
         self.enable_unified = false
     }

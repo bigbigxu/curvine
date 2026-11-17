@@ -1,11 +1,15 @@
 use bytes::BytesMut;
 use curvine_core_error::CommonResult;
 use curvine_error::{FsError, FsResult};
-use curvine_fs_api::{CurvineURI, FileSystem, Reader};
+use curvine_fs_api::{FileSystem, Path, Reader, RpcCode};
 use curvine_model::{ContentSummary, ContentSummarySource};
 use curvine_unified_fs::UnifiedFileSystem;
+use std::sync::Arc;
 use std::future::Future;
+use std::pin::Pin;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 pub(super) fn current_process_acl(client: &UnifiedFileSystem) -> (String, String, u32) {
     let uid = curvine_sys::get_uid();
@@ -24,90 +28,144 @@ fn merge_live_summary(into: &mut ContentSummary, other: &ContentSummary) {
     into.directory_count = into.directory_count.saturating_add(other.directory_count);
 }
 
-/// Live recursive traversal used by `du --live` and snapshot fallback paths.
-pub async fn calculate_content_summary_live(
-    client: &UnifiedFileSystem,
-    path: &CurvineURI,
-) -> FsResult<ContentSummary> {
-    let status = client.get_status(path).await?;
+/// Max concurrent subtree walks of the live scan. Permits are handed to child
+/// tasks (never held across awaiting them), so any depth is safe.
+const LIVE_WALK_CONCURRENCY: usize = 16;
 
-    if !status.is_dir {
-        // For a file, report this file's own length and its replica factor.
-        return Ok(ContentSummary::live_file(
-            status.len.max(0) as u64,
-            status.replicas,
-        ));
-    }
-
-    let mut summary = ContentSummary::live_recursive(0, 0, 0, 1);
-    let children = client.list_status(path).await?;
-
-    for child in children {
-        if child.is_dir {
-            let child_path = CurvineURI::new(&child.path)?;
-            let child_summary =
-                Box::pin(calculate_content_summary_live(client, &child_path)).await?;
-            merge_live_summary(&mut summary, &child_summary);
-        } else {
-            // Each file contributes its own replica factor: multiplying the
-            // directory total by one replica count is wrong as soon as the
-            // files below it have different factors.
-            let len = child.len.max(0) as u64;
-            summary.logical_bytes = summary.logical_bytes.saturating_add(len);
-            summary.replicated_bytes = summary
-                .replicated_bytes
-                .saturating_add(ContentSummary::replicated_size(len, child.replicas));
-            summary.file_count = summary.file_count.saturating_add(1);
-        }
-    }
-
-    Ok(summary)
+fn live_file_summary(len: i64, replicas: i32) -> ContentSummary {
+    ContentSummary::live_file(len.max(0) as u64, replicas)
 }
 
+/// Live recursive traversal over the namespace the client is configured for.
+///
+/// The walk follows the client's own mode: with the unified layer enabled (no
+/// `--cache-only`) cache-mode mounts are measured through their UFS storage, so
+/// the summary covers CV + UFS data; with `--cache-only` the client
+/// short-circuits to the CV namespace and the summary is CV-only.
+///
+/// Children listed through UFS carry UFS paths (e.g. `oss://bucket/...`); each
+/// child is mapped back to its CV path through the parent's mount before
+/// recursing, so the unified client keeps applying its delegation rules.
+pub async fn calculate_content_summary_live(
+    client: &UnifiedFileSystem,
+    path: &Path,
+) -> FsResult<ContentSummary> {
+    let client = Arc::new(client.clone());
+    let path = path.clone();
+    let semaphore = Arc::new(Semaphore::new(LIVE_WALK_CONCURRENCY));
+    walk_live(client, path, semaphore).await
+}
+
+/// Maps a child path reported by `list_status(parent)` back to its CV path.
+/// UFS-backed listings report UFS paths; without this mapping the recursion
+/// would feed `oss://...` paths back into the unified client and fail with
+/// "path is not curvine path".
+async fn child_cv_path(
+    client: &UnifiedFileSystem,
+    parent: &Path,
+    raw: Path,
+) -> FsResult<Path> {
+    if raw.is_cv() {
+        return Ok(raw);
+    }
+    match client.get_mount(parent, RpcCode::ListStatus).await? {
+        Some((_, mount)) => Ok(mount.get_cv_path(&raw)?),
+        None => Ok(raw),
+    }
+}
+
+/// Boxed recursion: the explicit `+ Send` bound lets the compiler verify the
+/// body concretely instead of inferring Sendness through the self-recursive
+/// future type.
+fn walk_live(
+    client: Arc<UnifiedFileSystem>,
+    path: Path,
+    semaphore: Arc<Semaphore>,
+) -> Pin<Box<dyn Future<Output = FsResult<ContentSummary>> + Send>> {
+    Box::pin(async move {
+        let status = client.get_status(&path).await?;
+
+        if !status.is_dir {
+            // For a file, report this file's own length and its replica factor.
+            return Ok(live_file_summary(status.len, status.replicas));
+        }
+
+        let children = client.list_status(&path).await?;
+        let mut summary = ContentSummary::live_recursive(0, 0, 0, 1);
+        let mut dir_tasks = JoinSet::new();
+
+        for child in children {
+            let child_path = child_cv_path(&client, &path, Path::from_str(&child.path)?).await?;
+            if child.is_dir {
+                // The permit moves into the child task: this parent never holds
+                // one while awaiting its children, so deep trees cannot starve.
+                let permit = Arc::clone(&semaphore)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| FsError::common("live walk semaphore closed"))?;
+                let child_client = Arc::clone(&client);
+                let child_semaphore = Arc::clone(&semaphore);
+                dir_tasks.spawn(async move {
+                    let _permit = permit;
+                    walk_live(child_client, child_path, child_semaphore).await
+                });
+            } else {
+                // Each file contributes its own replica factor: multiplying the
+                // directory total by one replica count is wrong as soon as the
+                // files below it have different factors.
+                merge_live_summary(
+                    &mut summary,
+                    &live_file_summary(child.len, child.replicas),
+                );
+            }
+        }
+
+        while let Some(joined) = dir_tasks.join_next().await {
+            let child_summary = joined
+                .map_err(|err| FsError::common(format!("live walk task failed: {}", err)))??;
+            merge_live_summary(&mut summary, &child_summary);
+        }
+        Ok(summary)
+    })
+}
+
+/// Resolves a content summary per the du/count semantics:
+///
+/// - `snapshot = true`: the dir-space snapshot value (CV namespace only,
+///   identical to what the web console shows). Errors surface verbatim —
+///   `SnapshotNotReady` means the snapshot has not been published yet and
+///   must NOT silently fall back to a live scan.
+/// - `snapshot = false`: live recursive walk over the client's configured
+///   namespace (unified mode covers CV + UFS data, `--cache-only` is CV-only).
+pub async fn resolve_content_summary_for_path(
+    client: &UnifiedFileSystem,
+    path: &Path,
+    snapshot: bool,
+) -> FsResult<ContentSummary> {
+    resolve_content_summary(
+        snapshot,
+        || async { client.get_content_summary_cv(path).await },
+        || async { calculate_content_summary_live(client, path).await },
+    )
+    .await
+}
+
+/// Routing seam kept generic so tests can assert the mode contract without a
+/// live cluster.
 async fn resolve_content_summary<S, L>(
-    live: bool,
-    snapshot: impl FnOnce() -> S,
+    snapshot: bool,
+    snapshot_fn: impl FnOnce() -> S,
     live_fn: impl FnOnce() -> L,
 ) -> FsResult<ContentSummary>
 where
-    S: Future<Output = FsResult<Option<ContentSummary>>>,
+    S: Future<Output = FsResult<ContentSummary>>,
     L: Future<Output = FsResult<ContentSummary>>,
 {
-    if live {
-        return live_fn().await;
+    if snapshot {
+        snapshot_fn().await
+    } else {
+        live_fn().await
     }
-
-    match snapshot().await {
-        Ok(Some(summary)) => Ok(summary),
-        Ok(None) => live_fn().await,
-        Err(FsError::Unsupported(_)) | Err(FsError::SnapshotNotReady(_)) => live_fn().await,
-        Err(err) => Err(err),
-    }
-}
-
-/// Resolves a content summary via dir-space snapshot when available, otherwise live scan.
-pub async fn resolve_content_summary_for_path(
-    client: &UnifiedFileSystem,
-    path: &CurvineURI,
-    live: bool,
-    warn_fallback: &mut bool,
-) -> CommonResult<ContentSummary> {
-    let path_label = path.full_path().to_string();
-    resolve_content_summary(
-        live,
-        || async { client.try_get_content_summary_snapshot(path).await },
-        || async {
-            if *warn_fallback {
-                eprintln!(
-                    "fs: dir-space snapshot unavailable for '{path_label}', using live recursive scan"
-                );
-                *warn_fallback = false;
-            }
-            calculate_content_summary_live(client, path).await
-        },
-    )
-    .await
-    .map_err(Into::into)
 }
 
 pub fn format_content_summary_source(summary: &ContentSummary) -> String {
@@ -262,10 +320,8 @@ mod tests {
     use curvine_io::DataSlice;
     use curvine_model::ContentSummarySnapshot;
     use std::io;
-    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
-    use tokio::io::{AsyncWrite, AsyncWriteExt};
 
     /// Reports `len` bytes but serves only `data`, then hits end of file.
     /// With `resized_len`, the reported length changes after the first read,
@@ -504,17 +560,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_summary_resolve_prefers_snapshot_by_default() {
+    async fn content_summary_snapshot_mode_uses_snapshot_only() {
         static SNAPSHOT_CALLS: AtomicUsize = AtomicUsize::new(0);
         static LIVE_CALLS: AtomicUsize = AtomicUsize::new(0);
         SNAPSHOT_CALLS.store(0, Ordering::SeqCst);
         LIVE_CALLS.store(0, Ordering::SeqCst);
 
         let summary = resolve_content_summary(
-            false,
+            true,
             || async {
                 SNAPSHOT_CALLS.fetch_add(1, Ordering::SeqCst);
-                Ok(Some(ContentSummary::live_file(42, 1)))
+                Ok(ContentSummary::live_file(42, 1))
             },
             || async {
                 LIVE_CALLS.fetch_add(1, Ordering::SeqCst);
@@ -530,17 +586,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_summary_live_skips_snapshot() {
+    async fn content_summary_default_mode_is_live_only() {
         static SNAPSHOT_CALLS: AtomicUsize = AtomicUsize::new(0);
         static LIVE_CALLS: AtomicUsize = AtomicUsize::new(0);
         SNAPSHOT_CALLS.store(0, Ordering::SeqCst);
         LIVE_CALLS.store(0, Ordering::SeqCst);
 
         let summary = resolve_content_summary(
-            true,
+            false,
             || async {
                 SNAPSHOT_CALLS.fetch_add(1, Ordering::SeqCst);
-                Ok(Some(ContentSummary::live_file(99, 1)))
+                Ok(ContentSummary::live_file(99, 1))
             },
             || async {
                 LIVE_CALLS.fetch_add(1, Ordering::SeqCst);
@@ -556,16 +612,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_summary_snapshot_not_ready_falls_back_once() {
-        let summary = resolve_content_summary(
-            false,
+    async fn content_summary_snapshot_mode_surfaces_not_ready() {
+        // No silent fallback: --snapshot must report SnapshotNotReady so the
+        // user knows the value is still being scanned.
+        let err = resolve_content_summary(
+            true,
             || async { Err(FsError::snapshot_not_ready("/a")) },
             || async { Ok(ContentSummary::live_recursive(10, 10, 1, 1)) },
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(summary.logical_bytes, 10);
+        assert!(matches!(err, FsError::SnapshotNotReady(_)));
     }
 
     #[test]
