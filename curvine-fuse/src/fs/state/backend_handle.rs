@@ -157,7 +157,7 @@ impl BackendHandle {
             let path = state
                 .get_path(self.ino)
                 .unwrap_or_else(|_| guard.path().clone());
-            let new_reader = state.new_reader(&path).await?;
+            let new_reader = state.open_reader(Some(self.ino), &path).await?;
             self.refresh_status(new_reader.status().clone());
             *guard = Arc::new(new_reader);
         }

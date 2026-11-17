@@ -432,7 +432,7 @@ impl FuseConf {
             // write-back so a short kernel attr_timeout does not make the
             // flush-delay validation reject valid configurations.
             if self.meta_cache_timeout.is_none() {
-                self.meta_cache_timeout = Some(DurationUnit::new(60 * DurationUnit::SECONDS));
+                self.meta_cache_timeout = Some(self.attr_timeout);
             }
         }
         // Validate the cache type unconditionally so typos fail fast even when

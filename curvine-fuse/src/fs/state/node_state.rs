@@ -1739,7 +1739,7 @@ impl NodeState {
 
         let path = self.get_path(ino)?;
         let epoch = self.locs_epoch(Some(ino));
-        let reader = match self.new_reader(&path).await {
+        let reader = match self.open_reader(Some(ino), &path).await {
             Ok(reader) => reader,
             Err(e) => {
                 let tombstone = self
@@ -2135,6 +2135,7 @@ mod test {
     #[cfg(target_os = "linux")]
     use curvine_client::unified::UnifiedWriter;
     use curvine_config::ClusterConf;
+    use curvine_config::FuseConf;
     use curvine_error::FsError;
     #[cfg(target_os = "linux")]
     use curvine_fs_api::local::LocalWriter;
@@ -2142,7 +2143,9 @@ mod test {
     use curvine_fs_api::Writer;
     use curvine_fs_api::{ListStream, Path};
     use curvine_fs_api::{StateReader, StateWriter};
-    use curvine_model::{FileBlocks, FileStatus, LocatedBlock, StorageState, TtlAction};
+    use curvine_model::{
+        CreateFileOpts, FileBlocks, FileStatus, LocatedBlock, OpenFlags, StorageState, TtlAction,
+    };
     use curvine_net::net::InetAddr;
     use curvine_runtime::common::{DurationUnit, FastHashMap, Utils};
     use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
@@ -2291,6 +2294,61 @@ mod test {
         expired.status.storage_policy.ttl_ms = 1;
         expired.status.storage_policy.ttl_action = TtlAction::Free;
         assert!(!NodeState::blocks_fully_in_cv(&expired));
+    }
+
+    #[test]
+    fn read_only_open_uses_cached_file_blocks() {
+        crate::FuseMetrics::ensure_init().unwrap();
+        let rt = Arc::new(AsyncRuntime::single());
+        let fuse = FuseConf {
+            enable_meta_cache: Some(true),
+            ..Default::default()
+        };
+        let fs = UnifiedFileSystem::with_rt(
+            ClusterConf {
+                fuse,
+                ..Default::default()
+            },
+            rt.clone(),
+        )
+        .unwrap();
+        let state = NodeState::new(fs).unwrap();
+
+        // Leave the inode as a committed write-back session would: local status
+        // plus a cached block list, no backend available to the test.
+        let ino = 7u64;
+        {
+            let mut dir = state.dir_write();
+            let mut status = FileStatus::with_name(ino as i64, "cached".to_string(), false);
+            status.len = 4096;
+            status.storage_policy.state = StorageState::Cv;
+            let inode = dir
+                .lookup(FUSE_ROOT_ID, "cached", status.clone(), true)
+                .unwrap();
+            inode.mark_dirty().unwrap();
+            inode.update_dirty_len(4096).unwrap();
+            let mut loc = LocatedBlock::default();
+            loc.block.id = 1;
+            loc.block.len = 4096;
+            let blocks = FileBlocks::new(status, vec![loc]);
+            assert!(inode.put_file_blocks(&blocks));
+        }
+
+        rt.block_on(async move {
+            let path = Path::from_str("/cached").unwrap();
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                state.fs_open(
+                    ino,
+                    OpenFlags::RDONLY.value(),
+                    CreateFileOpts::with_create(false),
+                ),
+            )
+            .await
+            .expect("a cached block list must serve the open without an RPC");
+            let handle = res.unwrap();
+            assert_eq!(handle.ino(), ino);
+        });
     }
 
     #[test]
