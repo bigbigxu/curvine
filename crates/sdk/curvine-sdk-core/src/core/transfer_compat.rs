@@ -560,7 +560,7 @@ mod tests {
             updated_at: None,
             owner: None,
             fence: None,
-            lease_expire_at: None,
+            expires_at: None,
             cv_metadata_epoch: None,
             task_summary: None,
             task_details_expired: None,
@@ -615,7 +615,7 @@ mod tests {
             updated_at: None,
             owner: None,
             fence: None,
-            lease_expire_at: None,
+            expires_at: None,
             cv_metadata_epoch: None,
             task_summary: Some(TransferTaskSummaryProto {
                 pending: 2,
