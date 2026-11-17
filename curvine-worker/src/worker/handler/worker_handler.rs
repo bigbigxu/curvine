@@ -387,6 +387,7 @@ impl WorkerHandler {
             // worker's ledger on it instead of aggregating task rows in MySQL.
             transfer_inflight_bytes: Some(self.task_manager.inflight_bytes()),
             transfer_inflight_tasks: Some(self.task_manager.inflight_tasks() as i64),
+            retryable: Some(submit.retryable),
         };
 
         Ok(Builder::success(msg).proto_header(response).build())

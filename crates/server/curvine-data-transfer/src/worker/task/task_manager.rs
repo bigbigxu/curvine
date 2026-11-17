@@ -27,6 +27,7 @@ use curvine_model::{JobTaskProgress, JobTaskState, LoadTaskInfo, TransferTaskRep
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use dashmap::mapref::entry::Entry;
 use log::{debug, info, warn};
+
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -43,6 +44,7 @@ pub struct TaskManager {
     transfer_reporters: Mutex<HashMap<Vec<String>, Weak<TransferProgressBatcher>>>,
     worker_session_id: String,
     worker_task_semaphore: Arc<Semaphore>,
+
     /// Serializes semaphore reconciliation so concurrent submits cannot
     /// over-add or double-retire permits while resizing.
     permit_lock: Arc<Mutex<()>>,
@@ -71,6 +73,10 @@ pub struct TaskManager {
     /// submit time - otherwise `inflight_tasks` under-reports a worker that has
     /// a queue and the scheduler keeps filling it.
     admitted_tasks: Arc<AtomicUsize>,
+    /// Upper bound on `admitted_tasks`. Beyond it new submissions are rejected
+    /// with a retryable "queue full" response so the master paces its dispatch
+    /// instead of growing this queue without bound (community #2167).
+    max_queued_tasks: Arc<AtomicUsize>,
 }
 
 /// RAII release of one admitted task slot, dropped when the runner exits.
@@ -86,6 +92,8 @@ impl Drop for AdmittedTaskGuard {
 
 pub struct TaskSubmitResult {
     pub accepted: bool,
+    /// The rejection is backpressure: the same task will be accepted later.
+    pub retryable: bool,
     pub reject_reason: String,
 }
 
@@ -150,6 +158,7 @@ impl TaskSubmitResult {
     fn accepted() -> Self {
         Self {
             accepted: true,
+            retryable: false,
             reject_reason: String::new(),
         }
     }
@@ -157,7 +166,21 @@ impl TaskSubmitResult {
     fn rejected(reason: impl Into<String>) -> Self {
         Self {
             accepted: false,
+            retryable: false,
             reject_reason: reason.into(),
+        }
+    }
+
+    /// The worker is out of queue room. Nothing is wrong with the task, so the
+    /// submitter should retry it instead of failing the job.
+    fn queue_full(pending: usize, limit: usize) -> Self {
+        Self {
+            accepted: false,
+            retryable: true,
+            reject_reason: format!(
+                "queue full: {} tasks pending (running + queued), limit {}",
+                pending, limit
+            ),
         }
     }
 }
@@ -234,6 +257,7 @@ impl TaskManager {
             transfer_reporters: Mutex::new(HashMap::new()),
             worker_session_id: worker_session_id.into(),
             worker_task_semaphore,
+
             permit_lock: Arc::new(Mutex::new(())),
             worker_max_concurrent_tasks: Arc::new(AtomicUsize::new(
                 conf.job.worker_max_concurrent_tasks,
@@ -250,6 +274,8 @@ impl TaskManager {
             )),
             inflight_bytes: Arc::new(AtomicI64::new(0)),
             admitted_tasks: Arc::new(AtomicUsize::new(0)),
+            max_queued_tasks: Arc::new(AtomicUsize::new(conf.job.worker_max_queued_tasks)),
+
         };
         record_metric(|metrics| {
             metrics.set_inflight_budget_bytes(mgr.transfer_inflight_budget_bytes())
@@ -258,6 +284,7 @@ impl TaskManager {
 
         Ok(mgr)
     }
+
 
     /// Periodically releases finished contexts whose stale-probe window closed.
     ///
@@ -296,9 +323,13 @@ impl TaskManager {
     /// # Concurrency Control
     ///
     /// - Tasks wait to acquire a permit from the load_task_semaphore before execution
-    /// - Maximum concurrent tasks is limited by `conf.job.load_task_concurrency_limit`
+    /// - Maximum concurrent tasks is limited by `conf.job.worker_max_concurrent_tasks`
     /// - Permits are automatically released when tasks complete or fail
     /// - This prevents excessive bandwidth usage during bulk data operations
+    /// - The number of tasks held at once (running + waiting for a permit) is
+    ///   limited by `conf.job.worker_max_queued_tasks`; above that the submit is
+    ///   rejected with `retryable = true` so the master retries it later instead
+    ///   of the worker growing an unbounded queue in memory
     ///
     /// # Behavior
     ///
@@ -341,6 +372,7 @@ impl TaskManager {
         let task_id = task.task_id.clone();
         let source_path = task.source_path.clone();
         let context = Arc::new(TaskContext::new(task));
+
         // Byte-budget admit (design §3.2): reject synchronously before the task
         // enters the local queue, so a saturated worker never silently queues
         // (the incident's "queued 112s" failure mode). Unknown sizes count at
@@ -350,8 +382,15 @@ impl TaskManager {
         let inflight_bytes = self.inflight_bytes.clone();
         let reserve_admitted = || -> Result<AdmittedTaskGuard, TaskSubmitResult> {
             let limit = self.worker_max_concurrent_tasks.load(Ordering::Acquire);
+            let queue_limit = self.max_queued_tasks.load(Ordering::Acquire);
             loop {
                 let current = self.admitted_tasks.load(Ordering::Acquire);
+                if queue_limit > 0 && current >= queue_limit {
+                    // Backpressure, not a verdict: the master paces its
+                    // dispatch on this and retries (community #2167).
+                    record_metric(|metrics| metrics.inc_submit_rejected("queue_full"));
+                    return Err(TaskSubmitResult::queue_full(current, queue_limit));
+                }
                 if limit > 0 && current >= limit {
                     record_metric(|metrics| metrics.inc_submit_rejected("inflight_tasks"));
                     return Err(TaskSubmitResult::rejected(format!(
@@ -435,6 +474,7 @@ impl TaskManager {
                     }
                 }
 
+
                 let byte_guard = match reserve_inflight() {
                     Ok(guard) => guard,
                     Err(result) => return Ok(result),
@@ -449,6 +489,7 @@ impl TaskManager {
             }
 
             Entry::Vacant(vac) => {
+
                 let byte_guard = match reserve_inflight() {
                     Ok(guard) => guard,
                     Err(result) => return Ok(result),
@@ -499,6 +540,7 @@ impl TaskManager {
         let tasks = self.tasks.clone();
         let semaphore = self.worker_task_semaphore.clone();
         let context_this = context.clone();
+
         let permit_lock = self.permit_lock.clone();
         let issued_permits = self.issued_task_permits.clone();
         let max_tasks = self.worker_max_concurrent_tasks.clone();
@@ -864,6 +906,7 @@ fn transfer_report_matches(
     )
 }
 
+
 #[cfg(test)]
 mod budget_tests {
     use super::{InflightByteGuard, WORKER_AT_CAPACITY_REJECT_PREFIX};
@@ -923,5 +966,6 @@ mod budget_tests {
 }
 
 #[cfg(test)]
+
 #[path = "tests/task_manager_budget_test.rs"]
 mod task_manager_budget_test;

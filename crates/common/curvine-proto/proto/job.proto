@@ -126,6 +126,9 @@ message SubmitTaskResponse {
   // rows in the metadata store. Legacy workers omit both fields.
   optional int64 transfer_inflight_bytes = 4;
   optional int64 transfer_inflight_tasks = 5;
+  // The rejection is backpressure, not a verdict on the task: the worker is out
+  // of queue room right now and will accept the same task once room appears.
+  optional bool retryable = 6 [default = false];
 }
 
 message TaskReportRequest {
