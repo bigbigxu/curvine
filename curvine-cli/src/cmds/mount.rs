@@ -1180,6 +1180,7 @@ mod tests {
             ]),
             ttl_ms: DurationUnit::DAY as i64,
             ttl_action: TtlAction::Delete,
+            ttl_type: Default::default(),
             read_verify_ufs: true,
             storage_type: None,
             block_size: None,
