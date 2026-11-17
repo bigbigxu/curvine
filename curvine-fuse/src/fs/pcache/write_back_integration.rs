@@ -1172,3 +1172,42 @@ fn write_back_ensure_flushed_single_flight() {
         assert_eq!(cache.ensure_flushed().await.unwrap(), 2);
     });
 }
+
+/// The kernel derives i_size from FUSE attr replies. A dirty file must report
+/// the write-back length there, or the kernel shrinks i_size back to the
+/// committed length and answers later reads past it as EOF without asking FUSE.
+#[test]
+fn write_back_dirty_len_is_reported_to_the_kernel() {
+    let rt = Arc::new(AsyncRuntime::single());
+    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
+    rt.block_on(async move {
+        let handle = ctx.create_file("dirty_len.bin").await;
+        let data = pattern_data(PAGE_SIZE as usize + 100);
+        ctx.write_via_fuse(&handle, 0, &data).await;
+
+        let mut attr = crate::FuseUtils::status_to_attr(&ctx.conf, &handle.status()).unwrap();
+        attr.ino = handle.ino();
+        assert_eq!(attr.size, 0, "open-time status must not know the write");
+
+        ctx.state.update_writer_len(&mut attr).await;
+        assert_eq!(attr.size, data.len() as u64);
+    });
+}
+
+/// Once the write-back entry is gone, the committed length is authoritative
+/// again; the helper must not invent a length for a clean inode.
+#[test]
+fn write_back_clean_inode_keeps_committed_len() {
+    let rt = Arc::new(AsyncRuntime::single());
+    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
+    rt.block_on(async move {
+        let handle = ctx.create_file("clean_len.bin").await;
+        let mut status = handle.status();
+        status.len = 100;
+        let mut attr = crate::FuseUtils::status_to_attr(&ctx.conf, &status).unwrap();
+        attr.ino = handle.ino();
+
+        ctx.state.update_writer_len(&mut attr).await;
+        assert_eq!(attr.size, 100);
+    });
+}

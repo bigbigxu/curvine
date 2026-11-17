@@ -1400,6 +1400,16 @@ impl NodeState {
     }
 
     pub async fn update_writer_len(&self, attr: &mut fuse_attr) {
+        // Write-back data lives only in the userspace page cache until it is
+        // flushed. Reporting the committed length here would let the kernel
+        // shrink i_size back to the backend length and answer later reads from
+        // an already truncated range without ever asking FUSE.
+        if self.enable_write_back {
+            if let Some(cache) = self.cm.get_cache(attr.ino).await {
+                attr.size = attr.size.max(cache.len());
+            }
+        }
+
         let Some(writer) = self.find_writer(attr.ino).await else {
             return;
         };
