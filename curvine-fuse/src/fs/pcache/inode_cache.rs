@@ -155,7 +155,6 @@ pub struct InodeCache {
     writer_ver: AtomicCounter,
     flush_gate: AsyncMutex<()>,
     all_ver: AtomicCounter,
-    synced_writer_ver: AtomicCounter,
     len: AtomicCounter,
     deleted: AtomicBool,
 }
@@ -181,7 +180,6 @@ impl InodeCache {
             writer_ver: AtomicCounter::new(0),
             flush_gate: AsyncMutex::new(()),
             all_ver: AtomicCounter::new(0),
-            synced_writer_ver: AtomicCounter::new(0),
             len: AtomicCounter::new(file_len),
             deleted: AtomicBool::new(false),
         }
@@ -393,7 +391,6 @@ impl InodeCache {
     async fn flush_inner(
         self: &Arc<InodeCache>,
         pages: Vec<Page>,
-        sync: bool,
     ) -> FuseResult<(Arc<FuseWriter>, u64)> {
         let flushed: Vec<u64> = pages.iter().map(|x| x.page_id).collect();
 
@@ -414,9 +411,6 @@ impl InodeCache {
                 }
             }
 
-            if sync {
-                writer.flush(None).await?;
-            }
             Ok((writer, total))
         }
         .await;
@@ -425,29 +419,23 @@ impl InodeCache {
         res
     }
 
-    fn refresh_ver(&self, read_ver: u64) -> Option<u64> {
-        let synced = self.synced_writer_ver.get();
-        (read_ver < synced).then_some(synced)
-    }
-
     async fn publish_writer(&self, writer: &Arc<FuseWriter>) -> FuseResult<()> {
-        if let Some(target_ver) = writer
-            .publish_dirty_read_snapshot(self.synced_writer_ver.get())
-            .await?
-        {
-            self.synced_writer_ver.set(target_ver);
+        if writer.publish_dirty_read_snapshot().await? {
+            if let Ok(state) = self.cm.state() {
+                state.invalidate_file_blocks(self.ino);
+            }
         }
         Ok(())
     }
 
-    pub async fn flush_dirty(self: &Arc<InodeCache>, sync: bool) -> FuseResult<u64> {
+    pub async fn flush_dirty(self: &Arc<InodeCache>, publish: bool) -> FuseResult<u64> {
         let _gate = self.flush_gate.lock().await;
         let pages = self.take_dirty_pages()?;
         if pages.is_empty() {
             return Ok(0);
         }
-        let (writer, total) = self.flush_inner(pages, sync).await?;
-        if sync {
+        let (writer, total) = self.flush_inner(pages).await?;
+        if publish {
             self.publish_writer(&writer).await?;
         }
         Ok(total)
@@ -457,19 +445,18 @@ impl InodeCache {
         self: &Arc<InodeCache>,
         off: u64,
         len: usize,
-        read_ver: u64,
-    ) -> FuseResult<Option<u64>> {
+    ) -> FuseResult<()> {
         self.check_error()?;
 
         let target = self.writer_ver.get();
         if target <= self.all_ver.get() {
-            return Ok(self.refresh_ver(read_ver));
+            return Ok(());
         }
 
         let spent = TimeSpent::new();
         let _gate = self.flush_gate.lock().await;
         if target <= self.all_ver.get() {
-            return Ok(self.refresh_ver(read_ver));
+            return Ok(());
         }
 
         let pages = self.take_dirty_pages_range(off, len)?;
@@ -478,12 +465,12 @@ impl InodeCache {
             if let Some(writer) = writer {
                 self.publish_writer(&writer).await?;
             }
-            return Ok(self.refresh_ver(read_ver));
+            return Ok(());
         }
 
         // publish_writer flushes everything enqueued below; a direct
         // writer.flush here would flush the backend twice.
-        let (writer, len) = self.flush_inner(pages, false).await?;
+        let (writer, len) = self.flush_inner(pages).await?;
         self.publish_writer(&writer).await?;
 
         FuseMetrics::with(|m| {
@@ -496,7 +483,7 @@ impl InodeCache {
                 .inc_by(len as i64);
         });
 
-        Ok(self.refresh_ver(read_ver))
+        Ok(())
     }
 
     pub fn len(&self) -> u64 {
@@ -530,8 +517,7 @@ impl InodeCache {
     pub async fn resize(self: &Arc<Self>, opts: FileAllocOpts) -> FuseResult<FileStatus> {
         self.check_error()?;
 
-        let (writer, _) = self.flush_all().await?;
-        let status = writer.resize(opts).await?;
+        let status = self.finalize_writer().await?.resize(opts).await?;
 
         self.writer_ver.incr();
         self.len.set(status.len as u64);
@@ -549,24 +535,34 @@ impl InodeCache {
         Ok(())
     }
 
-    async fn flush_all(self: &Arc<Self>) -> FuseResult<(Arc<FuseWriter>, u64)> {
+    async fn flush_all(self: &Arc<Self>) -> FuseResult<u64> {
         let _gate = self.flush_gate.lock().await;
         let target = self.writer_ver.get();
 
-        let writer = if target > self.all_ver.get() {
+        if target > self.all_ver.get() {
             let pages = self.take_all_dirty_pages()?;
-            // publish_writer flushes everything enqueued below; a direct
-            // writer.flush here would flush the backend twice.
-            let (writer, _) = self.flush_inner(pages, false).await?;
+            if pages.is_empty() {
+                // The pages are already queued in the writer by a background
+                // flush, which never publishes: commit them here, that is what
+                // an fsync without new pages is asking for.
+                let writer = self.writer.lock().await.clone();
+                if let Some(writer) = &writer {
+                    self.publish_writer(writer).await?;
+                }
+            } else {
+                let (writer, _) = self.flush_inner(pages).await?;
+                self.publish_writer(&writer).await?;
+            }
 
-            self.publish_writer(&writer).await?;
             self.all_ver.set(target);
-            writer
-        } else {
-            self.get_writer().await?
-        };
+        }
 
-        Ok((writer, self.all_ver.get()))
+        Ok(self.all_ver.get())
+    }
+
+    async fn finalize_writer(self: &Arc<Self>) -> FuseResult<Arc<FuseWriter>> {
+        self.flush_all().await?;
+        self.get_writer().await
     }
 
     pub async fn flush(self: &Arc<Self>) -> FuseResult<()> {
@@ -582,7 +578,7 @@ impl InodeCache {
         if self.writer_ver.get() <= self.all_ver.get() {
             return Ok(self.all_ver.get());
         }
-        self.flush_all().await.map(|(_, len)| len)
+        self.flush_all().await
     }
 
     pub async fn queue_complete(self: &Arc<Self>) -> FuseResult<()> {
@@ -605,8 +601,10 @@ impl InodeCache {
         }
 
         let fut = async {
-            let (writer, _) = self.flush_all().await?;
-            writer.complete_with_attr(None, opts).await?;
+            self.finalize_writer()
+                .await?
+                .complete_with_attr(None, opts)
+                .await?;
             Ok(())
         };
         let res = fut.await;
@@ -882,27 +880,17 @@ mod tests {
         assert_eq!(pages[0].page_id, 0);
     }
 
-    #[test]
-    fn refresh_ver_only_refreshes_older_readers() {
-        let cache = test_cache(&test_conf(4096));
-        cache.synced_writer_ver.set(7);
-
-        assert_eq!(cache.refresh_ver(6), Some(7));
-        assert_eq!(cache.refresh_ver(7), None);
-        assert_eq!(cache.refresh_ver(8), None);
-    }
-
     #[tokio::test]
     async fn publish_read_range_fast_path_when_all_flushed() {
         let cache = test_cache(&test_conf(4096));
 
         cache.writer_ver.set(5);
         cache.all_ver.set(5);
-        cache.synced_writer_ver.set(5);
 
-        assert_eq!(cache.publish_read_range(0, 4096, 5).await.unwrap(), None);
-        assert_eq!(cache.publish_read_range(0, 4096, 3).await.unwrap(), Some(5));
-        assert_eq!(cache.publish_read_range(0, 4096, 9).await.unwrap(), None);
+        // No writer was ever opened, so nothing is published and the fast path
+        // returns without touching the block list.
+        cache.publish_read_range(0, 4096).await.unwrap();
+        cache.publish_read_range(0, 4096).await.unwrap();
     }
 
     fn injected_error() -> FuseError {

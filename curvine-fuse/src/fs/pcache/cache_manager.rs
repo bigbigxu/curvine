@@ -289,8 +289,9 @@ impl CacheManager {
             .release_with_cleanup(ino, move |last| async move {
                 if last {
                     let res = cache.complete(opts).await;
-                    if res.is_ok() {
-                        state.mark_dirty_commit(ino);
+                    match &res {
+                        Ok(()) => state.mark_dirty_commit(ino),
+                        Err(_) => state.mark_dirty_abort(ino),
                     }
                     res
                 } else {

@@ -60,6 +60,7 @@ pub struct FuseWriter {
     len: Arc<AtomicLong>,
     mtime: Arc<AtomicLong>,
     write_ver: AtomicCounter,
+    published_ver: AtomicCounter,
     /// Serializes write/resize enqueue with dirty-read snapshot flush.
     ///
     /// On a bounded stream channel, `send_queued_task` may wait for capacity.
@@ -88,6 +89,7 @@ impl FuseWriter {
         let len = Arc::new(AtomicLong::new(status.len));
         let mtime = Arc::new(AtomicLong::new(status.mtime));
         let write_ver = AtomicCounter::new(0);
+        let published_ver = AtomicCounter::new(0);
         let path_type = writer.path_type();
         let metrics_enabled = conf.metrics_enabled;
 
@@ -120,6 +122,7 @@ impl FuseWriter {
             len,
             mtime,
             write_ver,
+            published_ver,
             enqueue_gate: tokio::sync::Mutex::new(()),
             metrics_enabled,
         }
@@ -208,24 +211,30 @@ impl FuseWriter {
     ///
     /// Acquires `enqueue_gate` so the Flush is ordered after in-flight enqueues
     /// without waiting for a global zero-inflight instant. Continuous writers may
-    /// keep advancing `write_ver` after this returns; the caller pins `read_ver`
-    /// to the returned snapshot and republishes on a later read if needed.
+    /// keep advancing `write_ver` after this returns; the next call publishes
+    /// again once it does.
     ///
-    /// Returns `Ok(None)` when `read_ver` already matches the gated `write_ver`.
-    pub async fn publish_dirty_read_snapshot(&self, read_ver: u64) -> FsResult<Option<u64>> {
+    /// Returns `Ok(false)` when everything queued so far is already published.
+    ///
+    /// The boolean only says "new data became visible"; callers must invalidate
+    /// the cached block list when it is `true`. It is deliberately not a version
+    /// a reader can compare against: snapshot validity is tracked by the inode
+    /// block-list generation (`NodeState::locs_epoch`).
+    pub async fn publish_dirty_read_snapshot(&self) -> FsResult<bool> {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
             let target_ver;
             {
                 let _gate = self.enqueue_gate.lock().await;
                 target_ver = self.write_ver.get();
-                if target_ver == read_ver {
-                    return Ok(None);
+                if target_ver == self.published_ver.get() {
+                    return Ok(false);
                 }
                 self.send_queued_task(WriteTask::Flush(rx, None)).await?;
             }
             tx.receive().await??;
-            Ok(Some(target_ver))
+            self.published_ver.set(target_ver);
+            Ok(true)
         };
         fun.await.map_err(|e| self.check_error(e))
     }
@@ -1522,18 +1531,17 @@ mod tests {
 
             let published = tokio::time::timeout(
                 Duration::from_secs(5),
-                fuse_writer.publish_dirty_read_snapshot(0),
+                fuse_writer.publish_dirty_read_snapshot(),
             )
             .await
             .expect("dirty-read snapshot must complete under continuous bounded writers")
             .expect("dirty-read snapshot flush must succeed");
-            let ver = published.expect("expected a snapshot while writers are active");
-            assert!(ver > 0, "expected a non-zero snapshot, got {ver}");
+            assert!(published, "expected a snapshot while writers are active");
 
             // Re-check must also complete under load (may flush a newer snapshot).
             tokio::time::timeout(
                 Duration::from_secs(5),
-                fuse_writer.publish_dirty_read_snapshot(ver),
+                fuse_writer.publish_dirty_read_snapshot(),
             )
             .await
             .expect("dirty-read re-publish must complete under continuous writers")

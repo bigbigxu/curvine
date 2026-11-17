@@ -143,31 +143,50 @@ impl WriteBackWork {
         let spend = TimeSpent::new();
 
         let evict_candidates = cm.evict_candidates().await;
-        let mut freed_bytes = 0;
-        let mut freed_inodes = 0;
-        for inode in &evict_candidates {
-            let Some(cache) = cm.get_cache(inode.ino).await else {
-                continue;
-            };
 
-            if let Err(e) = cache.flush_dirty(false).await {
-                warn!("write_back evict ino={} error: {}", inode.ino, e);
-                cache.set_error(e);
-            }
-
-            let bytes = cache.free_pages(false);
-            debug!(
-                "write_back evict ino={}, file_len={}, freed={}",
-                inode.ino, inode.file_len, bytes
-            );
-
-            freed_bytes += bytes;
-            freed_inodes += 1;
-
-            if freed_bytes >= target {
+        let mut planned = Vec::new();
+        let mut planned_bytes = 0;
+        for inode in evict_candidates {
+            planned_bytes += inode.page_len;
+            planned.push(inode);
+            if planned_bytes >= target {
                 break;
             }
         }
+
+        let handles = planned.into_iter().map(|inode| {
+            let cm = cm.clone();
+            tokio::spawn(async move {
+                let Some(cache) = cm.get_cache(inode.ino).await else {
+                    return (0u64, 0usize);
+                };
+
+                if let Err(e) = cache.flush_dirty(true).await {
+                    warn!("write_back evict ino={} error: {}", inode.ino, e);
+                    cache.set_error(e);
+                }
+
+                let bytes = cache.free_pages(false);
+                debug!(
+                    "write_back evict ino={}, file_len={}, freed={}",
+                    inode.ino, inode.file_len, bytes
+                );
+
+                (bytes, 1)
+            })
+        });
+
+        let (freed_bytes, freed_inodes) =
+            join_all(handles)
+                .await
+                .into_iter()
+                .fold((0u64, 0usize), |(bytes, inodes), res| match res {
+                    Ok((freed, count)) => (bytes + freed, inodes + count),
+                    Err(e) => {
+                        warn!("write_back evict task panicked: {}", e);
+                        (bytes, inodes)
+                    }
+                });
 
         FuseMetrics::with(|m| {
             m.write_back_io_us

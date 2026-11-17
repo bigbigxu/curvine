@@ -397,13 +397,16 @@ fn write_back_worker_flush_reclaims_clean_pages_and_keeps_reads_correct() {
         );
 
         // A later read misses the reclaimed pages and republishes through the
-        // writer, which must still surface the flushed bytes from the backend.
-        let published = cache
-            .publish_read_range(0, PAGE_SIZE as usize, 0)
+        // writer. Publishing bumps the inode block-list generation, which is the
+        // signal a cached reader reopens on.
+        let before = ctx.state.locs_epoch(Some(ino)).expect("inode is cached");
+        cache
+            .publish_read_range(0, PAGE_SIZE as usize)
             .await
             .unwrap();
+        let after = ctx.state.locs_epoch(Some(ino)).expect("inode is cached");
         assert!(
-            published.is_some(),
+            after > before,
             "read after reclaim should publish a snapshot"
         );
 
@@ -413,7 +416,7 @@ fn write_back_worker_flush_reclaims_clean_pages_and_keeps_reads_correct() {
 }
 
 #[test]
-fn write_back_dirty_read_range_snapshot_tracks_backend_versions() {
+fn write_back_dirty_read_range_publishes_each_dirty_range() {
     let rt = Arc::new(AsyncRuntime::single());
     let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
     rt.block_on(async move {
@@ -426,24 +429,44 @@ fn write_back_dirty_read_range_snapshot_tracks_backend_versions() {
         ctx.write_via_fuse(&handle, PAGE_SIZE, b"tail").await;
 
         let cache = ctx.cm.get_cache(handle.ino()).await.unwrap();
-        let first_ver = cache
-            .publish_read_range(0, 4, 0)
-            .await
-            .unwrap()
-            .expect("first range flush should publish");
 
-        let unchanged_ver = cache.publish_read_range(0, 4, first_ver).await.unwrap();
-        assert_eq!(unchanged_ver, None);
+        let before = ctx
+            .state
+            .locs_epoch(Some(handle.ino()))
+            .expect("inode cached");
+        cache.publish_read_range(0, 4).await.unwrap();
+        let after_head = ctx
+            .state
+            .locs_epoch(Some(handle.ino()))
+            .expect("inode cached");
+        assert!(after_head > before, "first range flush should publish");
 
-        let second_ver = cache
-            .publish_read_range(PAGE_SIZE, 4, first_ver)
-            .await
-            .unwrap()
-            .expect("second range flush should publish");
+        // The range is already clean and published: publishing again must not
+        // bump the generation.
+        cache.publish_read_range(0, 4).await.unwrap();
+        assert_eq!(
+            ctx.state.locs_epoch(Some(handle.ino())),
+            Some(after_head),
+            "an already published range must not publish again"
+        );
 
+        // The tail page still needs its own publish.
+        cache.publish_read_range(PAGE_SIZE, 4).await.unwrap();
+        let after_tail = ctx
+            .state
+            .locs_epoch(Some(handle.ino()))
+            .expect("inode cached");
+        assert!(after_tail > after_head, "second range flush should publish");
+
+        // A global flush commits everything that is queued and leaves nothing
+        // for a later range read to publish.
         cache.flush().await.unwrap();
-        let after_global_ver = cache.publish_read_range(0, 4, second_ver).await.unwrap();
-        assert_eq!(after_global_ver, None);
+        cache.publish_read_range(0, 4).await.unwrap();
+        assert_eq!(
+            ctx.state.locs_epoch(Some(handle.ino())),
+            Some(after_tail),
+            "global flush should leave nothing to publish"
+        );
 
         let mut expected = vec![0; PAGE_SIZE as usize + 4];
         expected[..4].copy_from_slice(b"head");
@@ -838,16 +861,24 @@ fn write_back_dirty_read_range_snapshot_publishes_enospc_write_through() {
         let cache = ctx.cm.get_cache(handle.ino()).await.unwrap();
         assert_eq!(cache.page_len(), 0);
 
-        let flush_ver = cache
-            .publish_read_range(0, 6, 0)
-            .await
-            .unwrap()
-            .expect("write-through should publish");
+        let before = ctx
+            .state
+            .locs_epoch(Some(handle.ino()))
+            .expect("inode cached");
+        cache.publish_read_range(0, 6).await.unwrap();
+        let after = ctx
+            .state
+            .locs_epoch(Some(handle.ino()))
+            .expect("inode cached");
+        assert!(after > before, "write-through should publish");
         assert_backend_eq(&backend, b"direct");
 
+        // Nothing new was queued, so a second call must not publish again.
+        cache.publish_read_range(0, 6).await.unwrap();
         assert_eq!(
-            cache.publish_read_range(0, 6, flush_ver).await.unwrap(),
-            None
+            ctx.state.locs_epoch(Some(handle.ino())),
+            Some(after),
+            "an unchanged range must not publish again"
         );
     });
 }
@@ -1139,5 +1170,96 @@ fn write_back_ensure_flushed_single_flight() {
         assert_eq!(cache.ensure_flushed().await.unwrap(), 2);
         cache.flush().await.unwrap();
         assert_eq!(cache.ensure_flushed().await.unwrap(), 2);
+    });
+}
+
+/// The kernel derives i_size from FUSE attr replies. A dirty file must report
+/// the write-back length there, or the kernel shrinks i_size back to the
+/// committed length and answers later reads past it as EOF without asking FUSE.
+#[test]
+fn write_back_dirty_len_is_reported_to_the_kernel() {
+    let rt = Arc::new(AsyncRuntime::single());
+    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
+    rt.block_on(async move {
+        let handle = ctx.create_file("dirty_len.bin").await;
+        let data = pattern_data(PAGE_SIZE as usize + 100);
+        ctx.write_via_fuse(&handle, 0, &data).await;
+
+        let mut attr = crate::FuseUtils::status_to_attr(&ctx.conf, &handle.status()).unwrap();
+        attr.ino = handle.ino();
+        assert_eq!(attr.size, 0, "open-time status must not know the write");
+
+        ctx.state.update_writer_len(&mut attr).await;
+        assert_eq!(attr.size, data.len() as u64);
+    });
+}
+
+/// Once the write-back entry is gone, the committed length is authoritative
+/// again; the helper must not invent a length for a clean inode.
+#[test]
+fn write_back_clean_inode_keeps_committed_len() {
+    let rt = Arc::new(AsyncRuntime::single());
+    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
+    rt.block_on(async move {
+        let handle = ctx.create_file("clean_len.bin").await;
+        let mut status = handle.status();
+        status.len = 100;
+        let mut attr = crate::FuseUtils::status_to_attr(&ctx.conf, &status).unwrap();
+        attr.ino = handle.ino();
+
+        ctx.state.update_writer_len(&mut attr).await;
+        assert_eq!(attr.size, 100);
+    });
+}
+
+/// A failed write-back completion must not leave the dcache inode advertising
+/// a length the backend never committed.
+#[test]
+fn write_back_complete_failure_clears_dirty_inode() {
+    let rt = Arc::new(AsyncRuntime::single());
+    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
+    rt.block_on(async move {
+        let handle = ctx.create_file("abort_dirty.bin").await;
+        let ino = handle.ino();
+        assert!(ctx
+            .state
+            .dir_read()
+            .get_inode(ino, None)
+            .expect("inode is cached")
+            .is_dirty());
+
+        let cache = ctx.cm.get_cache(ino).await.unwrap();
+        let fail_path = Path::from_str("/dev/full").unwrap();
+        let page_size = ctx.conf.write_back_page_size.as_byte() as usize;
+        let fail_writer = Arc::new(FuseWriter::new(
+            &ctx.conf,
+            ctx.rt.clone(),
+            UnifiedWriter::Local(LocalWriter::new(&fail_path, page_size).unwrap()),
+        ));
+        *cache.writer.lock().await = Some(fail_writer);
+
+        let data = pattern_data(1024);
+        ctx.write_via_fuse(&handle, 0, &data).await;
+        ctx.state.update_dirty_len(ino, data.len() as u64).unwrap();
+
+        let res = ctx.cm.release_cache(&cache).await;
+        assert!(res.is_err(), "complete must fail on /dev/full");
+
+        {
+            let dir = ctx.state.dir_read();
+            let inode = dir.get_inode(ino, None).expect("inode is cached");
+            assert!(
+                !inode.is_dirty(),
+                "failed complete must drop the dirty marker"
+            );
+            assert!(
+                !inode.cache_valid(60_000),
+                "failed complete must force a status refetch"
+            );
+        }
+        assert!(
+            ctx.cm.get_cache(ino).await.is_none(),
+            "the cache entry must be released"
+        );
     });
 }

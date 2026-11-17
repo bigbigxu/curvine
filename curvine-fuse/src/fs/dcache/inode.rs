@@ -191,7 +191,6 @@ impl Inode {
         if self.is_dirty() && !self.is_dir {
             self.len = len;
             self.mtime = LocalTime::mills() as i64;
-            self.locs.take();
             Ok(())
         } else {
             Ok(())
@@ -239,9 +238,6 @@ impl Inode {
     }
 
     pub fn get_file_blocks(&self, ttl: u64) -> Option<FileBlocks> {
-        if !matches!(self.lifecycle, Lifecycle::Cached) {
-            return None;
-        }
         let locs = self.locs.as_ref()?;
         if self.last_access + ttl < LocalTime::mills() {
             return None;
@@ -261,14 +257,10 @@ impl Inode {
             return false;
         }
 
-        if self.is_dirty() {
-            return false;
-        }
-
         self.locs = Some(Box::new(blocks.block_locs.clone()));
         self.last_access = LocalTime::mills();
 
-        if blocks.status.mtime >= self.status.mtime {
+        if !self.is_dirty() && blocks.status.mtime >= self.status.mtime {
             self.status = CachedStatus::from_status(blocks.status.clone());
 
             self.lifecycle = Lifecycle::Cached;
@@ -394,6 +386,13 @@ impl Inode {
         self.last_access = LocalTime::mills();
     }
 
+    pub fn mark_dirty_abort(&mut self) {
+        if matches!(self.lifecycle, Lifecycle::Dirty) {
+            self.lifecycle = Lifecycle::Invalid;
+        }
+        self.invalidate_file_blocks();
+    }
+
     pub fn dirty_set_attr(&mut self, opts: SetAttrOpts) -> FuseResult<FileStatus> {
         if !self.is_dirty() {
             return err_fuse!(libc::EIO, "inode {} is not dirty", self.ino);
@@ -472,6 +471,7 @@ impl DerefMut for Inode {
 mod tests {
     use super::Inode;
     use curvine_model::{FileBlocks, FileStatus, LocatedBlock};
+    use curvine_runtime::common::LocalTime;
 
     fn file_status(len: i64, mtime: i64) -> FileStatus {
         let mut status = FileStatus::with_name(42, "file".to_owned(), false);
@@ -531,6 +531,23 @@ mod tests {
     }
 
     #[test]
+    fn mark_dirty_abort_forces_status_refetch() {
+        let mut inode = Inode::with_status(42, 1, Box::<str>::from("file"), file_status(10, 1), 1);
+        inode.mark_dirty().unwrap();
+        inode.update_dirty_len(4096).unwrap();
+        let epoch = inode.locs_epoch;
+
+        inode.mark_dirty_abort();
+
+        assert!(!inode.is_dirty());
+        assert!(
+            !inode.cache_valid(60_000),
+            "an aborted dirty status must be refetched"
+        );
+        assert_eq!(inode.locs_epoch, epoch.wrapping_add(1));
+    }
+
+    #[test]
     fn n_lookup_serializes_as_plain_number() {
         let inode = Inode::with_status(7, 1, Box::<str>::from("f"), FileStatus::default(), 3);
         inode.add_lookup(2);
@@ -568,5 +585,69 @@ mod tests {
 
         let restored: Inode = serde_json::from_value(json).unwrap();
         assert!(restored.deferred_delete_path.is_none());
+    }
+
+    #[test]
+    fn dirty_file_blocks_are_cached_without_replacing_local_status() {
+        let mut inode = Inode::with_status(42, 1, Box::<str>::from("file"), file_status(10, 1), 1);
+        inode.mark_dirty().unwrap();
+        inode.update_dirty_len(30).unwrap();
+
+        let blocks = FileBlocks::new(file_status(30, 2), vec![LocatedBlock::default()]);
+        assert!(inode.put_file_blocks(&blocks));
+
+        let cached = inode
+            .get_file_blocks(0)
+            .expect("dirty inode should retain cached block locations");
+        assert_eq!(cached.status.len, 30);
+        assert_eq!(cached.block_locs.len(), 1);
+        assert!(inode.is_dirty());
+
+        // Growing a dirty file keeps the snapshot: the only consumer
+        // (`CacheHandle::read`) publishes first, and the dirty commit or abort
+        // drops it.
+        inode.update_dirty_len(31).unwrap();
+        assert!(
+            inode.get_file_blocks(60_000).is_some(),
+            "advancing a dirty file keeps its block locations"
+        );
+        inode.mark_dirty_commit();
+        assert!(
+            inode.get_file_blocks(60_000).is_none(),
+            "committing the dirty state drops its block locations"
+        );
+    }
+
+    #[test]
+    fn dirty_file_blocks_survive_flush_when_len_is_unchanged() {
+        let mut inode = Inode::with_status(42, 1, Box::<str>::from("file"), file_status(10, 1), 1);
+        inode.mark_dirty().unwrap();
+        inode.update_dirty_len(30).unwrap();
+
+        let blocks = FileBlocks::new(file_status(30, 2), vec![LocatedBlock::default()]);
+        assert!(inode.put_file_blocks(&blocks));
+
+        inode.update_dirty_len(30).unwrap();
+        let cached = inode
+            .get_file_blocks(0)
+            .expect("flushing an unchanged dirty length must keep block locations");
+        assert_eq!(cached.block_locs.len(), 1);
+        assert_eq!(cached.status.len, 30);
+    }
+
+    #[test]
+    fn dirty_file_blocks_expire_with_the_metadata_ttl() {
+        let mut inode = Inode::with_status(42, 1, Box::<str>::from("file"), file_status(0, 1), 1);
+        inode.mark_dirty().unwrap();
+
+        let blocks = FileBlocks::new(file_status(0, 2), Vec::new());
+        assert!(inode.put_file_blocks(&blocks));
+        assert!(inode.get_file_blocks(60_000).is_some());
+
+        // Another client may rewrite the file while it stays dirty here, so a
+        // dirty snapshot must not outlive the metadata TTL.
+        inode.last_access = LocalTime::mills().saturating_sub(60_000);
+        assert!(inode.get_file_blocks(30_000).is_none());
+        assert!(inode.get_file_blocks(120_000).is_some());
     }
 }

@@ -102,7 +102,7 @@ impl FileHandle {
     pub fn mark_stale(&self) {
         match self {
             FileHandle::Backend(h) => h.mark_stale(),
-            FileHandle::Cache(_) => {}
+            FileHandle::Cache(h) => h.mark_stale(),
         }
     }
 

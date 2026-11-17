@@ -186,6 +186,11 @@ impl NodeState {
         dir.mark_dirty_commit(ino);
     }
 
+    pub fn mark_dirty_abort(&self, ino: u64) {
+        self.dir_write().mark_dirty_abort(ino);
+        self.mark_handles_stale(ino);
+    }
+
     pub fn update_status(&self, ino: u64, name: Option<&str>, status: &FileStatus) -> bool {
         let mut lock = self.dir_write();
         let inode = match lock.get_inode_mut(ino, name) {
@@ -775,6 +780,7 @@ impl NodeState {
     }
 
     /// Test-visible handle insertion; production callers go through `new_handle`.
+    ///
     pub(crate) async fn insert_handle_with_writer(
         &self,
         ino: u64,
@@ -1456,6 +1462,12 @@ impl NodeState {
     }
 
     pub async fn update_writer_len(&self, attr: &mut fuse_attr) {
+        if self.enable_write_back {
+            if let Some(cache) = self.cm.get_cache(attr.ino).await {
+                attr.size = attr.size.max(cache.len());
+            }
+        }
+
         let Some(writer) = self.find_writer(attr.ino).await else {
             return;
         };

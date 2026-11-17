@@ -55,7 +55,7 @@ pub struct BackendHandle {
     pub ino: u64,
     pub fh: u64,
 
-    reader: Option<AsyncMutex<ReaderState>>,
+    reader: Option<AsyncMutex<Arc<FuseReader>>>,
     pub writer: Option<Arc<FuseWriter>>, // Writer uses Arc for global sharing
     /// Open-time file status snapshot. Guarded by a lock because the read path
     /// refreshes it in place after a dirty-read reopen (`read()` takes `&self`).
@@ -64,20 +64,6 @@ pub struct BackendHandle {
     stale: AtomicBool,
 
     fh_locks: std::sync::Mutex<HandleLock>,
-}
-
-struct ReaderState {
-    reader: Arc<FuseReader>,
-    read_ver: u64,
-}
-
-impl ReaderState {
-    fn new(reader: Arc<FuseReader>) -> Self {
-        Self {
-            reader,
-            read_ver: 0,
-        }
-    }
 }
 
 impl BackendHandle {
@@ -91,7 +77,7 @@ impl BackendHandle {
         Self {
             ino,
             fh,
-            reader: reader.map(|reader| AsyncMutex::new(ReaderState::new(reader))),
+            reader: reader.map(AsyncMutex::new),
             writer,
             status: std::sync::RwLock::new(status),
             stale: AtomicBool::new(false),
@@ -138,9 +124,8 @@ impl BackendHandle {
             );
         }
 
-        let reader_state = match &self.reader {
-            Some(reader) => reader,
-            None => return err_fuse!(libc::EIO),
+        let Some(reader) = &self.reader else {
+            return err_fuse!(libc::EIO);
         };
 
         // Serialize refresh state per file handle. The Arc cloned below keeps the
@@ -149,7 +134,7 @@ impl BackendHandle {
         // Keep this lock across snapshot publication and reader reopen/install;
         // releasing it between those awaits lets concurrent refreshes install
         // readers for different snapshots and reintroduces the lifetime race.
-        let mut reader_state = reader_state.lock().await;
+        let mut guard = reader.lock().await;
 
         if let Some(writer) = state.find_writer(self.ino).await {
             // `write_ver` advances only after a write/resize is successfully queued.
@@ -161,26 +146,24 @@ impl BackendHandle {
             //
             // One FuseWriter is shared per inode. LTP ftest04 forks several O_RDWR
             // children against that writer, so write_ver keeps moving under load.
-            if let Some(target_ver) = writer
-                .publish_dirty_read_snapshot(reader_state.read_ver)
-                .await?
-            {
-                reader_state.read_ver = target_ver;
+            if writer.publish_dirty_read_snapshot().await? {
                 state.invalidate_file_blocks(self.ino);
             }
         }
 
-        if self.stale.get() && self.stale.compare_and_set(true, false) {
+        let reopen = self.stale.get() && self.stale.compare_and_set(true, false);
+
+        if reopen {
             let path = state
                 .get_path(self.ino)
-                .unwrap_or_else(|_| reader_state.reader.path().clone());
+                .unwrap_or_else(|_| guard.path().clone());
             let new_reader = state.new_reader(&path).await?;
             self.refresh_status(new_reader.status().clone());
-            reader_state.reader = Arc::new(new_reader);
+            *guard = Arc::new(new_reader);
         }
 
-        let reader = reader_state.reader.clone();
-        drop(reader_state);
+        let reader = Arc::clone(&*guard);
+        drop(guard);
         reader.read(op, reply).await?;
         Ok(())
     }
@@ -369,7 +352,7 @@ impl BackendHandle {
         let handle = Self {
             ino,
             fh,
-            reader: reader.map(|reader| AsyncMutex::new(ReaderState::new(reader))),
+            reader: reader.map(AsyncMutex::new),
             writer,
             status: std::sync::RwLock::new(status),
             stale: AtomicBool::new(false),
@@ -431,8 +414,8 @@ mod tests {
 
         runtime.block_on(async {
             let mut state = handle.reader.as_ref().unwrap().lock().await;
-            let in_flight = state.reader.clone();
-            state.reader = make_reader();
+            let in_flight = Arc::clone(&*state);
+            *state = make_reader();
             drop(state);
 
             assert!(
