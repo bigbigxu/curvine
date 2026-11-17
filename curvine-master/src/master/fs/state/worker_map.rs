@@ -176,7 +176,7 @@ impl WorkerMap {
 
     pub fn ensure_worker_id_addr(&self, addr: &WorkerAddress) -> FsResult<()> {
         if let Some(v) = self.workers.get(&addr.worker_id) {
-            if v.address != *addr {
+            if v.address != *addr && v.liveness() != Liveness::Lost {
                 return err_box!(
                     "worker id addr mismatch,  expected {}, actual: {}",
                     v.address,

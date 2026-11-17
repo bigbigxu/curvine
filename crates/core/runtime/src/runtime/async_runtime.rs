@@ -141,10 +141,10 @@ impl RpcRuntime for AsyncRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::AsyncRuntime;
+    use super::*;
     use crate::runtime::RpcRuntime;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{mpsc, Arc};
     use std::time::Duration;
 
     /// Dropping the last runtime reference from inside one of that runtime's
@@ -186,5 +186,33 @@ mod tests {
             "runtime teardown panicked on a worker thread: {:?}",
             outcome.err()
         );
+    }
+
+    #[test]
+    fn runtime_can_be_dropped_inside_another_runtime() {
+        let outer = AsyncRuntime::single();
+        outer.block_on(async {
+            let inner = AsyncRuntime::single();
+            assert_eq!(inner.spawn(async { 42 }).await.unwrap(), 42);
+            drop(inner);
+        });
+    }
+
+    #[test]
+    fn last_runtime_owner_can_be_released_by_its_own_task() {
+        let runtime = Arc::new(AsyncRuntime::single());
+        let task_owner = runtime.clone();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (finished, done) = mpsc::channel();
+        runtime.spawn(async move {
+            released.await.unwrap();
+            drop(task_owner);
+            finished.send(()).unwrap();
+        });
+        // Ensure the task holds the only external runtime owner when it drops.
+        drop(runtime);
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(2))
+            .expect("dropping the task's runtime owner panicked or blocked");
     }
 }

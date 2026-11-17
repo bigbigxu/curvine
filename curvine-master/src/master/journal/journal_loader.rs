@@ -30,7 +30,7 @@ use curvine_model::RenameFlags;
 use curvine_raft::conf::JournalConfExt;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData};
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg, LogStorage, RocksLogStorage};
-use curvine_raft::raft::{RaftClient, RaftError, RaftResult, RaftUtils};
+use curvine_raft::raft::{FollowerReadinessMonitor, RaftClient, RaftError, RaftResult, RaftUtils};
 use curvine_runtime::common::{FileUtils, TimeSpent};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
@@ -59,6 +59,7 @@ pub struct JournalLoader {
     batch_size: u64,
     metrics: &'static MasterMetrics,
     has_apply_worker: bool,
+    follower_readiness: FollowerReadinessMonitor,
     /// Shared raft-term handle, so the session lease epoch follows election
     /// instead of process start (#1883 review).
     term: Arc<AtomicU64>,
@@ -91,6 +92,7 @@ impl JournalLoader {
             journal_writer,
             worker_manager,
             recovery,
+            FollowerReadinessMonitor::default(),
             true,
             Arc::new(AtomicU64::new(0)),
             ProgressView::new(),
@@ -108,6 +110,7 @@ impl JournalLoader {
         journal_writer: Arc<JournalWriter>,
         worker_manager: SyncWorkerManager,
         recovery: RecoveryGate,
+        follower_readiness: FollowerReadinessMonitor,
         term: Arc<AtomicU64>,
         progress: ProgressView,
     ) -> CommonResult<Self> {
@@ -121,6 +124,7 @@ impl JournalLoader {
             journal_writer,
             worker_manager,
             recovery,
+            follower_readiness,
             false,
             term,
             progress,
@@ -138,6 +142,7 @@ impl JournalLoader {
         journal_writer: Arc<JournalWriter>,
         worker_manager: SyncWorkerManager,
         recovery: RecoveryGate,
+        follower_readiness: FollowerReadinessMonitor,
         testing: bool,
         term: Arc<AtomicU64>,
         progress: ProgressView,
@@ -179,6 +184,7 @@ impl JournalLoader {
             batch_size: conf.scan_batch_size,
             metrics: Master::get_metrics()?,
             has_apply_worker: !testing,
+            follower_readiness,
             term,
             progress,
         };
@@ -217,10 +223,12 @@ impl JournalLoader {
     /// the watermarks, so there is no wake-up to send here.
     fn set_applied(&self, applied: AppliedIndex) -> CommonResult<()> {
         let mut state = self.fsm_state()?;
+        let applied_index = applied.index;
         state.applied = applied;
         self.refresh_fsm_metrics(&state);
         let (caught_up, pending) = Self::ufs_gate(&state);
         drop(state);
+        self.follower_readiness.observe_applied(applied_index);
         self.hard_state_changed(&self.log_store.hard_state());
         self.publish_ufs_gate(caught_up, pending);
         Ok(())
@@ -246,6 +254,15 @@ impl JournalLoader {
         let caught_up = state.ufs_applied.index >= state.applied.index;
         let pending = state.applied.index.saturating_sub(state.ufs_applied.index);
         (caught_up, pending)
+    }
+
+    fn refresh_replay_readiness(&self) -> CommonResult<()> {
+        let applied = self.fsm_state_snapshot()?.applied;
+        let committed_index = self.log_store.hard_state().commit;
+        self.follower_readiness.observe_applied(applied.index);
+        self.follower_readiness
+            .set_replay_ready(applied.index >= committed_index);
+        Ok(())
     }
 
     fn refresh_fsm_metrics(&self, state: &FsmState) {
@@ -405,11 +422,16 @@ impl JournalLoader {
             ApplyMsg::EntryWithAck((entry, _)) => self.apply0(is_leader, true, entry),
 
             ApplyMsg::Scan(applied_index) => {
+                self.follower_readiness.set_replay_ready(false);
                 let mut last_applied = applied_index.index;
 
                 let commit_index = self.log_store.hard_state().commit;
                 loop {
                     if last_applied >= commit_index {
+                        let applied = self.fsm_state_snapshot()?.applied;
+                        self.follower_readiness.observe_applied(applied.index);
+                        self.follower_readiness
+                            .set_replay_ready(applied.index >= commit_index);
                         return Ok(());
                     }
 
@@ -422,6 +444,7 @@ impl JournalLoader {
                     // would let the next entry advance `ufs_applied` past the gap
                     // and lose those UFS side effects for good.
                     if list.is_empty() {
+                        self.follower_readiness.set_replay_ready(false);
                         return err_box!(
                             "metadata invariant broken: journal replay stopped at index {}, commit index {}, but no entries are on disk",
                             last_applied,
@@ -707,6 +730,7 @@ impl JournalLoader {
         *self.fsm_state()? = snapshot.fsm_state;
         self.refresh_metrics()?;
         self.refresh_ufs_gate()?;
+        self.refresh_replay_readiness()?;
 
         info!(
             "apply_snapshot: fs_dir_restore={} ms, mount_restore={} ms, total={} ms",
@@ -1429,6 +1453,7 @@ mod tests {
             "leader advances the metadata watermark"
         );
         assert_eq!(state.applied.term, 7);
+        assert_eq!(loader.follower_readiness.snapshot().applied_index, Some(2));
         assert_eq!(
             state.ufs_applied.index, 0,
             "UFS progress belongs to the background replayer, never to apply"

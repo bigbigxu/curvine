@@ -14,6 +14,7 @@
 
 use crate::master::journal::RecoveryGate;
 use curvine_raft::raft::RoleState;
+use curvine_raft::raft::{FollowerReadinessMonitor, FollowerReadinessSnapshot};
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::sync::StateCtl;
 use num_enum::{FromPrimitive, IntoPrimitive};
@@ -288,6 +289,7 @@ pub struct MasterMonitor {
     pub(crate) journal_ctl: StateCtl,
     pub fs_ctl: StateCtl,
     recovery: RecoveryGate,
+    follower_readiness: FollowerReadinessMonitor,
     /// Raft term of the last persisted hard state, published by the journal
     /// loader. Client-session lease
     /// epochs are keyed on it: a promotion always carries a higher term than the
@@ -305,16 +307,48 @@ pub struct MasterMonitor {
 
 impl MasterMonitor {
     pub fn new(journal_ctl: StateCtl, fs_ctl: StateCtl) -> Self {
-        Self::with_term(journal_ctl, fs_ctl, Arc::new(AtomicU64::new(0)))
+        Self::with_term_and_follower_readiness(
+            journal_ctl,
+            fs_ctl,
+            Arc::new(AtomicU64::new(0)),
+            FollowerReadinessMonitor::default(),
+        )
     }
 
-    /// Build a monitor that shares its term handle with the journal loader.
+    pub fn with_follower_readiness(
+        journal_ctl: StateCtl,
+        fs_ctl: StateCtl,
+        follower_readiness: FollowerReadinessMonitor,
+    ) -> Self {
+        Self::with_term_and_follower_readiness(
+            journal_ctl,
+            fs_ctl,
+            Arc::new(AtomicU64::new(0)),
+            follower_readiness,
+        )
+    }
+
     pub fn with_term(journal_ctl: StateCtl, fs_ctl: StateCtl, term: Arc<AtomicU64>) -> Self {
+        Self::with_term_and_follower_readiness(
+            journal_ctl,
+            fs_ctl,
+            term,
+            FollowerReadinessMonitor::default(),
+        )
+    }
+
+    pub fn with_term_and_follower_readiness(
+        journal_ctl: StateCtl,
+        fs_ctl: StateCtl,
+        term: Arc<AtomicU64>,
+        follower_readiness: FollowerReadinessMonitor,
+    ) -> Self {
         Self {
             journal_ctl,
             fs_ctl,
             recovery: RecoveryGate::new(),
             term,
+            follower_readiness,
             progress: ProgressView::new(),
             leader_id: Arc::new(AtomicU64::new(0)),
             latch_term: Arc::new(AtomicU64::new(u64::MAX)),
@@ -329,17 +363,24 @@ impl MasterMonitor {
         fs_ctl: StateCtl,
         term: Arc<AtomicU64>,
         leader_id: Arc<AtomicU64>,
+        follower_readiness: FollowerReadinessMonitor,
     ) -> Self {
         Self {
             journal_ctl,
             fs_ctl,
             recovery: RecoveryGate::new(),
             term,
+            follower_readiness,
             progress: ProgressView::new(),
             leader_id,
             latch_term: Arc::new(AtomicU64::new(u64::MAX)),
             latch_caught_up: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Returns current Raft contact and actual journal replay observations.
+    pub fn follower_readiness_snapshot(&self) -> FollowerReadinessSnapshot {
+        self.follower_readiness.snapshot()
     }
 
     /// Raft id of the announced leader, 0 while none is known.
@@ -433,7 +474,6 @@ impl MasterMonitor {
         self.term.load(Ordering::Acquire)
     }
 
-    /// Test-only term bump, mirroring [`MasterMonitor::set_role_for_test`].
     #[doc(hidden)]
     pub fn set_term_for_test(&self, term: u64) {
         self.term.store(term, Ordering::Release);

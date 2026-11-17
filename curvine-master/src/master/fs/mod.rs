@@ -41,6 +41,7 @@ pub use self::fs_retry_cache::*;
 
 mod full_block_report;
 
+mod follower_block_report;
 mod location_entry;
 
 mod master_filesystem;

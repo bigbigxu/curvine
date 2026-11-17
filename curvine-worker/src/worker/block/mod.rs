@@ -23,6 +23,9 @@ pub use self::checksum_scan::{ChecksumScan, ScanStats};
 mod master_client;
 pub use self::master_client::{MasterClient, MasterRegistration};
 
+mod worker_peer_fanout;
+pub(crate) use worker_peer_fanout::FullReportSnapshot;
+
 mod block_actor;
 pub use self::block_actor::BlockActor;
 

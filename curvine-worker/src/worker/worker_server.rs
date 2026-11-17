@@ -23,7 +23,7 @@ use curvine_config::{ClusterConf, ConfigSourceMap, RuntimeConfigRegistry};
 use curvine_core_error::StringError;
 use curvine_core_error::{CommonError, CommonResult};
 use curvine_fault::FaultHttpControl;
-use curvine_model::{CompatibilityPolicy, HeartbeatStatus, WorkerAddress};
+use curvine_model::{BlockReportInfo, CompatibilityPolicy, HeartbeatStatus, WorkerAddress};
 use curvine_net::net::ConnState;
 use curvine_rpc::handler::HandlerService;
 use curvine_rpc::server::{RpcServer, ServerStateListener};
@@ -34,6 +34,7 @@ use curvine_runtime::sync::{FastMutex, StateCtl};
 #[cfg(feature = "spdk")]
 use curvine_storage_spdk::SpdkEnv;
 use curvine_web::server::{WebHandlerService, WebServer};
+use dashmap::DashMap;
 use log::info;
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
@@ -50,6 +51,7 @@ pub struct WorkerService {
     task_manager: Arc<TaskManager>,
     rt: Arc<Runtime>,
     replication_manager: Arc<WorkerReplicationManager>,
+    report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
     fault_http: FaultHttpControl,
     /// Rpc server state handle, set once the rpc server exists so the web
     /// `/healthz` route can report whether the worker is serving.
@@ -113,6 +115,7 @@ impl WorkerService {
         curvine_profiling::check_startup(&conf.profiling)
             .map_err(|error| CommonError::from(error.to_string()))?;
         let store: BlockStore = BlockStore::new(&conf.cluster_id, conf)?;
+        let report_blocks = Arc::new(DashMap::new());
 
         // Data-plane runtime. Load / export tasks do blocking block I/O
         // (std::fs open / write / flush); when they share the RPC runtime they
@@ -133,6 +136,7 @@ impl WorkerService {
             conf,
             &task_manager.get_fs_context(),
             worker_session_id,
+            report_blocks.clone(),
         );
 
         let ws = Self {
@@ -141,6 +145,7 @@ impl WorkerService {
             task_manager,
             rt,
             replication_manager,
+            report_blocks,
             fault_http,
             server_state: Arc::new(OnceCell::new()),
             compatibility_policy: Arc::new(conf.worker.compatibility.to_policy()),
@@ -233,6 +238,8 @@ impl Worker {
         mut conf: ClusterConf,
         config_sources: ConfigSourceMap,
     ) -> CommonResult<Self> {
+        conf.worker.validate_follower_reports()?;
+
         Logger::init(conf.worker.log.clone());
 
         // Init SPDK before WorkerService - enables BlockMeta to open SPDK bdevs
@@ -332,9 +339,10 @@ impl Worker {
         let block_actor = BlockActor::new(
             rt.clone(),
             &conf,
-            addr.clone(),
-            worker_session_id,
             block_store.clone(),
+            addr.clone(),
+            worker_session_id.clone(),
+            service.report_blocks.clone(),
             rpc_server.new_state_ctl(),
             start_ms,
             service.task_manager.inflight_budget_bytes(),
@@ -374,11 +382,11 @@ impl Worker {
     }
 
     pub async fn start(&mut self) -> CommonResult<ServerStateListener> {
-        // step 3: Start rpc server
         let rpc_server = self
             .rpc_server
             .take()
             .expect("worker rpc server must be initialized before startup");
+        // step 3: Start rpc server
         let mut rpc_status = rpc_server.start();
         rpc_status.wait_running().await?;
 
@@ -394,8 +402,14 @@ impl Worker {
 
         // step 5: Start block heartbeat check service
         let block_actor = self.block_actor.clone();
-        thread::spawn(move || block_actor.start())
-            .join()
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        thread::spawn(move || {
+            let _ = startup_tx.send(block_actor.start());
+        });
+        // The actor's synchronous client needs this same I/O runtime. Joining
+        // its thread here blocks startup forever with a single I/O worker.
+        startup_rx
+            .await
             .map_err(|_| {
                 CommonError::from(StringError::from(
                     "worker block actor startup thread panicked",

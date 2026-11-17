@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::raft::follower_readiness::FollowerReadinessMonitor;
 use curvine_core_error::CommonResult;
 use curvine_runtime::sync::{StateCtl, StateListener, StateMonitor};
 use num_enum::{FromPrimitive, IntoPrimitive};
@@ -21,7 +22,7 @@ use std::sync::Arc;
 
 // raft node status.
 #[repr(i8)]
-#[derive(PartialEq, PartialOrd, Debug, Clone, Copy, IntoPrimitive, FromPrimitive)]
+#[derive(PartialEq, Eq, PartialOrd, Debug, Clone, Copy, IntoPrimitive, FromPrimitive)]
 pub enum RoleState {
     // The raft node has not joined the cluster yet.
     #[num_enum(default)]
@@ -38,6 +39,7 @@ pub struct RoleMonitor {
     /// known. Published here because the observability plane must be able to
     /// say who the leader is without touching the raft node (#CV-94).
     leader_id: Arc<AtomicU64>,
+    follower_readiness: FollowerReadinessMonitor,
 }
 
 impl RoleMonitor {
@@ -45,6 +47,7 @@ impl RoleMonitor {
         Self {
             state: StateMonitor::new(RoleState::Init.into()),
             leader_id: Arc::new(AtomicU64::new(0)),
+            follower_readiness: FollowerReadinessMonitor::default(),
         }
     }
 
@@ -67,6 +70,11 @@ impl RoleMonitor {
         }
     }
 
+    /// Read/write handle shared with the journal FSM and master RPC layer.
+    pub fn follower_readiness(&self) -> FollowerReadinessMonitor {
+        self.follower_readiness.clone()
+    }
+
     pub fn is_leader(&self) -> bool {
         self.state() == RoleState::Leader
     }
@@ -79,6 +87,13 @@ impl RoleMonitor {
 
     pub fn advance_exit(&self) {
         self.state.advance_state(RoleState::Exit, true);
+        let snapshot = self.follower_readiness.snapshot();
+        self.follower_readiness.observe_raft_state(
+            RoleState::Exit,
+            snapshot.term,
+            0,
+            snapshot.commit_index,
+        );
     }
 
     pub fn new_listener(&self) -> RoleStateListener {
