@@ -41,6 +41,7 @@ forbidden=(
   curvine-rocksdb
   curvine-raft
   curvine-ufs-oss-hdfs
+  curvine-ufs-cosn
   curvine-hdfs-jni
 )
 

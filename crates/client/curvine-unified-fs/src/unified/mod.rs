@@ -28,6 +28,9 @@ use curvine_ufs_opendal::*;
 #[cfg(feature = "oss-hdfs")]
 use curvine_ufs_oss_hdfs::*;
 
+#[cfg(feature = "cosn")]
+use curvine_ufs_cosn::*;
+
 pub mod macros;
 
 mod unified_filesystem;
@@ -57,6 +60,9 @@ pub enum UnifiedWriter {
     #[cfg(feature = "oss-hdfs")]
     OssHdfs(OssHdfsWriter),
 
+    #[cfg(feature = "cosn")]
+    Cosn(CosnWriter),
+
     Local(LocalWriter),
 }
 
@@ -71,6 +77,9 @@ impl_writer_for_enum! {
 
         #[cfg(feature = "oss-hdfs")]
         OssHdfs(OssHdfsWriter),
+
+        #[cfg(feature = "cosn")]
+        Cosn(CosnWriter),
 
         Local(LocalWriter),
     }
@@ -95,6 +104,9 @@ impl UnifiedWriter {
             #[cfg(feature = "oss-hdfs")]
             UnifiedWriter::OssHdfs(_) => "ufs",
 
+            #[cfg(feature = "cosn")]
+            UnifiedWriter::Cosn(_) => "ufs",
+
             UnifiedWriter::Local(_) => "local",
         }
     }
@@ -108,6 +120,9 @@ pub enum UfsWriter {
     #[cfg(feature = "oss-hdfs")]
     OssHdfs(OssHdfsWriter),
 
+    #[cfg(feature = "cosn")]
+    Cosn(CosnWriter),
+
     Local(LocalWriter),
 }
 
@@ -118,6 +133,9 @@ impl_writer_for_enum! {
 
         #[cfg(feature = "oss-hdfs")]
         OssHdfs(OssHdfsWriter),
+
+        #[cfg(feature = "cosn")]
+        Cosn(CosnWriter),
 
         Local(LocalWriter),
     }
@@ -132,6 +150,9 @@ impl UfsWriter {
             #[cfg(feature = "oss-hdfs")]
             UnifiedWriter::OssHdfs(writer) => Ok(UfsWriter::OssHdfs(writer)),
 
+            #[cfg(feature = "cosn")]
+            UnifiedWriter::Cosn(writer) => Ok(UfsWriter::Cosn(writer)),
+
             UnifiedWriter::Local(writer) => Ok(UfsWriter::Local(writer)),
 
             other => Err(Box::new(other)),
@@ -145,6 +166,9 @@ impl UfsWriter {
 
             #[cfg(feature = "oss-hdfs")]
             UfsWriter::OssHdfs(writer) => UnifiedWriter::OssHdfs(writer),
+
+            #[cfg(feature = "cosn")]
+            UfsWriter::Cosn(writer) => UnifiedWriter::Cosn(writer),
 
             UfsWriter::Local(writer) => UnifiedWriter::Local(writer),
         }
@@ -163,6 +187,9 @@ pub enum UnifiedReader {
     #[cfg(feature = "oss-hdfs")]
     OssHdfs(OssHdfsReader),
 
+    #[cfg(feature = "cosn")]
+    Cosn(CosnReader),
+
     Local(LocalReader),
 }
 
@@ -177,6 +204,9 @@ impl_reader_for_enum! {
 
         #[cfg(feature = "oss-hdfs")]
         OssHdfs(OssHdfsReader),
+
+        #[cfg(feature = "cosn")]
+        Cosn(CosnReader),
 
         Local(LocalReader),
     }
@@ -200,6 +230,9 @@ impl UnifiedReader {
             #[cfg(feature = "oss-hdfs")]
             UnifiedReader::OssHdfs(_) => "ufs",
 
+            #[cfg(feature = "cosn")]
+            UnifiedReader::Cosn(_) => "ufs",
+
             UnifiedReader::Local(_) => "local",
         }
     }
@@ -216,6 +249,9 @@ pub enum UfsReader {
     #[cfg(feature = "oss-hdfs")]
     OssHdfs(OssHdfsReader),
 
+    #[cfg(feature = "cosn")]
+    Cosn(CosnReader),
+
     Local(LocalReader),
 }
 
@@ -226,6 +262,9 @@ impl_reader_for_enum! {
 
         #[cfg(feature = "oss-hdfs")]
         OssHdfs(OssHdfsReader),
+
+        #[cfg(feature = "cosn")]
+        Cosn(CosnReader),
 
         Local(LocalReader),
     }
@@ -239,6 +278,9 @@ pub enum UfsFileSystem {
     #[cfg(feature = "oss-hdfs")]
     OssHdfs(OssHdfsFileSystem),
 
+    #[cfg(feature = "cosn")]
+    Cosn(CosnFileSystem),
+
     Local(LocalFilesystem),
 }
 
@@ -249,6 +291,9 @@ impl_filesystem_for_enum! {
 
         #[cfg(feature = "oss-hdfs")]
         OssHdfs(OssHdfsFileSystem),
+
+        #[cfg(feature = "cosn")]
+        Cosn(CosnFileSystem),
 
         Local(LocalFilesystem),
     }
@@ -282,6 +327,18 @@ impl UfsFileSystem {
                 #[cfg(not(feature = "oss-hdfs"))]
                 {
                     err_box!("oss-hdfs provider is not enabled")
+                }
+            }
+
+            (Provider::Cosn, Some("cosn")) => {
+                #[cfg(feature = "cosn")]
+                {
+                    let fs = CosnFileSystem::new(path, conf)?;
+                    Ok(UfsFileSystem::Cosn(fs))
+                }
+                #[cfg(not(feature = "cosn"))]
+                {
+                    err_box!("cosn provider is not enabled")
                 }
             }
 
@@ -351,6 +408,18 @@ impl UfsFileSystem {
             }
 
             // Other schemes with auto provider
+            (Provider::Auto, Some("cosn")) => {
+                #[cfg(feature = "cosn")]
+                {
+                    let fs = CosnFileSystem::new(path, conf)?;
+                    Ok(UfsFileSystem::Cosn(fs))
+                }
+                #[cfg(not(feature = "cosn"))]
+                {
+                    err_box!("cosn provider is not enabled")
+                }
+            }
+
             #[cfg(feature = "opendal")]
             (Provider::Auto, Some(scheme))
                 if ["s3", "cos", "gcs", "azure", "azblob", "hdfs", "webhdfs"].contains(&scheme) =>
@@ -388,6 +457,9 @@ impl UfsFileSystem {
 
             #[cfg(feature = "oss-hdfs")]
             UfsFileSystem::OssHdfs(fs) => Ok(UfsReader::OssHdfs(fs.open(path).await?)),
+
+            #[cfg(feature = "cosn")]
+            UfsFileSystem::Cosn(fs) => Ok(UfsReader::Cosn(fs.open(path).await?)),
 
             UfsFileSystem::Local(fs) => Ok(UfsReader::Local(fs.open(path).await?)),
         }
