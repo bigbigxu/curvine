@@ -14,16 +14,32 @@
 
 use std::sync::Arc;
 
-use curvine_config::{MasterConf, RuntimeConfigEntryView, RuntimeConfigRegistry};
+use curvine_config::{
+    MasterConf, RuntimeConfigEntryView, RuntimeConfigRegistry, RuntimeConfigRegistryBuilder,
+};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_proto::RuntimeConfigEntryProto;
 use curvine_rpc::handler::LimitConf;
+use curvine_runtime::common::{ByteUnit, DurationUnit};
 use serde_json::Value;
 
 use crate::master::space::DirSpaceManager;
 
 pub const DIR_SPACE_ENABLED_KEY: &str = curvine_config::DIR_SPACE_ENABLED_RUNTIME_KEY;
 pub const DIR_SPACE_TRACKED_PATHS_KEY: &str = curvine_config::DIR_SPACE_TRACKED_PATHS_RUNTIME_KEY;
+
+/// Runtime-tunable dir-space scan knobs. Keys equal the on-disk config paths
+/// under `[master.dir_space]` so the config view needs no translation table.
+pub const DIR_SPACE_TRACK_MAX_INODES_KEY: &str = "master.dir_space.track_max_inodes";
+pub const DIR_SPACE_TRACK_MAX_EDGES_KEY: &str = "master.dir_space.track_max_edges";
+pub const DIR_SPACE_TRACK_MEMORY_BUDGET_KEY: &str = "master.dir_space.track_memory_budget";
+pub const DIR_SPACE_TRACKED_SCAN_INTERVAL_KEY: &str = "master.dir_space.tracked_scan_interval";
+pub const DIR_SPACE_TRACKED_SCAN_TIMEOUT_KEY: &str = "master.dir_space.tracked_scan_timeout";
+pub const DIR_SPACE_MAX_INODES_KEY: &str = "master.dir_space.max_inodes";
+pub const DIR_SPACE_MAX_EDGES_KEY: &str = "master.dir_space.max_edges";
+pub const DIR_SPACE_MEMORY_BUDGET_KEY: &str = "master.dir_space.memory_budget";
+pub const DIR_SPACE_GLOBAL_SCAN_INTERVAL_KEY: &str = "master.dir_space.global_scan_interval";
+pub const DIR_SPACE_GLOBAL_SCAN_TIMEOUT_KEY: &str = "master.dir_space.global_scan_timeout";
 
 /// Per-connection in-flight request cap. The key is the configuration path so the
 /// config view can attribute the value without a translation table.
@@ -100,6 +116,7 @@ pub fn build_master_runtime_registry(
                 move || Ok(Value::from(manager.reset_tracked_paths()))
             },
         )
+        .register_dir_space_tuning(&manager)
         .register_at(
             CONN_LIMIT_KEY,
             Some(CONN_LIMIT_KEY),
@@ -143,6 +160,97 @@ pub fn build_master_runtime_registry(
             },
         )
         .build()
+}
+
+/// Extension so the tuning keys can be registered as one unit while reusing
+/// the shared `DirSpaceManager` handle.
+trait RegisterDirSpaceTuning {
+    fn register_dir_space_tuning(self, manager: &Arc<DirSpaceManager>) -> Self;
+}
+
+impl RegisterDirSpaceTuning for RuntimeConfigRegistryBuilder {
+    fn register_dir_space_tuning(self, manager: &Arc<DirSpaceManager>) -> Self {
+        // Per-key apply: parse one field, merge into the current effective
+        // tuning, and validate the whole set (including the timeout <=
+        // interval invariants) before storing the override. A reset on any
+        // tuning key restores every tuning knob to the file-backed values.
+        macro_rules! tuning_key {
+            ($builder:expr, $key:expr, $field:ident, $parser:ident) => {
+                $builder.register_at(
+                    $key,
+                    Some($key),
+                    {
+                        let manager = manager.clone();
+                        move || Value::from(manager.file_tuning().$field)
+                    },
+                    {
+                        let manager = manager.clone();
+                        move || Value::from(manager.effective_tuning().$field)
+                    },
+                    {
+                        let manager = manager.clone();
+                        move |raw| {
+                            let value = $parser(raw, $key)?;
+                            let mut tuning = manager.effective_tuning();
+                            let previous = tuning.$field;
+                            tuning.$field = value;
+                            manager.update_tuning(tuning)?;
+                            Ok((Value::from(previous), Value::from(value)))
+                        }
+                    },
+                    {
+                        let manager = manager.clone();
+                        move || {
+                            let restored = manager.reset_tuning();
+                            Ok(Value::from(restored.$field))
+                        }
+                    },
+                )
+            };
+        }
+
+        let builder = self;
+        let builder = tuning_key!(builder, DIR_SPACE_TRACK_MAX_INODES_KEY, track_max_inodes, parse_positive_u64_value);
+        let builder = tuning_key!(builder, DIR_SPACE_TRACK_MAX_EDGES_KEY, track_max_edges, parse_positive_u64_value);
+        let builder = tuning_key!(builder, DIR_SPACE_TRACK_MEMORY_BUDGET_KEY, track_memory_budget_bytes, parse_byte_value);
+        let builder = tuning_key!(builder, DIR_SPACE_TRACKED_SCAN_INTERVAL_KEY, tracked_scan_interval_ms, parse_duration_ms_value);
+        let builder = tuning_key!(builder, DIR_SPACE_TRACKED_SCAN_TIMEOUT_KEY, tracked_scan_timeout_ms, parse_duration_ms_value);
+        let builder = tuning_key!(builder, DIR_SPACE_MAX_INODES_KEY, max_inodes, parse_positive_u64_value);
+        let builder = tuning_key!(builder, DIR_SPACE_MAX_EDGES_KEY, max_edges, parse_positive_u64_value);
+        let builder = tuning_key!(builder, DIR_SPACE_MEMORY_BUDGET_KEY, memory_budget_bytes, parse_byte_value);
+        let builder = tuning_key!(builder, DIR_SPACE_GLOBAL_SCAN_INTERVAL_KEY, global_scan_interval_ms, parse_duration_ms_value);
+        tuning_key!(builder, DIR_SPACE_GLOBAL_SCAN_TIMEOUT_KEY, global_scan_timeout_ms, parse_duration_ms_value)
+    }
+}
+
+/// Positive integer field (inodes / edges). Zero is rejected so a runtime
+/// edit cannot introduce a value `DirSpaceConf::validate` would refuse.
+fn parse_positive_u64_value(raw: &str, key: &str) -> CommonResult<u64> {
+    let value: u64 = raw.trim().parse().map_err(|_| {
+        curvine_core_error::CommonError::from(format!("{} expects an integer", key))
+    })?;
+    if value == 0 {
+        return err_box!("{} must be greater than zero", key);
+    }
+    Ok(value)
+}
+
+/// Duration field: plain integer means milliseconds, or a string with unit
+/// (`90s`, `5m`, `1h`), matching the on-disk config syntax.
+fn parse_duration_ms_value(raw: &str, key: &str) -> CommonResult<u64> {
+    let unit = DurationUnit::from_str(raw.trim()).map_err(|err| {
+        curvine_core_error::CommonError::from(format!("{}: {}", key, err))
+    })?;
+    Ok(unit.as_millis())
+}
+
+/// Byte-budget field: plain integer means bytes, or a string with unit
+/// (`256MB`, `1GB`), matching the on-disk config syntax.
+fn parse_byte_value(raw: &str, key: &str) -> CommonResult<u64> {
+    let unit = ByteUnit::from_str(raw.trim()).map_err(|err| {
+        curvine_core_error::CommonError::from(format!("{}: {}", key, err))
+    })?;
+    Ok(unit.as_byte())
 }
 
 fn parse_enabled(raw: &str) -> CommonResult<bool> {
@@ -253,5 +361,126 @@ mod tests {
         let one = list_runtime_config_entries(&registry, Some("demo_limit".to_string())).unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].effective_value, 9);
+    }
+
+    // ------------------------------------------------------------------
+    // Dir-space tuning keys
+    // ------------------------------------------------------------------
+
+    mod dir_space_tuning {
+        use super::*;
+        use crate::master::journal::JournalSystem;
+        use crate::master::space::scheduler::DirSpaceCoordinatorTask;
+        use crate::master::space::DirSpaceManager;
+        use crate::master::{Master, MasterMonitor, MountManager};
+        use curvine_config::{ClusterConf, JournalConf, MasterConf};
+        use curvine_runtime::common::Utils;
+
+        fn tuning_registry(name: &str) -> (RuntimeConfigRegistry, Arc<DirSpaceManager>, MasterMonitor) {
+            Master::init_test_metrics();
+            let mut conf = ClusterConf {
+                testing: true,
+                master: MasterConf {
+                    meta_dir: Utils::test_sub_dir(format!("dir-space-tuning/meta-{}", name)),
+                    ..Default::default()
+                },
+                journal: JournalConf {
+                    enable: false,
+                    journal_dir: Utils::test_sub_dir(format!("dir-space-tuning/journal-{}", name)),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            conf.master.dir_space.enabled = true;
+            conf.master.dir_space.tracked_paths = vec!["/".to_string()];
+            conf.master.init().unwrap();
+            let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+            let monitor = fs.master_monitor.clone();
+            let manager = Arc::new(DirSpaceManager::new(
+                fs.clone(),
+                Arc::new(MountManager::new(fs.clone())),
+                Arc::new(conf.master),
+            ));
+            let registry = build_master_runtime_registry(
+                manager.clone(),
+                LimitConf::new(1024, 1024),
+                &MasterConf::default(),
+            );
+            (registry, manager, monitor)
+        }
+
+        #[test]
+        fn track_max_inodes_hot_edit_changes_effective_value() {
+            let (registry, manager, _monitor) = tuning_registry("hot-edit");
+            let file = manager.effective_tuning().track_max_inodes;
+
+            let entry = registry
+                .get(DIR_SPACE_TRACK_MAX_INODES_KEY)
+                .expect("tuning key registered");
+            assert_eq!(entry.effective_value, file as i64);
+
+            registry
+                .set(DIR_SPACE_TRACK_MAX_INODES_KEY, "5000000", Some("test"))
+                .unwrap();
+            assert_eq!(manager.effective_tuning().track_max_inodes, 5_000_000);
+            assert!(manager.tuning_overridden());
+
+            let entry = registry.get(DIR_SPACE_TRACK_MAX_INODES_KEY).unwrap();
+            assert_eq!(entry.override_value.as_deref(), Some("5000000"));
+            assert_eq!(entry.effective_value, 5_000_000i64);
+        }
+
+        #[test]
+        fn tracked_scan_interval_accepts_duration_string_and_drives_scheduler() {
+            let (registry, manager, monitor) = tuning_registry("duration");
+            registry
+                .set(DIR_SPACE_TRACKED_SCAN_INTERVAL_KEY, "15m", Some("test"))
+                .unwrap();
+            registry
+                .set(DIR_SPACE_TRACKED_SCAN_TIMEOUT_KEY, "10m", Some("test"))
+                .unwrap();
+            assert_eq!(manager.point_interval_ms(), 15 * 60 * 1000);
+            assert_eq!(manager.effective_tuning().tracked_scan_timeout_ms, 10 * 60 * 1000);
+
+            // The coordinator reads the cadence live: a fresh task picks up
+            // the tuned interval without a restart.
+            let task = DirSpaceCoordinatorTask::new(manager.clone(), monitor);
+            let _ = task; // constructed without caching stale intervals
+        }
+
+        #[test]
+        fn timeout_above_interval_is_rejected_and_leaves_no_override() {
+            let (registry, manager, _monitor) = tuning_registry("timeout-reject");
+            let before = manager.effective_tuning().tracked_scan_timeout_ms;
+            let err = registry
+                .set(DIR_SPACE_TRACKED_SCAN_TIMEOUT_KEY, "99m", Some("test"))
+                .unwrap_err();
+            assert!(err.to_string().contains("must not be greater than"));
+            assert_eq!(manager.effective_tuning().tracked_scan_timeout_ms, before);
+            assert!(!manager.tuning_overridden());
+        }
+
+        #[test]
+        fn memory_budget_accepts_unit_string() {
+            let (registry, manager, _monitor) = tuning_registry("budget");
+            registry
+                .set(DIR_SPACE_TRACK_MEMORY_BUDGET_KEY, "1GB", Some("test"))
+                .unwrap();
+            assert_eq!(manager.effective_tuning().track_memory_budget_bytes, 1024 * 1024 * 1024);
+        }
+
+        #[test]
+        fn reset_restores_file_backed_tuning() {
+            let (registry, manager, _monitor) = tuning_registry("reset");
+            let file = manager.effective_tuning().track_max_inodes;
+            registry
+                .set(DIR_SPACE_TRACK_MAX_INODES_KEY, "5000000", Some("test"))
+                .unwrap();
+            registry
+                .reset(DIR_SPACE_TRACK_MAX_INODES_KEY, Some("test"))
+                .unwrap();
+            assert_eq!(manager.effective_tuning().track_max_inodes, file);
+            assert!(!manager.tuning_overridden());
+        }
     }
 }

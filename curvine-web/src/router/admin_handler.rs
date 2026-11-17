@@ -4804,12 +4804,93 @@ struct DirSpaceSummariesRequest {
     paths: Vec<String>,
 }
 
+/// Whether this probe error means "no snapshot yet / not applicable" and
+/// therefore maps to `pending` instead of `failed`.
+fn dir_space_probe_is_pending(err: &FsError) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::SnapshotNotReady | ErrorKind::Unsupported | ErrorKind::FileNotFound
+    )
+}
+
+fn dir_space_ready_item(path: &str, summary: &curvine_model::ContentSummary) -> Value {
+    json!({
+        "path": path,
+        "state": "ready",
+        "logical_bytes": summary.logical_bytes,
+        "directory_count": summary.directory_count,
+        "file_count": summary.file_count,
+    })
+}
+
+/// Probe one tracked path and produce its response item.
+///
+/// Batch pass first; on any hard failure the path is re-probed once in
+/// isolation (per-item probe) so a transient RPC fault or a leader flip
+/// degrades only this path, never the whole batch. The handler never fails
+/// the request because of one bad path.
+async fn dir_space_summary_item(
+    client: UnifiedFileSystem,
+    raw: String,
+    enabled: bool,
+    tracked: Arc<HashSet<String>>,
+) -> Value {
+    use curvine_config::DirSpaceConf;
+
+    let path = match DirSpaceConf::normalize_tracked_path_list(std::slice::from_ref(&raw), u32::MAX)
+    {
+        Ok(canonical) => canonical.into_iter().next(),
+        Err(err) => {
+            return json!({ "path": raw, "state": "failed", "error": err.to_string() });
+        }
+    };
+    let Some(path) = path else {
+        return json!({ "path": "", "state": "off", "error": "empty path" });
+    };
+    if !enabled || !tracked.contains(&path) {
+        return json!({ "path": path, "state": "off" });
+    }
+    let fs_path = match FsPath::from_str(&path) {
+        Ok(fs_path) => fs_path,
+        Err(err) => {
+            return json!({ "path": path, "state": "failed", "error": err.to_string() });
+        }
+    };
+
+    // Batch pass: one attempt like every other path in the request.
+    match client.try_get_content_summary_snapshot(&fs_path).await {
+        Ok(Some(summary)) if summary.snapshot.is_some() => {
+            return dir_space_ready_item(&path, &summary);
+        }
+        Ok(_) => return json!({ "path": path, "state": "pending" }),
+        Err(err) if dir_space_probe_is_pending(&err) => {
+            return json!({ "path": path, "state": "pending" });
+        }
+        // Transient-looking failure: fall through to the per-item probe.
+        Err(_) => {}
+    }
+
+    // Per-item probe pass: one isolated retry for this path only.
+    match client.try_get_content_summary_snapshot(&fs_path).await {
+        Ok(Some(summary)) if summary.snapshot.is_some() => {
+            dir_space_ready_item(&path, &summary)
+        }
+        Ok(_) => json!({ "path": path, "state": "pending" }),
+        Err(err) if dir_space_probe_is_pending(&err) => {
+            json!({ "path": path, "state": "pending" })
+        }
+        Err(err) => json!({
+            "path": path,
+            "state": "failed",
+            "error": err.to_string(),
+        }),
+    }
+}
+
 async fn dir_space_summaries_v1(
     Extension(instance): Extension<Arc<AdminRouterHandler>>,
     Json(payload): Json<DirSpaceSummariesRequest>,
 ) -> FsResult<Json<Value>> {
-    use curvine_config::DirSpaceConf;
-
     if payload.paths.len() > DIR_SPACE_SUMMARY_LIMIT {
         return err_box!(
             "dir-space summary request exceeds {} paths",
@@ -4834,41 +4915,16 @@ async fn dir_space_summaries_v1(
         })
         .unwrap_or_default();
 
-    let mut items = Vec::with_capacity(payload.paths.len());
-    for raw in payload.paths {
-        let canonical = DirSpaceConf::normalize_tracked_path_list(&[raw], u32::MAX)?;
-        let Some(path) = canonical.into_iter().next() else {
-            continue;
-        };
-        if !enabled || !tracked.contains(&path) {
-            items.push(json!({ "path": path, "state": "off" }));
-            continue;
-        }
-        match client
-            .try_get_content_summary_snapshot(&FsPath::from_str(&path)?)
-            .await
-        {
-            Ok(Some(summary)) if summary.snapshot.is_some() => {
-                items.push(json!({
-                    "path": path,
-                    "state": "ready",
-                    "logical_bytes": summary.logical_bytes,
-                    "directory_count": summary.directory_count,
-                    "file_count": summary.file_count,
-                }));
-            }
-            Ok(_) => items.push(json!({ "path": path, "state": "pending" })),
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    ErrorKind::SnapshotNotReady | ErrorKind::Unsupported | ErrorKind::FileNotFound
-                ) =>
-            {
-                items.push(json!({ "path": path, "state": "pending" }));
-            }
-            Err(err) => return Err(err),
-        }
-    }
+    // Batch pass: probe all requested paths concurrently so one slow path
+    // delays only its own item, not the whole response.
+    let tracked = Arc::new(tracked);
+    let probes = payload.paths.into_iter().map(|raw| {
+        let client = client.clone();
+        let tracked = Arc::clone(&tracked);
+        async move { dir_space_summary_item(client, raw, enabled, tracked).await }
+    });
+    let items = futures::future::join_all(probes).await;
+
     Ok(api_success(json!({ "items": items })))
 }
 

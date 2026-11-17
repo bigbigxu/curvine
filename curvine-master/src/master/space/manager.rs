@@ -110,11 +110,31 @@ pub struct DirSpaceManager {
     enabled_override: Mutex<Option<bool>>,
     file_paths: Vec<String>,
     paths_override: Mutex<Option<Vec<String>>>,
+    /// Runtime-tunable scan knobs (limits, budgets, cadence). Overrides are
+    /// volatile like the enabled/path overrides: restart restores file values.
+    tuning_override: Mutex<Option<DirSpaceTuning>>,
     /// Bumped on every runtime override so the coordinator scans on its next tick.
     config_epoch: AtomicU64,
     /// Latest scan-round progress. The coordinator publishes the schedule;
     /// scan attempts publish whether a round is running and how it finished.
     activity: Mutex<DirSpaceActivityState>,
+}
+
+/// The scan knobs an operator can tune while the master is running. Values are
+/// validated as a whole (including the timeout <= interval invariants) before
+/// an override is stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirSpaceTuning {
+    pub global_scan_interval_ms: u64,
+    pub global_scan_timeout_ms: u64,
+    pub tracked_scan_interval_ms: u64,
+    pub tracked_scan_timeout_ms: u64,
+    pub max_inodes: u64,
+    pub max_edges: u64,
+    pub memory_budget_bytes: u64,
+    pub track_max_inodes: u64,
+    pub track_max_edges: u64,
+    pub track_memory_budget_bytes: u64,
 }
 
 /// Point-in-time dir-space scan status for the web console.
@@ -188,6 +208,7 @@ impl DirSpaceManager {
             enabled_override: Mutex::new(None),
             file_paths: conf.dir_space.tracked_paths_normalized.clone(),
             paths_override: Mutex::new(None),
+            tuning_override: Mutex::new(None),
             config_epoch: AtomicU64::new(0),
             activity: Mutex::new(DirSpaceActivityState::default()),
             conf,
@@ -365,14 +386,121 @@ impl DirSpaceManager {
         &self.store
     }
 
+    /// File-backed tuning as the process booted with (the reset target).
+    pub fn file_tuning(&self) -> DirSpaceTuning {
+        let conf = &self.conf.dir_space;
+        DirSpaceTuning {
+            global_scan_interval_ms: conf.global_scan_interval_ms(),
+            global_scan_timeout_ms: conf.global_scan_timeout_ms(),
+            tracked_scan_interval_ms: conf.tracked_scan_interval_ms(),
+            tracked_scan_timeout_ms: conf.tracked_scan_timeout_ms(),
+            max_inodes: conf.max_inodes,
+            max_edges: conf.max_edges,
+            memory_budget_bytes: conf.memory_budget_bytes(),
+            track_max_inodes: conf.track_max_inodes,
+            track_max_edges: conf.track_max_edges,
+            track_memory_budget_bytes: conf.track_memory_budget_bytes(),
+        }
+    }
+
+    /// Effective tuning: runtime override when present, else file-backed.
+    pub fn effective_tuning(&self) -> DirSpaceTuning {
+        match self
+            .tuning_override
+            .lock()
+            .expect("dir-space tuning lock")
+            .as_ref()
+        {
+            Some(tuning) => *tuning,
+            None => self.file_tuning(),
+        }
+    }
+
+    /// Validate the whole tuning set, mirroring `DirSpaceConf::validate` so a
+    /// runtime edit cannot introduce a value the process would refuse to boot
+    /// with.
+    pub fn validate_tuning(tuning: &DirSpaceTuning) -> CommonResult<()> {
+        let fields = [
+            (
+                "dir_space.global_scan_interval",
+                tuning.global_scan_interval_ms,
+            ),
+            ("dir_space.global_scan_timeout", tuning.global_scan_timeout_ms),
+            (
+                "dir_space.tracked_scan_interval",
+                tuning.tracked_scan_interval_ms,
+            ),
+            (
+                "dir_space.tracked_scan_timeout",
+                tuning.tracked_scan_timeout_ms,
+            ),
+            ("dir_space.max_inodes", tuning.max_inodes),
+            ("dir_space.max_edges", tuning.max_edges),
+            ("dir_space.memory_budget", tuning.memory_budget_bytes),
+            ("dir_space.track_max_inodes", tuning.track_max_inodes),
+            ("dir_space.track_max_edges", tuning.track_max_edges),
+            (
+                "dir_space.track_memory_budget",
+                tuning.track_memory_budget_bytes,
+            ),
+        ];
+        for (name, value) in fields {
+            if value == 0 {
+                return err_box!("{} must be greater than zero", name);
+            }
+        }
+        if tuning.global_scan_timeout_ms > tuning.global_scan_interval_ms {
+            return err_box!(
+                "dir_space.global_scan_timeout must not be greater than dir_space.global_scan_interval"
+            );
+        }
+        if tuning.tracked_scan_timeout_ms > tuning.tracked_scan_interval_ms {
+            return err_box!(
+                "dir_space.tracked_scan_timeout must not be greater than dir_space.tracked_scan_interval"
+            );
+        }
+        Ok(())
+    }
+
+    /// Store a validated tuning override. Returns the previously effective
+    /// tuning so the caller can report the old value. Bumps the config epoch.
+    pub fn update_tuning(&self, tuning: DirSpaceTuning) -> CommonResult<DirSpaceTuning> {
+        Self::validate_tuning(&tuning)?;
+        let previous = self.effective_tuning();
+        *self
+            .tuning_override
+            .lock()
+            .expect("dir-space tuning lock") = Some(tuning);
+        self.bump_config_epoch();
+        Ok(previous)
+    }
+
+    /// Drop the tuning override; returns the restored file-backed values.
+    pub fn reset_tuning(&self) -> DirSpaceTuning {
+        *self
+            .tuning_override
+            .lock()
+            .expect("dir-space tuning lock") = None;
+        self.bump_config_epoch();
+        self.file_tuning()
+    }
+
+    /// Whether any tuning knob currently has a runtime override.
+    pub fn tuning_overridden(&self) -> bool {
+        self.tuning_override
+            .lock()
+            .expect("dir-space tuning lock")
+            .is_some()
+    }
+
     /// Configured global scan interval in milliseconds (coordinator cadence).
     pub fn interval_ms(&self) -> u64 {
-        self.conf.dir_space.global_scan_interval_ms()
+        self.effective_tuning().global_scan_interval_ms
     }
 
     /// Configured tracked-point scan interval in milliseconds.
     pub fn point_interval_ms(&self) -> u64 {
-        self.conf.dir_space.tracked_scan_interval_ms()
+        self.effective_tuning().tracked_scan_interval_ms
     }
 
     /// Refresh the global snapshot age metric from the published generation.
@@ -408,23 +536,25 @@ impl DirSpaceManager {
     }
 
     fn global_limits(&self) -> ScanLimits {
+        let tuning = self.effective_tuning();
         ScanLimits {
-            max_inodes: self.conf.dir_space.max_inodes,
-            max_edges: self.conf.dir_space.max_edges,
+            max_inodes: tuning.max_inodes,
+            max_edges: tuning.max_edges,
             max_dirs: self.conf.dir_space.max_dirs,
             max_depth: self.conf.dir_space.max_depth,
-            memory_budget_bytes: self.conf.dir_space.memory_budget_bytes(),
+            memory_budget_bytes: tuning.memory_budget_bytes,
             max_inode_record_bytes: self.conf.dir_space.max_inode_record_bytes(),
         }
     }
 
     fn point_limits(&self) -> ScanLimits {
+        let tuning = self.effective_tuning();
         ScanLimits {
-            max_inodes: self.conf.dir_space.track_max_inodes,
-            max_edges: self.conf.dir_space.track_max_edges,
+            max_inodes: tuning.track_max_inodes,
+            max_edges: tuning.track_max_edges,
             max_dirs: self.conf.dir_space.max_dirs,
             max_depth: self.conf.dir_space.track_max_depth,
-            memory_budget_bytes: self.conf.dir_space.track_memory_budget_bytes(),
+            memory_budget_bytes: tuning.track_memory_budget_bytes,
             max_inode_record_bytes: self.conf.dir_space.max_inode_record_bytes(),
         }
     }
@@ -490,7 +620,7 @@ impl DirSpaceManager {
             return (ScanOutcome::Success, 0, true);
         }
 
-        let timeout_ms = self.conf.dir_space.tracked_scan_timeout_ms();
+        let timeout_ms = self.effective_tuning().tracked_scan_timeout_ms;
         let monitor = self.fs.master_monitor.clone();
         let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
         let monitor_for_ctx = monitor.clone();
@@ -708,7 +838,7 @@ impl DirSpaceManager {
         self.begin_scan("global", "/");
         let _mark = ScanMark(self);
 
-        let timeout_ms = self.conf.dir_space.global_scan_timeout_ms();
+        let timeout_ms = self.effective_tuning().global_scan_timeout_ms;
         let monitor = self.fs.master_monitor.clone();
         let context = ScanContext {
             deadline: Instant::now() + std::time::Duration::from_millis(timeout_ms),
@@ -1103,6 +1233,76 @@ mod tests {
     // ------------------------------------------------------------------
     // Lifecycle: disabled / standby / role transitions
     // ------------------------------------------------------------------
+
+    #[test]
+    fn tuning_override_changes_cadence_and_limits_live() {
+        let (fs, conf) = test_fs("tuning", true);
+        set_role(&monitor_for(&fs), true);
+        let manager = manager_for(&fs, &conf);
+
+        // Baseline comes from the file config.
+        let file_tuning = manager.effective_tuning();
+        assert_eq!(manager.interval_ms(), file_tuning.global_scan_interval_ms);
+        assert_eq!(manager.point_interval_ms(), file_tuning.tracked_scan_interval_ms);
+        assert!(!manager.tuning_overridden());
+
+        // Override the tracked-point limit and cadence; reads reflect it
+        // immediately without any restart.
+        let mut tuning = file_tuning;
+        tuning.track_max_inodes = 5_000_000;
+        tuning.tracked_scan_interval_ms = 10 * 60 * 1000;
+        tuning.tracked_scan_timeout_ms = 5 * 60 * 1000;
+        let previous = manager.update_tuning(tuning).unwrap();
+        assert_eq!(previous, file_tuning);
+        assert!(manager.tuning_overridden());
+        assert_eq!(manager.effective_tuning().track_max_inodes, 5_000_000);
+        assert_eq!(manager.point_interval_ms(), 10 * 60 * 1000);
+
+        // Reset restores the file-backed values.
+        let restored = manager.reset_tuning();
+        assert_eq!(restored, file_tuning);
+        assert_eq!(manager.effective_tuning(), file_tuning);
+        assert!(!manager.tuning_overridden());
+    }
+
+    #[test]
+    fn tuning_validation_rejects_timeout_above_interval() {
+        let tuning = DirSpaceTuning {
+            global_scan_interval_ms: 60_000,
+            global_scan_timeout_ms: 120_000,
+            tracked_scan_interval_ms: 60_000,
+            tracked_scan_timeout_ms: 60_000,
+            max_inodes: 1,
+            max_edges: 1,
+            memory_budget_bytes: 1,
+            track_max_inodes: 1,
+            track_max_edges: 1,
+            track_memory_budget_bytes: 1,
+        };
+        assert!(DirSpaceManager::validate_tuning(&tuning).is_err());
+
+        let mut ok = tuning;
+        ok.global_scan_timeout_ms = 60_000;
+        assert!(DirSpaceManager::validate_tuning(&ok).is_ok());
+
+        ok.track_max_inodes = 0;
+        assert!(DirSpaceManager::validate_tuning(&ok).is_err());
+    }
+
+    #[test]
+    fn tuning_update_rejects_invalid_set_without_storing() {
+        let (fs, conf) = test_fs("tuning-invalid", true);
+        set_role(&monitor_for(&fs), true);
+        let manager = manager_for(&fs, &conf);
+        let file_tuning = manager.effective_tuning();
+
+        // timeout > interval must be refused and must not leave an override.
+        let mut bad = file_tuning;
+        bad.tracked_scan_timeout_ms = bad.tracked_scan_interval_ms + 1;
+        assert!(manager.update_tuning(bad).is_err());
+        assert!(!manager.tuning_overridden());
+        assert_eq!(manager.effective_tuning(), file_tuning);
+    }
 
     #[test]
     fn disabled_feature_never_scans_and_queries_are_unsupported() {

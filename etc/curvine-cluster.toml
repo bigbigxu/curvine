@@ -175,6 +175,10 @@ max_tracked_points = 128
 # (`master.dir_space_enabled`, `master.dir_space_tracked_paths`).
 # Those runtime keys keep their historical spelling; the configuration paths
 # they back are `master.dir_space.enabled` and `master.dir_space.tracked_paths`.
+# The scan knobs above (interval/timeout/budgets/inode caps) are also hot-editable
+# at runtime under their config paths, e.g. `master.dir_space.track_max_inodes`,
+# `master.dir_space.tracked_scan_timeout` (integer = ms/bytes, or "5m" / "1GB").
+# Overrides are volatile like the switch: restart restores the file values.
 auto_track_mounts = false
 tracked_paths = []
 # How long a snapshot restore waits for an in-flight scan lease to drop.

@@ -49,8 +49,6 @@ pub const COORDINATOR_TICK_MS: u64 = 1000;
 pub struct DirSpaceCoordinatorTask {
     manager: std::sync::Arc<DirSpaceManager>,
     monitor: MasterMonitor,
-    global_interval_ms: u64,
-    point_interval_ms: u64,
     /// Last-tick active state, used to detect standby → active transitions.
     was_active: std::sync::atomic::AtomicBool,
     /// Monotonic instant of the next allowed global round.
@@ -65,13 +63,11 @@ pub struct DirSpaceCoordinatorTask {
 
 impl DirSpaceCoordinatorTask {
     pub fn new(manager: std::sync::Arc<DirSpaceManager>, monitor: MasterMonitor) -> Self {
-        let global_interval_ms = manager.interval_ms();
-        let point_interval_ms = manager.point_interval_ms();
+        // Scan intervals are read live from the manager on every scheduling
+        // decision so runtime tuning edits take effect without a restart.
         Self {
             manager,
             monitor,
-            global_interval_ms,
-            point_interval_ms,
             was_active: std::sync::atomic::AtomicBool::new(false),
             global_next_due: std::sync::Mutex::new(Instant::now()),
             point_next_due: std::sync::Mutex::new(Instant::now()),
@@ -92,7 +88,7 @@ impl DirSpaceCoordinatorTask {
             | ScanOutcome::Limit
             | ScanOutcome::Disabled => {
                 *next_due =
-                    Instant::now() + std::time::Duration::from_millis(self.global_interval_ms);
+                    Instant::now() + std::time::Duration::from_millis(self.manager.interval_ms());
             }
             ScanOutcome::Busy => {}
             ScanOutcome::RoleLost => {}
@@ -112,12 +108,12 @@ impl DirSpaceCoordinatorTask {
             | ScanOutcome::Limit
                 if round_complete =>
             {
-                *next_due =
-                    Instant::now() + std::time::Duration::from_millis(self.point_interval_ms);
+                *next_due = Instant::now()
+                    + std::time::Duration::from_millis(self.manager.point_interval_ms());
             }
             ScanOutcome::Disabled if round_complete => {
-                *next_due =
-                    Instant::now() + std::time::Duration::from_millis(self.point_interval_ms);
+                *next_due = Instant::now()
+                    + std::time::Duration::from_millis(self.manager.point_interval_ms());
             }
             ScanOutcome::Busy | ScanOutcome::RoleLost => {}
             _ => {}
