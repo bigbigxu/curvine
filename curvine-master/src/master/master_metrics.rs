@@ -188,6 +188,7 @@ pub struct MasterMetrics {
     pub(crate) ufs_replay_pending: Gauge,
     pub(crate) master_safe_mode: Gauge,
     pub(crate) master_ufs_caught_up: Gauge,
+    pub(crate) journal_ufs: GaugeVec,
 
     // Metadata DB keys as produced by `DBEngine::get_rocksdb_metrics`; journal
     // DB keys carry an extra `journal_` prefix.
@@ -426,6 +427,11 @@ impl MasterMetrics {
             master_ufs_caught_up: m::new_gauge(
                 "master_ufs_caught_up",
                 "1 when the leader UFS watermark has reached the metadata watermark",
+            )?,
+            journal_ufs: m::new_gauge_vec(
+                "journal_ufs",
+                "UFS replay progress by kind: pending backlog, stalled flag, failed attempts",
+                &["kind"],
             )?,
 
             rocksdb_metrics: m::new_gauge_vec("rocksdb_metrics", "RocksDB metrics", &["tag"])?,

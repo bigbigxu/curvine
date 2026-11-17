@@ -17,7 +17,7 @@ use crate::master::journal::{
     CompleteFileEntry, DeleteEntry, JournalBatch, JournalEntry, JournalWriter, MkdirEntry,
     ReleaseWriterEntry, RenameEntry,
 };
-use crate::master::meta::inode::InodeView;
+use crate::master::meta::inode::{InodeDir, InodeView};
 use crate::master::{FsModeExport, JobManager, Master, MasterMetrics, SyncFsDir};
 use curvine_config::JournalConf;
 use curvine_core_error::{err_box, CommonResult};
@@ -33,7 +33,7 @@ use curvine_unified_fs::{MountValue, UfsFileSystem};
 use log::{debug, error, info, warn};
 use raft::eraftpb::{Entry, EntryType};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Result of replaying one raft entry in the background worker.
 enum Step {
@@ -51,6 +51,14 @@ enum Step {
 /// nothing measurable and keeps every wake-up signal out of the design: there
 /// is no notification to lose, because there is no notification.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A failing entry that keeps failing for this long is reported as stalled: the
+/// backlog it blocks also pins journal compaction at `ufs_applied`.
+const STALL_AFTER: Duration = Duration::from_secs(60);
+
+const UFS_PENDING: &str = "pending";
+const UFS_STALLED: &str = "stalled";
+const UFS_FAILED: &str = "failed";
 
 #[derive(Clone)]
 pub struct UfsLoader {
@@ -134,6 +142,20 @@ impl UfsLoader {
         }
     }
 
+    fn publish_ufs(&self, kind: &str, value: i64) {
+        self.metrics
+            .journal_ufs
+            .with_label_values(&[kind])
+            .set(value);
+    }
+
+    fn note_replay_failure(&self) {
+        self.metrics
+            .journal_ufs
+            .with_label_values(&[UFS_FAILED])
+            .inc();
+    }
+
     /// Replay every UFS side effect the watermarks still owe.
     ///
     /// Progress lives entirely in `ufs_applied`: there is no in-memory queue to
@@ -154,6 +176,7 @@ impl UfsLoader {
     /// or because the watermarks no longer describe recoverable state.
     async fn cycle(&self) -> bool {
         if !self.is_leader.get() {
+            self.clear_progress();
             return self.idle().await;
         }
 
@@ -202,17 +225,61 @@ impl UfsLoader {
         }
     }
 
+    /// Drain the owed range one entry per cycle, the way the replayer task does
+    /// it. Test-only: the replayer is not spawned when the journal system runs
+    /// in testing mode, so a test that has to observe a caught-up UFS watermark
+    /// drives the same loop here instead.
+    #[doc(hidden)]
+    pub async fn drain_replay_for_test(&self) -> CommonResult<()> {
+        let was_leader = self.is_leader.get();
+        self.is_leader.set(true);
+        let result = async {
+            loop {
+                let (from, to) = self.replay_range()?;
+                if from >= to {
+                    return Ok(());
+                }
+                if !self.cycle().await {
+                    return err_box!("ufs replay stopped before draining ({}, {}]", from, to);
+                }
+                if self.replay_range()?.0 == from {
+                    return err_box!(
+                        "ufs replay made no progress at index {}, owes ({}, {}]",
+                        from,
+                        from,
+                        to
+                    );
+                }
+            }
+        }
+        .await;
+        self.is_leader.set(was_leader);
+        result
+    }
+
     /// `(ufs_applied, applied]`, or `None` when the range cannot be read and
     /// safe mode was entered instead.
     fn owed_range(&self) -> Option<(u64, u64)> {
         match self.replay_range() {
-            Ok(range) => Some(range),
+            Ok((from, to)) => {
+                self.publish_ufs(UFS_PENDING, to.saturating_sub(from) as i64);
+                Some((from, to))
+            }
             Err(e) => {
                 self.recovery
                     .enter_safe_mode(&format!("ufs replay cannot read watermarks: {}", e));
                 None
             }
         }
+    }
+
+    fn clear_progress(&self) {
+        self.publish_ufs(UFS_PENDING, 0);
+        self.publish_ufs(UFS_STALLED, 0);
+    }
+
+    fn clear_stall(&self) {
+        self.publish_ufs(UFS_STALLED, 0);
     }
 
     /// One marker per replayed entry: a follower only needs the latest
@@ -271,30 +338,58 @@ impl UfsLoader {
 
     /// Apply one raft entry's UFS effects.
     async fn replay_one(&self, entry: &Entry) -> Step {
+        let mut failing_since: Option<Instant> = None;
+        let mut stall_logged = false;
+
         loop {
+            if !self.is_leader.get() {
+                return Step::Paused;
+            }
+            if self.stopped.get() {
+                return Step::Stop;
+            }
+
             match self.replay_entry(entry).await {
-                Ok(reached) => return Step::Applied(reached),
+                Ok(reached) => {
+                    self.clear_stall();
+                    return Step::Applied(reached);
+                }
                 Err(e) => {
                     let message = e.to_string();
-                    match classify_apply_error(&message) {
-                        ApplyDisposition::EnterSafeMode => {
-                            self.recovery.enter_safe_mode(&message);
-                            return Step::Stop;
-                        }
-                        ApplyDisposition::Retry => {
-                            // A demoted node must not keep retrying a shared UFS
-                            // write: the new leader owns that side effect now.
-                            if !self.is_leader.get() {
-                                return Step::Paused;
-                            }
-                            warn!(
-                                "ufs replay failed at index {}, retrying in {:?}: {}",
-                                entry.index, self.retry_interval, message
+                    if matches!(
+                        classify_apply_error(&message),
+                        ApplyDisposition::EnterSafeMode
+                    ) {
+                        self.recovery.enter_safe_mode(&message);
+                        return Step::Stop;
+                    }
+
+                    self.note_replay_failure();
+                    if self.owed_range().is_none() {
+                        return Step::Stop;
+                    }
+
+                    let since = *failing_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= STALL_AFTER {
+                        self.publish_ufs(UFS_STALLED, 1);
+                        if !stall_logged {
+                            stall_logged = true;
+                            error!(
+                                "ufs replay: entry {} has been failing for {:?}, the UFS \
+                                 backlog cannot drain and journal compaction stays pinned at \
+                                 ufs_applied: {}",
+                                entry.index,
+                                since.elapsed(),
+                                e
                             );
-                            if !self.sleep_or_stop().await {
-                                return Step::Stop;
-                            }
                         }
+                    }
+                    warn!(
+                        "ufs replay failed at index {}, retrying in {:?}: {}",
+                        entry.index, self.retry_interval, e
+                    );
+                    if !self.sleep_or_stop().await {
+                        return Step::Stop;
                     }
                 }
             }
@@ -325,7 +420,8 @@ impl UfsLoader {
                 JournalEntry::Mkdir(_)
                 | JournalEntry::CompleteFile(_)
                 | JournalEntry::Rename(_)
-                | JournalEntry::Delete(_) => {}
+                | JournalEntry::Delete(_)
+                | JournalEntry::ReleaseWriter(_) => {}
                 _ => continue,
             }
 
@@ -487,14 +583,32 @@ impl UfsLoader {
         }
     }
 
+    fn dir_still_at(&self, dir: &InodeDir, path: &Path) -> CommonResult<bool> {
+        match self.fs_dir.read().get_inode_path(dir.id) {
+            Ok(current) => Ok(current == path.full_path()),
+            Err(FsError::FileNotFound(_)) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub async fn mkdir(&self, e: &MkdirEntry) -> CommonResult<()> {
         let path = Path::from_str(&e.path)?;
-        if let Some((_, mnt)) = self.get_mnt(&path)? {
-            self.mkdir_with_parent_retry(&path, &mnt).await?;
-            Ok(())
-        } else {
-            Ok(())
+        let Some((_, mnt)) = self.get_mnt(&path)? else {
+            return Ok(());
+        };
+
+        // A retried batch replays this entry after the rename that moved the
+        // inode, so the stale path must not be recreated on UFS.
+        if !self.dir_still_at(&e.dir, &path)? {
+            debug!(
+                "mkdir: inode {} is no longer at {}, skipping the UFS create",
+                e.dir.id, e.path
+            );
+            return Ok(());
         }
+
+        self.mkdir_with_parent_retry(&path, &mnt).await?;
+        Ok(())
     }
 
     /// True when exports go through the Transfer service: the replayer then
