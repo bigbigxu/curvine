@@ -300,7 +300,8 @@ fn dispatch_reads_the_live_worker_task_limit() {
     // The admission gate itself, which is what the live limit has to move. The
     // decision below falls back to a probe when the gate excludes everything,
     // so the ceiling is only observable here.
-    let admitted = |scheduler: &TransferScheduler<MemoryTransferStore>, state: &TransferRuntimeConfig| {
+    let admitted = |scheduler: &TransferScheduler<MemoryTransferStore>,
+                    state: &TransferRuntimeConfig| {
         super::super::choose_worker_admitted(
             &workers,
             10,

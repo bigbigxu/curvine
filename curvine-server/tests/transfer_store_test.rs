@@ -43,9 +43,12 @@ fn transfer_job(id: &str, target_path: &str) -> TransferJobRecord {
         cv_metadata_epoch: None,
         state: TransferState::Pending,
         owner: String::new(),
-        lease_epoch: 0,
+        fence: 0,
         lease_expire_at: 0,
         cancel_requested: false,
+        cancel_reason: String::new(),
+        expires_at: 0,
+        max_runs: TransferJobRecord::DEFAULT_MAX_RUNS,
         summary: TransferProgress::default(),
         client_request_id: format!("request-{id}"),
         submitter: "test".to_string(),
@@ -63,7 +66,7 @@ where
         .create_or_get_by_request_id(transfer_job("snapshot", "/cache/snapshot"))
         .unwrap();
     let lease = store
-        .acquire_runnable_transfer("owner-1", 60_000, 10, 10, false)
+        .claim_next_job("owner-1", 10, 10, false, 60_000, "")
         .unwrap()
         .unwrap();
 
@@ -72,7 +75,7 @@ where
             job_id: lease.job_id.clone(),
             run_id: lease.run_id,
             owner: lease.owner,
-            lease_epoch: lease.lease_epoch,
+            fence: lease.fence,
             message: "mount snapshot refresh delayed".to_string(),
             next_attempt_at_ms: 20,
             mount_snapshot_attempts: Some(1),
@@ -212,7 +215,7 @@ fn assert_acquire_skips_pending_target_conflicts<S>(
     store.create_or_get_by_request_id(unrelated).unwrap();
 
     let first_lease = store
-        .acquire_runnable_transfer("owner-1", 60_000, 10, 10, false)
+        .claim_next_job("owner-1", 10, 10, false, 60_000, "")
         .unwrap()
         .unwrap();
     assert_eq!(first_lease.job_id, "job-first");
@@ -221,7 +224,7 @@ fn assert_acquire_skips_pending_target_conflicts<S>(
             job_id: "job-first".to_string(),
             run_id: 1,
             owner: "owner-1".to_string(),
-            lease_epoch: first_lease.lease_epoch,
+            fence: first_lease.fence,
             mount_snapshot_json: "{\"mount\":true}".to_string(),
             cluster_snapshot_version: 7,
             now_ms: 11,
@@ -236,7 +239,7 @@ fn assert_acquire_skips_pending_target_conflicts<S>(
         "{\"mount\":true}"
     );
     let unrelated_lease = store
-        .acquire_runnable_transfer("owner-2", 60_000, 20, 10, false)
+        .claim_next_job("owner-2", 20, 10, false, 60_000, "")
         .unwrap()
         .unwrap();
     assert_eq!(unrelated_lease.job_id, "job-unrelated");
@@ -250,7 +253,7 @@ fn assert_acquire_skips_pending_target_conflicts<S>(
             job_id: first_lease.job_id,
             run_id: first_lease.run_id,
             owner: first_lease.owner,
-            lease_epoch: first_lease.lease_epoch,
+            fence: first_lease.fence,
             from_states: vec![TransferState::Planning],
             to_state: TransferState::Completed,
             message: "completed".to_string(),
@@ -259,7 +262,7 @@ fn assert_acquire_skips_pending_target_conflicts<S>(
         .unwrap());
 
     let second_lease = store
-        .acquire_runnable_transfer("owner-3", 60_000, 40, 10, false)
+        .claim_next_job("owner-3", 40, 10, false, 60_000, "")
         .unwrap()
         .unwrap();
     assert_eq!(second_lease.job_id, "job-second");
@@ -283,7 +286,7 @@ where
 
     assert_eq!(
         store
-            .acquire_runnable_transfer("owner-1", 60_000, 10, 10, false)
+            .claim_next_job("owner-1", 10, 10, false, 60_000, "")
             .unwrap()
             .unwrap()
             .job_id,
@@ -291,7 +294,7 @@ where
     );
     assert_eq!(
         store
-            .acquire_runnable_transfer("owner-2", 60_000, 20, 10, false)
+            .claim_next_job("owner-2", 20, 10, false, 60_000, "")
             .unwrap()
             .unwrap()
             .job_id,
@@ -311,12 +314,12 @@ where
     store.create_or_get_by_request_id(child).unwrap();
 
     let root_lease = store
-        .acquire_runnable_transfer("owner-1", 60_000, 10, 10, false)
+        .claim_next_job("owner-1", 10, 10, false, 60_000, "")
         .unwrap()
         .unwrap();
     assert_eq!(root_lease.job_id, "job-root");
     assert!(store
-        .acquire_runnable_transfer("owner-2", 60_000, 20, 10, false)
+        .claim_next_job("owner-2", 20, 10, false, 60_000, "")
         .unwrap()
         .is_none());
     assert_eq!(
@@ -329,7 +332,7 @@ where
             job_id: root_lease.job_id,
             run_id: root_lease.run_id,
             owner: root_lease.owner,
-            lease_epoch: root_lease.lease_epoch,
+            fence: root_lease.fence,
             from_states: vec![TransferState::Planning],
             to_state: TransferState::Completed,
             message: "completed".to_string(),
@@ -338,7 +341,7 @@ where
         .unwrap());
     assert_eq!(
         store
-            .acquire_runnable_transfer("owner-3", 60_000, 40, 10, false)
+            .claim_next_job("owner-3", 40, 10, false, 60_000, "")
             .unwrap()
             .unwrap()
             .job_id,

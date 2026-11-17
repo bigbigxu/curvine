@@ -210,16 +210,66 @@ impl RegisterDirSpaceTuning for RuntimeConfigRegistryBuilder {
         }
 
         let builder = self;
-        let builder = tuning_key!(builder, DIR_SPACE_TRACK_MAX_INODES_KEY, track_max_inodes, parse_positive_u64_value);
-        let builder = tuning_key!(builder, DIR_SPACE_TRACK_MAX_EDGES_KEY, track_max_edges, parse_positive_u64_value);
-        let builder = tuning_key!(builder, DIR_SPACE_TRACK_MEMORY_BUDGET_KEY, track_memory_budget_bytes, parse_byte_value);
-        let builder = tuning_key!(builder, DIR_SPACE_TRACKED_SCAN_INTERVAL_KEY, tracked_scan_interval_ms, parse_duration_ms_value);
-        let builder = tuning_key!(builder, DIR_SPACE_TRACKED_SCAN_TIMEOUT_KEY, tracked_scan_timeout_ms, parse_duration_ms_value);
-        let builder = tuning_key!(builder, DIR_SPACE_MAX_INODES_KEY, max_inodes, parse_positive_u64_value);
-        let builder = tuning_key!(builder, DIR_SPACE_MAX_EDGES_KEY, max_edges, parse_positive_u64_value);
-        let builder = tuning_key!(builder, DIR_SPACE_MEMORY_BUDGET_KEY, memory_budget_bytes, parse_byte_value);
-        let builder = tuning_key!(builder, DIR_SPACE_GLOBAL_SCAN_INTERVAL_KEY, global_scan_interval_ms, parse_duration_ms_value);
-        tuning_key!(builder, DIR_SPACE_GLOBAL_SCAN_TIMEOUT_KEY, global_scan_timeout_ms, parse_duration_ms_value)
+        let builder = tuning_key!(
+            builder,
+            DIR_SPACE_TRACK_MAX_INODES_KEY,
+            track_max_inodes,
+            parse_positive_u64_value
+        );
+        let builder = tuning_key!(
+            builder,
+            DIR_SPACE_TRACK_MAX_EDGES_KEY,
+            track_max_edges,
+            parse_positive_u64_value
+        );
+        let builder = tuning_key!(
+            builder,
+            DIR_SPACE_TRACK_MEMORY_BUDGET_KEY,
+            track_memory_budget_bytes,
+            parse_byte_value
+        );
+        let builder = tuning_key!(
+            builder,
+            DIR_SPACE_TRACKED_SCAN_INTERVAL_KEY,
+            tracked_scan_interval_ms,
+            parse_duration_ms_value
+        );
+        let builder = tuning_key!(
+            builder,
+            DIR_SPACE_TRACKED_SCAN_TIMEOUT_KEY,
+            tracked_scan_timeout_ms,
+            parse_duration_ms_value
+        );
+        let builder = tuning_key!(
+            builder,
+            DIR_SPACE_MAX_INODES_KEY,
+            max_inodes,
+            parse_positive_u64_value
+        );
+        let builder = tuning_key!(
+            builder,
+            DIR_SPACE_MAX_EDGES_KEY,
+            max_edges,
+            parse_positive_u64_value
+        );
+        let builder = tuning_key!(
+            builder,
+            DIR_SPACE_MEMORY_BUDGET_KEY,
+            memory_budget_bytes,
+            parse_byte_value
+        );
+        let builder = tuning_key!(
+            builder,
+            DIR_SPACE_GLOBAL_SCAN_INTERVAL_KEY,
+            global_scan_interval_ms,
+            parse_duration_ms_value
+        );
+        tuning_key!(
+            builder,
+            DIR_SPACE_GLOBAL_SCAN_TIMEOUT_KEY,
+            global_scan_timeout_ms,
+            parse_duration_ms_value
+        )
     }
 }
 
@@ -238,18 +288,16 @@ fn parse_positive_u64_value(raw: &str, key: &str) -> CommonResult<u64> {
 /// Duration field: plain integer means milliseconds, or a string with unit
 /// (`90s`, `5m`, `1h`), matching the on-disk config syntax.
 fn parse_duration_ms_value(raw: &str, key: &str) -> CommonResult<u64> {
-    let unit = DurationUnit::from_str(raw.trim()).map_err(|err| {
-        curvine_core_error::CommonError::from(format!("{}: {}", key, err))
-    })?;
+    let unit = DurationUnit::from_str(raw.trim())
+        .map_err(|err| curvine_core_error::CommonError::from(format!("{}: {}", key, err)))?;
     Ok(unit.as_millis())
 }
 
 /// Byte-budget field: plain integer means bytes, or a string with unit
 /// (`256MB`, `1GB`), matching the on-disk config syntax.
 fn parse_byte_value(raw: &str, key: &str) -> CommonResult<u64> {
-    let unit = ByteUnit::from_str(raw.trim()).map_err(|err| {
-        curvine_core_error::CommonError::from(format!("{}: {}", key, err))
-    })?;
+    let unit = ByteUnit::from_str(raw.trim())
+        .map_err(|err| curvine_core_error::CommonError::from(format!("{}: {}", key, err)))?;
     Ok(unit.as_byte())
 }
 
@@ -376,7 +424,9 @@ mod tests {
         use curvine_config::{ClusterConf, JournalConf, MasterConf};
         use curvine_runtime::common::Utils;
 
-        fn tuning_registry(name: &str) -> (RuntimeConfigRegistry, Arc<DirSpaceManager>, MasterMonitor) {
+        fn tuning_registry(
+            name: &str,
+        ) -> (RuntimeConfigRegistry, Arc<DirSpaceManager>, MasterMonitor) {
             Master::init_test_metrics();
             let mut conf = ClusterConf {
                 testing: true,
@@ -440,7 +490,10 @@ mod tests {
                 .set(DIR_SPACE_TRACKED_SCAN_TIMEOUT_KEY, "10m", Some("test"))
                 .unwrap();
             assert_eq!(manager.point_interval_ms(), 15 * 60 * 1000);
-            assert_eq!(manager.effective_tuning().tracked_scan_timeout_ms, 10 * 60 * 1000);
+            assert_eq!(
+                manager.effective_tuning().tracked_scan_timeout_ms,
+                10 * 60 * 1000
+            );
 
             // The coordinator reads the cadence live: a fresh task picks up
             // the tuned interval without a restart.
@@ -466,7 +519,10 @@ mod tests {
             registry
                 .set(DIR_SPACE_TRACK_MEMORY_BUDGET_KEY, "1GB", Some("test"))
                 .unwrap();
-            assert_eq!(manager.effective_tuning().track_memory_budget_bytes, 1024 * 1024 * 1024);
+            assert_eq!(
+                manager.effective_tuning().track_memory_budget_bytes,
+                1024 * 1024 * 1024
+            );
         }
 
         #[test]

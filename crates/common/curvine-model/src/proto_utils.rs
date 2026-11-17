@@ -647,10 +647,8 @@ impl ProtoUtils {
                 transfer_inflight_budget_bytes: info
                     .transfer_inflight_budget_bytes
                     .unwrap_or_default(),
-                transfer_inflight_tasks: info
-                    .transfer_inflight_tasks
-                    .unwrap_or_default()
-                    .max(0) as u64,
+                transfer_inflight_tasks: info.transfer_inflight_tasks.unwrap_or_default().max(0)
+                    as u64,
                 transfer_inflight_bytes: info.transfer_inflight_bytes.unwrap_or_default(),
                 worker_max_concurrent_tasks: info.worker_max_concurrent_tasks.unwrap_or_default()
                     as usize,

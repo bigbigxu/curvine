@@ -181,7 +181,9 @@ impl TransferRuntimeConfig {
                 WORKER_INFLIGHT_BUDGET_CONFIG
             )));
         }
-        Ok(self.worker_inflight_budget_bytes.swap(target, Ordering::AcqRel))
+        Ok(self
+            .worker_inflight_budget_bytes
+            .swap(target, Ordering::AcqRel))
     }
 
     /// Restores the default budget and returns it.
@@ -781,7 +783,9 @@ mod tests {
         assert_eq!(state.worker_inflight_budget_bytes(), 524288);
 
         // Zero and garbage are refused instead of silently disabling the gate.
-        assert!(registry.set(WORKER_INFLIGHT_BUDGET_CONFIG, "0", None).is_err());
+        assert!(registry
+            .set(WORKER_INFLIGHT_BUDGET_CONFIG, "0", None)
+            .is_err());
         assert!(registry
             .set(WORKER_INFLIGHT_BUDGET_CONFIG, "10 buckets", None)
             .is_err());
@@ -797,5 +801,4 @@ mod tests {
             TransferConf::DEFAULT_WORKER_INFLIGHT_BUDGET_BYTES
         );
     }
-
 }

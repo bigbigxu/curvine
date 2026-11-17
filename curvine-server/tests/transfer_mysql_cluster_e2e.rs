@@ -95,9 +95,12 @@ fn e2e_job(command: &TransferCommand, job_id: &str) -> TransferJobRecord {
         cv_metadata_epoch: None,
         state: TransferState::Pending,
         owner: String::new(),
-        lease_epoch: 0,
+        fence: 0,
         lease_expire_at: 0,
         cancel_requested: false,
+        cancel_reason: String::new(),
+        expires_at: 0,
+        max_runs: TransferJobRecord::DEFAULT_MAX_RUNS,
         summary: TransferProgress::default(),
         client_request_id: format!("req-{job_id}"),
         submitter: "e2e".to_string(),
@@ -142,7 +145,7 @@ fn mysql_e2e_store_gates() -> CommonResult<()> {
     let job = e2e_job(&command, &format!("mysql-gates-{}", Utils::rand_str(6)));
     store.create_or_get_by_request_id_checked(job.clone())?;
     let lease = store
-        .acquire_runnable_transfer("owner", 60_000, 1, 8, false)?
+        .claim_next_job("owner", 1, 8, false, 60_000, "")?
         .unwrap();
     let task = TransferTaskRecord {
         job_id: job.job_id.clone(),
@@ -175,7 +178,7 @@ fn mysql_e2e_store_gates() -> CommonResult<()> {
         job_id: job.job_id.clone(),
         run_id: job.run_id,
         owner: lease.owner.clone(),
-        lease_epoch: lease.lease_epoch,
+        fence: lease.fence,
         tasks: vec![task],
         message: "planned".to_string(),
         now_ms: 2,
@@ -187,7 +190,7 @@ fn mysql_e2e_store_gates() -> CommonResult<()> {
         job_id: job.job_id.clone(),
         run_id: job.run_id,
         owner: lease_now.owner.clone(),
-        lease_epoch: lease_now.lease_epoch,
+        fence: lease_now.fence,
         task_id: "task-0".to_string(),
         attempt_id: 1,
         worker_id: 7,
@@ -204,7 +207,7 @@ fn mysql_e2e_store_gates() -> CommonResult<()> {
     let job2 = e2e_job(&command, &format!("mysql-max-{}", Utils::rand_str(6)));
     store.create_or_get_by_request_id_checked(job2.clone())?;
     let lease2 = store
-        .acquire_runnable_transfer("owner", 60_000, 10, 8, false)?
+        .claim_next_job("owner", 10, 8, false, 60_000, "")?
         .unwrap();
     let mut task2 = TransferTaskRecord {
         job_id: job2.job_id.clone(),
@@ -219,7 +222,7 @@ fn mysql_e2e_store_gates() -> CommonResult<()> {
         job_id: job2.job_id.clone(),
         run_id: job2.run_id,
         owner: lease2.owner.clone(),
-        lease_epoch: lease2.lease_epoch,
+        fence: lease2.fence,
         tasks: vec![task2],
         message: "planned".to_string(),
         now_ms: 11,
@@ -229,7 +232,7 @@ fn mysql_e2e_store_gates() -> CommonResult<()> {
         job_id: job2.job_id.clone(),
         run_id: job2.run_id,
         owner: lease2_now.owner.clone(),
-        lease_epoch: lease2_now.lease_epoch,
+        fence: lease2_now.fence,
         task_id: "task-0".to_string(),
         attempt_id: 1,
         worker_id: 7,
@@ -286,7 +289,7 @@ fn mysql_e2e_store_gates() -> CommonResult<()> {
         job_id: job.job_id.clone(),
         run_id: job.run_id,
         owner: lease_now.owner.clone(),
-        lease_epoch: lease_now.lease_epoch,
+        fence: lease_now.fence,
         from_states: vec![
             TransferState::Planning,
             TransferState::Dispatching,
@@ -414,13 +417,13 @@ fn mysql_cluster_e2e_batch_segment_load() -> CommonResult<()> {
         assert!(!planned.tasks.is_empty());
         store.create_or_get_by_request_id_checked(job.clone())?;
         let lease = store
-            .acquire_runnable_transfer("owner", 60_000, 1, 8, false)?
+            .claim_next_job("owner", 1, 8, false, 60_000, "")?
             .unwrap();
         store.persist_planned_tasks(TransferPlannedTasks {
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease.owner.clone(),
-            lease_epoch: lease.lease_epoch,
+            fence: lease.fence,
             tasks: planned.tasks.clone(),
             message: "planned".to_string(),
             now_ms: 2,
@@ -776,13 +779,13 @@ fn s3_cluster_e2e_s3_source() -> CommonResult<()> {
         let planned = planner.plan(&job).await?;
         store.create_or_get_by_request_id_checked(job.clone())?;
         let lease = store
-            .acquire_runnable_transfer("owner", 60_000, 1, 8, false)?
+            .claim_next_job("owner", 1, 8, false, 60_000, "")?
             .unwrap();
         store.persist_planned_tasks(TransferPlannedTasks {
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease.owner.clone(),
-            lease_epoch: lease.lease_epoch,
+            fence: lease.fence,
             tasks: planned.tasks.clone(),
             message: "planned".to_string(),
             now_ms: 2,
@@ -859,7 +862,7 @@ fn s3_cluster_e2e_s3_source() -> CommonResult<()> {
             job_id: job.job_id.clone(),
             run_id: job.run_id,
             owner: lease.owner.clone(),
-            lease_epoch: lease.lease_epoch,
+            fence: lease.fence,
             from_states: vec![
                 TransferState::Planning,
                 TransferState::Dispatching,
@@ -1021,13 +1024,13 @@ fn s3_cluster_e2e_s3_source() -> CommonResult<()> {
         let s3job = e2e_job(&s3command, &s3job_id);
         store.create_or_get_by_request_id_checked(s3job.clone())?;
         let s3lease = store
-            .acquire_runnable_transfer("owner", 60_000, 1, 8, false)?
+            .claim_next_job("owner", 1, 8, false, 60_000, "")?
             .unwrap();
         store.persist_planned_tasks(TransferPlannedTasks {
             job_id: s3job.job_id.clone(),
             run_id: s3job.run_id,
             owner: s3lease.owner.clone(),
-            lease_epoch: s3lease.lease_epoch,
+            fence: s3lease.fence,
             tasks: vec![TransferTaskRecord {
                 job_id: s3job.job_id.clone(),
                 run_id: 1,
@@ -1063,7 +1066,7 @@ fn s3_cluster_e2e_s3_source() -> CommonResult<()> {
             job_id: s3job.job_id.clone(),
             run_id: s3job.run_id,
             owner: s3lease_now.owner.clone(),
-            lease_epoch: s3lease_now.lease_epoch,
+            fence: s3lease_now.fence,
             task_id: "task-crash".to_string(),
             attempt_id: 1,
             worker_id: 7,

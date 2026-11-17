@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::task_store::TaskStore;
 use super::record_report_outcome;
+use super::task_store::TaskStore;
 use curvine_error::{FsError, FsResult};
 use curvine_job_client::{TransferClient, TransferTaskProgressReport};
 use curvine_model::{JobTaskProgress, TransferTaskReportInfo};
@@ -192,9 +192,11 @@ impl TransferProgressBatcher {
                         // report interval (CV-105 §3.5).
                         record_report_outcome(&Ok(ReportOutcome::Rejected));
                         let info = &report.report.info;
-                        let cancelled = report
-                            .abort
-                            .cancel_fenced(&report.report.job_id, info.run_id, info.attempt_id);
+                        let cancelled = report.abort.cancel_fenced(
+                            &report.report.job_id,
+                            info.run_id,
+                            info.attempt_id,
+                        );
                         if !cancelled.is_empty() {
                             info!(
                                 "aborted {} transfer task(s) after a fenced progress report: {}",

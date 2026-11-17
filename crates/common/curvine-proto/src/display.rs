@@ -131,7 +131,8 @@ impl Display for GetMountTableResponse {
             );
             storage_width = storage_width.max(storage_type_to_str(mnt.storage_type).len());
             ttl_type_width = ttl_type_width.max(ttl_type_to_str(mnt.ttl_type).len());
-            ttl_action_width = ttl_action_width.max(ttl_action_to_str(mnt.ttl_action().into()).len());
+            ttl_action_width =
+                ttl_action_width.max(ttl_action_to_str(mnt.ttl_action().into()).len());
             provider_width = provider_width.max(provider_to_str(mnt.provider).len());
         }
 

@@ -4872,9 +4872,7 @@ async fn dir_space_summary_item(
 
     // Per-item probe pass: one isolated retry for this path only.
     match client.try_get_content_summary_snapshot(&fs_path).await {
-        Ok(Some(summary)) if summary.snapshot.is_some() => {
-            dir_space_ready_item(&path, &summary)
-        }
+        Ok(Some(summary)) if summary.snapshot.is_some() => dir_space_ready_item(&path, &summary),
         Ok(_) => json!({ "path": path, "state": "pending" }),
         Err(err) if dir_space_probe_is_pending(&err) => {
             json!({ "path": path, "state": "pending" })

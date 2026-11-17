@@ -1313,7 +1313,10 @@ mod record_compat_tests {
         object.remove("lease_expire_at");
         object.insert("fence".to_string(), serde_json::json!(9));
         object.insert("expires_at".to_string(), serde_json::json!(4_242));
-        object.insert("cancel_reason".to_string(), serde_json::json!("ttl_expired"));
+        object.insert(
+            "cancel_reason".to_string(),
+            serde_json::json!("ttl_expired"),
+        );
         object.insert("max_runs".to_string(), serde_json::json!(3));
         let record: TransferJobRecord = serde_json::from_value(value).expect("current row");
         assert_eq!(record.fence, 9);

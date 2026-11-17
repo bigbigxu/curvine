@@ -275,7 +275,6 @@ impl TaskManager {
             inflight_bytes: Arc::new(AtomicI64::new(0)),
             admitted_tasks: Arc::new(AtomicUsize::new(0)),
             max_queued_tasks: Arc::new(AtomicUsize::new(conf.job.worker_max_queued_tasks)),
-
         };
         record_metric(|metrics| {
             metrics.set_inflight_budget_bytes(mgr.transfer_inflight_budget_bytes())
@@ -284,7 +283,6 @@ impl TaskManager {
 
         Ok(mgr)
     }
-
 
     /// Periodically releases finished contexts whose stale-probe window closed.
     ///
@@ -474,7 +472,6 @@ impl TaskManager {
                     }
                 }
 
-
                 let byte_guard = match reserve_inflight() {
                     Ok(guard) => guard,
                     Err(result) => return Ok(result),
@@ -489,7 +486,6 @@ impl TaskManager {
             }
 
             Entry::Vacant(vac) => {
-
                 let byte_guard = match reserve_inflight() {
                     Ok(guard) => guard,
                     Err(result) => return Ok(result),
@@ -906,7 +902,6 @@ fn transfer_report_matches(
     )
 }
 
-
 #[cfg(test)]
 mod budget_tests {
     use super::{InflightByteGuard, WORKER_AT_CAPACITY_REJECT_PREFIX};
@@ -966,6 +961,5 @@ mod budget_tests {
 }
 
 #[cfg(test)]
-
 #[path = "tests/task_manager_budget_test.rs"]
 mod task_manager_budget_test;

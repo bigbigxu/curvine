@@ -212,9 +212,6 @@ fn map_task_target_path(
     }
 }
 
-/// Maximum number of load-task submissions kept in flight at once.
-const SUBMIT_CONCURRENCY: usize = 1024;
-
 /// Run `submit` over `items` with at most `limit` futures in flight.
 ///
 /// A plain `try_join_all` over one future per item keeps the whole set live and

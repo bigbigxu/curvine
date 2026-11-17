@@ -181,9 +181,12 @@ fn e2e_job(job_id: &str) -> TransferJobRecord {
         cv_metadata_epoch: None,
         state: TransferState::Pending,
         owner: String::new(),
-        lease_epoch: 0,
+        fence: 0,
         lease_expire_at: 0,
         cancel_requested: false,
+        cancel_reason: String::new(),
+        expires_at: 0,
+        max_runs: TransferJobRecord::DEFAULT_MAX_RUNS,
         summary: TransferProgress::default(),
         client_request_id: format!("req-{job_id}"),
         submitter: "e2e".to_string(),
@@ -255,13 +258,13 @@ fn e2e_c123_store_service_config_index() -> CommonResult<()> {
     let job = e2e_job("e2e-c123");
     store.create_or_get_by_request_id_checked(job.clone())?;
     let lease = store
-        .acquire_runnable_transfer("owner", 60_000, 1, 8, false)?
+        .claim_next_job("owner", 1, 8, false, 60_000, "")?
         .unwrap();
     store.persist_planned_tasks(TransferPlannedTasks {
         job_id: job.job_id.clone(),
         run_id: job.run_id,
         owner: lease.owner.clone(),
-        lease_epoch: lease.lease_epoch,
+        fence: lease.fence,
         tasks: vec![e2e_task(&job.job_id, "task-0", 384)],
         message: "planned".to_string(),
         now_ms: 2,
@@ -274,7 +277,7 @@ fn e2e_c123_store_service_config_index() -> CommonResult<()> {
         job_id: job.job_id.clone(),
         run_id: job.run_id,
         owner: lease_now.owner.clone(),
-        lease_epoch: lease_now.lease_epoch,
+        fence: lease_now.fence,
         task_id: "task-0".to_string(),
         attempt_id: 1,
         worker_id: 7,
@@ -320,13 +323,13 @@ fn e2e_c123_store_service_config_index() -> CommonResult<()> {
     let live = e2e_job("e2e-live");
     store.create_or_get_by_request_id_checked(live.clone())?;
     let live_lease = store
-        .acquire_runnable_transfer("owner", 60_000, 1, 8, false)?
+        .claim_next_job("owner", 1, 8, false, 60_000, "")?
         .unwrap();
     store.persist_planned_tasks(TransferPlannedTasks {
         job_id: live.job_id.clone(),
         run_id: live.run_id,
         owner: live_lease.owner.clone(),
-        lease_epoch: live_lease.lease_epoch,
+        fence: live_lease.fence,
         tasks: vec![e2e_task(&live.job_id, "task-0", 10)],
         message: "planned".to_string(),
         now_ms: 2,
@@ -338,7 +341,7 @@ fn e2e_c123_store_service_config_index() -> CommonResult<()> {
         job_id: job.job_id.clone(),
         run_id: job.run_id,
         owner: lease_now.owner.clone(),
-        lease_epoch: lease_now.lease_epoch,
+        fence: lease_now.fence,
         from_states: vec![
             TransferState::Planning,
             TransferState::Dispatching,

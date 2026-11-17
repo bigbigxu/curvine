@@ -695,7 +695,12 @@ fn parse_watch_interval(value: &str) -> CommonResult<Duration> {
 fn run_display(run_id: u64) -> String {
     match run_id {
         0 | 1 => "1 (first run)".to_string(),
-        n => format!("{} (re-planned {} time{})", n, n - 1, if n - 1 == 1 { "" } else { "s" }),
+        n => format!(
+            "{} (re-planned {} time{})",
+            n,
+            n - 1,
+            if n - 1 == 1 { "" } else { "s" }
+        ),
     }
 }
 

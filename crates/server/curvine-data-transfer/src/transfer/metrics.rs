@@ -898,6 +898,10 @@ mod tests {
         dec_floor(&gauge);
         dec_floor(&gauge);
         dec_floor(&gauge);
-        assert_eq!(gauge.get(), 0, "more decrements than increments must not go negative");
+        assert_eq!(
+            gauge.get(),
+            0,
+            "more decrements than increments must not go negative"
+        );
     }
 }

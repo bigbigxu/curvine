@@ -722,7 +722,11 @@ where
             ) {
                 Ok(client) => client,
                 Err(err) => {
-                    log::debug!("transfer peer probe client for {} unavailable: {}", peer, err);
+                    log::debug!(
+                        "transfer peer probe client for {} unavailable: {}",
+                        peer,
+                        err
+                    );
                     continue;
                 }
             };
@@ -792,7 +796,10 @@ where
         let owned = match self.store.list_active_owned_jobs(256) {
             Ok(owned) => owned,
             Err(err) => {
-                log::warn!("transfer ownership sweep could not list owned jobs: {}", err);
+                log::warn!(
+                    "transfer ownership sweep could not list owned jobs: {}",
+                    err
+                );
                 return Ok(());
             }
         };
@@ -840,7 +847,8 @@ where
                 owner: self.owner.clone(),
                 fence: job.run_id,
             };
-            self.stop_recoverable_tasks(&job, &lease, "owner lost").await?;
+            self.stop_recoverable_tasks(&job, &lease, "owner lost")
+                .await?;
         }
         Ok(())
     }
@@ -878,7 +886,8 @@ where
                 owner: self.owner.clone(),
                 fence: job.run_id,
             };
-            self.stop_recoverable_tasks(&job, &lease, "ttl expired").await?;
+            self.stop_recoverable_tasks(&job, &lease, "ttl expired")
+                .await?;
         }
         Ok(())
     }
@@ -946,7 +955,10 @@ where
                     } else {
                         job.cancel_reason.as_str()
                     };
-                    if self.store.fail_job(&job.job_id, job.run_id, reason, now_ms)? {
+                    if self
+                        .store
+                        .fail_job(&job.job_id, job.run_id, reason, now_ms)?
+                    {
                         record_metric(|metrics| metrics.inc_job_failed(reason));
                         log::warn!(
                             "transfer {} run {} failed after {} runs: {}",
@@ -1027,8 +1039,7 @@ where
             return Ok(false);
         };
         if lease.owner == self.owner {
-            *self.retick_cursor.lock().unwrap_or_else(|e| e.into_inner()) =
-                lease.job_id.clone();
+            *self.retick_cursor.lock().unwrap_or_else(|e| e.into_inner()) = lease.job_id.clone();
         }
         record_metric(|metrics| metrics.inc_acquire("ok"));
 
@@ -3168,12 +3179,7 @@ where
 {
     if task_cache.owns_task(&task.job_id, task.run_id, &task.task_id) {
         // Memory-only: no row exists, so this is the whole bookkeeping.
-        return Ok(task_cache.release_attempt(
-            &task.job_id,
-            task.run_id,
-            &task.task_id,
-            now_ms,
-        ));
+        return Ok(task_cache.release_attempt(&task.job_id, task.run_id, &task.task_id, now_ms));
     }
     store.update_task_state(TransferTaskStateUpdate {
         job_id: task.job_id.clone(),
@@ -3785,7 +3791,10 @@ mod tests {
         let mut w2 = WorkerInfo::new(Default::default(), 1);
         w2.worker_max_concurrent_tasks = 5;
         let admitted = choose_worker_admitted(std::slice::from_ref(&w2), 10, 2, 0, |_| (2, 0));
-        assert!(admitted.is_empty(), "a reported 5 must not raise a limit of 2");
+        assert!(
+            admitted.is_empty(),
+            "a reported 5 must not raise a limit of 2"
+        );
         w2.worker_max_concurrent_tasks = 1;
         let admitted = choose_worker_admitted(std::slice::from_ref(&w2), 10, 2, 0, |_| (1, 0));
         assert_eq!(

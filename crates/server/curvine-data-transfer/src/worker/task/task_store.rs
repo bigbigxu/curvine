@@ -103,8 +103,8 @@ impl Deref for TaskStore {
 mod supersede_tests {
     use super::TaskStore;
     use crate::worker::task::TaskContext;
-    use curvine_model::WorkerAddress;
     use curvine_model::TransferTaskReportInfo;
+    use curvine_model::WorkerAddress;
     use curvine_model::{
         JobTaskState, LoadJobInfo, LoadTaskInfo, MountInfo, StorageType, TtlAction,
     };

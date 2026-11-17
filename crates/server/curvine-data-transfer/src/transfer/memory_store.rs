@@ -542,7 +542,14 @@ impl TransferStore for MemoryTransferStore {
                             | TransferState::Canceling
                     )
             })
-            .map(|job| (job.updated_at, job.job_id.clone(), job.run_id, job.owner.clone()))
+            .map(|job| {
+                (
+                    job.updated_at,
+                    job.job_id.clone(),
+                    job.run_id,
+                    job.owner.clone(),
+                )
+            })
             .collect();
         rows.sort();
         rows.truncate(limit.max(1));
@@ -588,26 +595,28 @@ impl TransferStore for MemoryTransferStore {
                 .jobs
                 .values()
                 .filter(|job| {
-                    job.job_id.as_str() > after_job_id
-                        && {
-                    // Only re-tick a job this instance still has work for:
-                    // cancellation, or tasks waiting to be dispatched. Owning a
-                    // job is not by itself a reason to hand it back, or every
-                    // later claim would starve the Pending queue behind it.
-                    job.owner == owner
-                        && (job.state == TransferState::Canceling
-                            || (matches!(
-                                job.state,
-                                TransferState::Dispatching | TransferState::Running
-                            ) && inner.tasks.iter().any(|((task_job, task_run, _), task)| {
-                                *task_job == job.job_id
-                                    && *task_run == job.run_id
-                                    && matches!(
-                                        task.state,
-                                        TransferTaskState::Pending | TransferTaskState::Stale
-                                    )
-                            })))
-                        }
+                    job.job_id.as_str() > after_job_id && {
+                        // Only re-tick a job this instance still has work for:
+                        // cancellation, or tasks waiting to be dispatched. Owning a
+                        // job is not by itself a reason to hand it back, or every
+                        // later claim would starve the Pending queue behind it.
+                        job.owner == owner
+                            && (job.state == TransferState::Canceling
+                                || (matches!(
+                                    job.state,
+                                    TransferState::Dispatching | TransferState::Running
+                                ) && inner.tasks.iter().any(
+                                    |((task_job, task_run, _), task)| {
+                                        *task_job == job.job_id
+                                            && *task_run == job.run_id
+                                            && matches!(
+                                                task.state,
+                                                TransferTaskState::Pending
+                                                    | TransferTaskState::Stale
+                                            )
+                                    },
+                                )))
+                    }
                 })
                 .min_by_key(|job| (job.updated_at, job.job_id.clone()))
                 .map(|job| (job.job_id.clone(), job.run_id));
@@ -710,9 +719,7 @@ impl TransferStore for MemoryTransferStore {
         // Same fence as the SQL backends: a job already in Canceling is not
         // moved again, so two instances sweeping the same owner produce exactly
         // one transition.
-        if job.run_id != run_id
-            || job.state.is_terminal()
-            || job.state == TransferState::Canceling
+        if job.run_id != run_id || job.state.is_terminal() || job.state == TransferState::Canceling
         {
             return Ok(false);
         }
@@ -833,10 +840,7 @@ impl TransferStore for MemoryTransferStore {
         let Some(job) = inner.jobs.get_mut(job_id) else {
             return Ok(false);
         };
-        if job.run_id != run_id
-            || job.owner != owner
-            || job.state.is_terminal()
-        {
+        if job.run_id != run_id || job.owner != owner || job.state.is_terminal() {
             return Ok(false);
         }
         if job
@@ -856,10 +860,7 @@ impl TransferStore for MemoryTransferStore {
         let Some(job) = inner.jobs.get_mut(&update.job_id) else {
             return Ok(false);
         };
-        if job.run_id != update.run_id
-            || job.owner != update.owner
-            || job.state.is_terminal()
-        {
+        if job.run_id != update.run_id || job.owner != update.owner || job.state.is_terminal() {
             return Ok(false);
         }
         if !job.mount_snapshot_json.trim().is_empty() && job.mount_snapshot_json != "{}" {
@@ -939,10 +940,7 @@ impl TransferStore for MemoryTransferStore {
         let Some(job) = inner.jobs.get(&update.job_id) else {
             return Ok(false);
         };
-        if job.run_id != update.run_id
-            || job.owner != update.owner
-            || job.state.is_terminal()
-        {
+        if job.run_id != update.run_id || job.owner != update.owner || job.state.is_terminal() {
             return Ok(false);
         }
         let key = (update.job_id, update.run_id, update.task_id);
@@ -994,10 +992,10 @@ impl TransferStore for MemoryTransferStore {
         }
         ensure_task_transaction_bound(candidates.len())?;
         let mut inner = self.inner.lock();
-        let owner_valid = inner.jobs.get(job_id).is_some_and(|job| {
-            job.run_id == run_id
-                && job.owner == owner
-        });
+        let owner_valid = inner
+            .jobs
+            .get(job_id)
+            .is_some_and(|job| job.run_id == run_id && job.owner == owner);
         if !owner_valid {
             return Ok(Vec::new());
         }

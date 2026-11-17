@@ -219,7 +219,7 @@ impl MasterClient {
             ),
             // Live load: the only capacity signal the scheduler dispatches on.
             transfer_inflight_tasks: Some(
-                self.transfer_inflight_tasks.load(Ordering::Acquire) as i64,
+                self.transfer_inflight_tasks.load(Ordering::Acquire) as i64
             ),
             transfer_inflight_bytes: Some(self.transfer_inflight_bytes.load(Ordering::Acquire)),
             software_version: self.software_version.clone(),

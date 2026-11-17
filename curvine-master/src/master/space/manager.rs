@@ -425,7 +425,10 @@ impl DirSpaceManager {
                 "dir_space.global_scan_interval",
                 tuning.global_scan_interval_ms,
             ),
-            ("dir_space.global_scan_timeout", tuning.global_scan_timeout_ms),
+            (
+                "dir_space.global_scan_timeout",
+                tuning.global_scan_timeout_ms,
+            ),
             (
                 "dir_space.tracked_scan_interval",
                 tuning.tracked_scan_interval_ms,
@@ -467,20 +470,14 @@ impl DirSpaceManager {
     pub fn update_tuning(&self, tuning: DirSpaceTuning) -> CommonResult<DirSpaceTuning> {
         Self::validate_tuning(&tuning)?;
         let previous = self.effective_tuning();
-        *self
-            .tuning_override
-            .lock()
-            .expect("dir-space tuning lock") = Some(tuning);
+        *self.tuning_override.lock().expect("dir-space tuning lock") = Some(tuning);
         self.bump_config_epoch();
         Ok(previous)
     }
 
     /// Drop the tuning override; returns the restored file-backed values.
     pub fn reset_tuning(&self) -> DirSpaceTuning {
-        *self
-            .tuning_override
-            .lock()
-            .expect("dir-space tuning lock") = None;
+        *self.tuning_override.lock().expect("dir-space tuning lock") = None;
         self.bump_config_epoch();
         self.file_tuning()
     }
@@ -1243,7 +1240,10 @@ mod tests {
         // Baseline comes from the file config.
         let file_tuning = manager.effective_tuning();
         assert_eq!(manager.interval_ms(), file_tuning.global_scan_interval_ms);
-        assert_eq!(manager.point_interval_ms(), file_tuning.tracked_scan_interval_ms);
+        assert_eq!(
+            manager.point_interval_ms(),
+            file_tuning.tracked_scan_interval_ms
+        );
         assert!(!manager.tuning_overridden());
 
         // Override the tracked-point limit and cadence; reads reflect it

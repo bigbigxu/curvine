@@ -176,7 +176,8 @@ impl TaskContext {
             // job id, which the caller already matched.
             return true;
         };
-        (run_id == 0 || report.run_id == run_id) && (attempt_id == 0 || report.attempt_id == attempt_id)
+        (run_id == 0 || report.run_id == run_id)
+            && (attempt_id == 0 || report.attempt_id == attempt_id)
     }
 
     pub fn is_cancel(&self) -> bool {

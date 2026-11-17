@@ -72,10 +72,6 @@ impl PeerHealth {
         self.rounds = self.rounds.saturating_add(1);
     }
 
-    pub fn rounds(&self) -> u32 {
-        self.rounds
-    }
-
     /// A probe answered: the peer is alive and its owner id is known again. A
     /// matching endpoint list also clears an earlier drift.
     pub fn observe_ok(&mut self, addr: &str, report: PeerReport, local: &[String]) {
@@ -255,7 +251,10 @@ mod tests {
         // Two failures are not evidence of death.
         assert!(health.owner_is_alive("owner-b", &local));
 
-        assert!(health.observe_failure("b:1"), "third failure crosses the line");
+        assert!(
+            health.observe_failure("b:1"),
+            "third failure crosses the line"
+        );
         assert!(health.is_dead("b:1"));
         assert!(!health.owner_is_alive("owner-b", &local));
     }
@@ -268,7 +267,10 @@ mod tests {
         health.observe_failure("b:1");
         health.observe_ok("b:1", report("owner-b", &["a:1", "b:1"]), &local);
         health.observe_failure("b:1");
-        assert!(!health.is_dead("b:1"), "the counter restarted at the success");
+        assert!(
+            !health.is_dead("b:1"),
+            "the counter restarted at the success"
+        );
     }
 
     #[test]
@@ -296,7 +298,10 @@ mod tests {
         health.observe_failure("b:1");
         health.observe_failure("b:1"); // one short of the threshold
         health.finish_round();
-        assert!(health.owner_is_alive("owner-b", &local), "flapping peer keeps it alive");
+        assert!(
+            health.owner_is_alive("owner-b", &local),
+            "flapping peer keeps it alive"
+        );
     }
 
     #[test]

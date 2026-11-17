@@ -18,7 +18,9 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::meta::inode::ttl::TtlBucket;
 use crate::master::{JobStore, Master, MasterPhase};
 use curvine_core_error::CommonResult;
-use curvine_metrics::{Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Metrics, Metrics as m};
+use curvine_metrics::{
+    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Metrics, Metrics as m,
+};
 use curvine_model::{JobTaskProgress, JobTaskState, JobTaskType, MetricValue, WorkerInfo};
 use curvine_raft::raft::storage::{LogStorage, RocksLogStorage};
 use curvine_runtime::common::LocalTime;

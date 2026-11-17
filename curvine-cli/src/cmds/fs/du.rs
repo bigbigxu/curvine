@@ -48,7 +48,7 @@ impl DuCommand {
                     );
                 }
 
-// One failing path must not hide the sizes of the others, so the
+                // One failing path must not hide the sizes of the others, so the
                 // error is reported per path and the command fails at the end.
                 let mut failed = 0usize;
                 for raw in paths {
@@ -71,7 +71,9 @@ impl DuCommand {
                     {
                         Ok(summary) => {
                             if *verbose {
-                                let source = crate::cmds::fs::common::format_content_summary_source(&summary);
+                                let source = crate::cmds::fs::common::format_content_summary_source(
+                                    &summary,
+                                );
                                 let (generation, finished) = summary
                                     .snapshot
                                     .as_ref()
@@ -148,10 +150,9 @@ fn format_du_row(summary: &ContentSummary, path: &str, human_readable: bool) -> 
 
 #[cfg(test)]
 mod tests {
-use super::{batch_error, failure_line, format_du_row};
-    use crate::cmds::fs::commands::FsSubCommand;
-    use clap::Parser;
-    use curvine_model::{ContentSummary, ContentSummarySnapshot, ContentSummarySource, FileStatus};
+    use super::format_du_row;
+
+    use curvine_model::{ContentSummary, ContentSummarySnapshot, ContentSummarySource};
 
     fn live_recursive_dir(files: &[(u64, i32)]) -> ContentSummary {
         let mut summary = ContentSummary::live_recursive(0, 0, 0, 1);
@@ -159,7 +160,6 @@ use super::{batch_error, failure_line, format_du_row};
             summary.logical_bytes += len;
             summary.replicated_bytes += ContentSummary::replicated_size(len, replicas);
             summary.file_count += 1;
-
         }
         summary
     }

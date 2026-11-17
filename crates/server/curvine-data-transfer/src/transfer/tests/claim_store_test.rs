@@ -112,7 +112,9 @@ fn claim_respects_the_executing_ceiling_and_returns_owned_work_first() {
         .is_none());
 
     // Without the ceiling the same instance picks up the second job.
-    let second = store.claim_next_job("owner-1", 12, 8, true, 120_000, "").unwrap();
+    let second = store
+        .claim_next_job("owner-1", 12, 8, true, 120_000, "")
+        .unwrap();
     assert_eq!(second.expect("second job").job_id, "b");
 }
 
@@ -156,7 +158,9 @@ fn claim_re_ticks_owned_work_without_any_lease_window() {
 #[test]
 fn mark_canceling_records_the_reason_and_owner() {
     let store = store_with(vec![job("a")]);
-    store.claim_next_job("owner-1", 10, 8, true, 120_000, "").unwrap();
+    store
+        .claim_next_job("owner-1", 10, 8, true, 120_000, "")
+        .unwrap();
 
     assert!(store
         .mark_canceling("a", 1, "owner-2", "owner_lost", 20)
@@ -172,19 +176,27 @@ fn mark_canceling_records_the_reason_and_owner() {
 #[test]
 fn mark_canceling_ignores_terminal_and_stale_run_ids() {
     let store = store_with(vec![job("a")]);
-    store.claim_next_job("owner-1", 10, 8, true, 120_000, "").unwrap();
+    store
+        .claim_next_job("owner-1", 10, 8, true, 120_000, "")
+        .unwrap();
 
     assert!(!store.mark_canceling("a", 2, "o", "owner_lost", 20).unwrap());
     assert!(store.fail_job("a", 1, "owner_lost", 30).unwrap());
     // Already terminal: a second transition must not resurrect the job.
-    assert!(!store.mark_canceling("a", 1, "o", "ttl_expired", 40).unwrap());
+    assert!(!store
+        .mark_canceling("a", 1, "o", "ttl_expired", 40)
+        .unwrap());
 }
 
 #[test]
 fn revive_run_bumps_the_generation_and_clears_ownership() {
     let store = store_with(vec![job("a")]);
-    store.claim_next_job("owner-1", 10, 8, true, 120_000, "").unwrap();
-    store.mark_canceling("a", 1, "owner-2", "owner_lost", 20).unwrap();
+    store
+        .claim_next_job("owner-1", 10, 8, true, 120_000, "")
+        .unwrap();
+    store
+        .mark_canceling("a", 1, "owner-2", "owner_lost", 20)
+        .unwrap();
 
     assert!(store.revive_run("a", 1, 30).unwrap());
     let record = store.get_transfer("a").unwrap().expect("job a");
@@ -206,7 +218,9 @@ fn revive_run_bumps_the_generation_and_clears_ownership() {
 #[test]
 fn fail_job_is_terminal_and_keeps_the_reason() {
     let store = store_with(vec![job("a")]);
-    store.claim_next_job("owner-1", 10, 8, true, 120_000, "").unwrap();
+    store
+        .claim_next_job("owner-1", 10, 8, true, 120_000, "")
+        .unwrap();
 
     assert!(store.fail_job("a", 1, "ttl_expired", 20).unwrap());
     let record = store.get_transfer("a").unwrap().expect("job a");
@@ -221,7 +235,10 @@ fn fail_job_is_terminal_and_keeps_the_reason() {
 #[test]
 fn fresh_jobs_have_no_ttl_and_two_runs_by_default() {
     let job = job("a");
-    assert_eq!(job.expires_at, 0, "no TTL unless the submitter asks for one");
+    assert_eq!(
+        job.expires_at, 0,
+        "no TTL unless the submitter asks for one"
+    );
     assert_eq!(job.max_runs, 2, "initial run plus one re-plan");
     assert!(job.cancel_reason.is_empty());
 }
@@ -229,13 +246,22 @@ fn fresh_jobs_have_no_ttl_and_two_runs_by_default() {
 #[test]
 fn concurrent_mark_canceling_transitions_exactly_once() {
     let store = store_with(vec![job("a")]);
-    store.claim_next_job("owner-1", 10, 8, true, 120_000, "").unwrap();
+    store
+        .claim_next_job("owner-1", 10, 8, true, 120_000, "")
+        .unwrap();
 
     // Two instances sweep the same dead owner; the row decides, not the caller.
-    let first = store.mark_canceling("a", 1, "sweeper-1", "owner_lost", 20).unwrap();
-    let second = store.mark_canceling("a", 1, "sweeper-2", "owner_lost", 21).unwrap();
+    let first = store
+        .mark_canceling("a", 1, "sweeper-1", "owner_lost", 20)
+        .unwrap();
+    let second = store
+        .mark_canceling("a", 1, "sweeper-2", "owner_lost", 21)
+        .unwrap();
     assert!(first, "the first sweep moves the job into Canceling");
-    assert!(!second, "the second finds it already there and does nothing");
+    assert!(
+        !second,
+        "the second finds it already there and does nothing"
+    );
     assert_eq!(store.get_transfer("a").unwrap().unwrap().owner, "sweeper-1");
 }
 
@@ -244,20 +270,30 @@ fn canceling_waits_for_recoverable_tasks_before_reviving() {
     use super::ownership::{cancel_outcome, CancelOutcome};
 
     let store = store_with(vec![job("a")]);
-    let lease = store.claim_next_job("owner-1", 10, 8, true, 120_000, "").unwrap().unwrap();
-    store.mark_canceling("a", 1, "owner-1", "owner_lost", 20).unwrap();
-    store.persist_planned_tasks(super::TransferPlannedTasks {
-        job_id: lease.job_id.clone(),
-        run_id: lease.run_id,
-        owner: lease.owner.clone(),
-        fence: lease.fence,
-        tasks: vec![],
-        message: "planned".to_string(),
-        now_ms: 21,
-    }).ok();
+    let lease = store
+        .claim_next_job("owner-1", 10, 8, true, 120_000, "")
+        .unwrap()
+        .unwrap();
+    store
+        .mark_canceling("a", 1, "owner-1", "owner_lost", 20)
+        .unwrap();
+    store
+        .persist_planned_tasks(super::TransferPlannedTasks {
+            job_id: lease.job_id.clone(),
+            run_id: lease.run_id,
+            owner: lease.owner.clone(),
+            fence: lease.fence,
+            tasks: vec![],
+            message: "planned".to_string(),
+            now_ms: 21,
+        })
+        .ok();
 
     // Tasks still recoverable: the machine waits and writes nothing.
-    assert_eq!(store.get_transfer("a").unwrap().unwrap().state, TransferState::Canceling);
+    assert_eq!(
+        store.get_transfer("a").unwrap().unwrap().state,
+        TransferState::Canceling
+    );
     assert_eq!(cancel_outcome(true, 1, 2, true), CancelOutcome::Wait);
 
     // Converged: budget left, so the next generation starts as Pending.
@@ -267,11 +303,18 @@ fn canceling_waits_for_recoverable_tasks_before_reviving() {
     assert_eq!(revived.state, TransferState::Pending);
 
     // Converged with the budget spent: terminal instead.
-    store.claim_next_job("owner-1", 31, 8, true, 120_000, "").unwrap();
-    store.mark_canceling("a", 2, "owner-1", "owner_lost", 32).unwrap();
+    store
+        .claim_next_job("owner-1", 31, 8, true, 120_000, "")
+        .unwrap();
+    store
+        .mark_canceling("a", 2, "owner-1", "owner_lost", 32)
+        .unwrap();
     assert_eq!(cancel_outcome(false, 2, 2, true), CancelOutcome::Fail);
     assert!(store.fail_job("a", 2, "owner_lost", 33).unwrap());
-    assert_eq!(store.get_transfer("a").unwrap().unwrap().state, TransferState::Failed);
+    assert_eq!(
+        store.get_transfer("a").unwrap().unwrap().state,
+        TransferState::Failed
+    );
 }
 
 #[test]
@@ -280,7 +323,9 @@ fn a_restarted_instance_sees_its_old_jobs_as_another_owner() {
     // owner id is an instance id that no longer exists. It shows up in the
     // ownership sweep route, not as "mine".
     let store = store_with(vec![job("a")]);
-    store.claim_next_job("old-instance-uuid", 10, 8, true, 120_000, "").unwrap();
+    store
+        .claim_next_job("old-instance-uuid", 10, 8, true, 120_000, "")
+        .unwrap();
     let owned = store.list_active_owned_jobs(16).unwrap();
     assert_eq!(owned.len(), 1);
     assert_eq!(owned[0].2, "old-instance-uuid");
@@ -290,10 +335,15 @@ fn a_restarted_instance_sees_its_old_jobs_as_another_owner() {
 #[test]
 fn ttl_deadline_is_fixed_and_never_extended_by_a_replan() {
     let store = store_with(vec![job("a")]);
-    store.claim_next_job("owner-1", 10, 8, true, 120_000, "").unwrap().unwrap();
+    store
+        .claim_next_job("owner-1", 10, 8, true, 120_000, "")
+        .unwrap()
+        .unwrap();
     // Simulate a submit that asked for a deadline.
     store.set_expires_at_for_test("a", 5_000).unwrap();
-    assert!(store.mark_canceling("a", 1, "owner-1", "owner_lost", 20).unwrap());
+    assert!(store
+        .mark_canceling("a", 1, "owner-1", "owner_lost", 20)
+        .unwrap());
     assert!(store.revive_run("a", 1, 30).unwrap());
     let revived = store.get_transfer("a").unwrap().unwrap();
     assert_eq!(revived.run_id, 2);
@@ -306,9 +356,14 @@ fn ttl_deadline_is_fixed_and_never_extended_by_a_replan() {
 #[test]
 fn jobs_without_a_ttl_never_expire() {
     let store = store_with(vec![job("a")]);
-    store.claim_next_job("owner-1", 10, 8, true, 120_000, "").unwrap();
+    store
+        .claim_next_job("owner-1", 10, 8, true, 120_000, "")
+        .unwrap();
     // expires_at = 0 means "no TTL": far in the future it still never shows up.
-    assert!(store.list_expired_jobs(i64::MAX / 4, 16).unwrap().is_empty());
+    assert!(store
+        .list_expired_jobs(i64::MAX / 4, 16)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -318,7 +373,9 @@ fn an_expired_job_is_listed_once_and_skipped_while_canceling() {
     store.set_expires_at_for_test("b", 1_000).unwrap();
     assert_eq!(store.list_expired_jobs(2_000, 16).unwrap().len(), 2);
 
-    assert!(store.mark_canceling("a", 1, "sweeper", "ttl_expired", 2_000).unwrap());
+    assert!(store
+        .mark_canceling("a", 1, "sweeper", "ttl_expired", 2_000)
+        .unwrap());
     let listed = store.list_expired_jobs(3_000, 16).unwrap();
     assert_eq!(listed.len(), 1, "a cancelling job is not re-marked");
     assert_eq!(listed[0].0, "b");
@@ -338,7 +395,10 @@ fn re_tick_writes_nothing_to_the_store() {
     // implementation bumped `updated_at` on every claim, which dominated the
     // measured write amplification.
     let store = store_with(vec![job("a")]);
-    let lease = store.claim_next_job("owner-1", 10, 8, true, 120_000, "").unwrap().unwrap();
+    let lease = store
+        .claim_next_job("owner-1", 10, 8, true, 120_000, "")
+        .unwrap()
+        .unwrap();
     // A Canceling job always counts as "work" for the re-tick rotation.
     store.mark_canceling("a", 1, "owner-1", "user", 11).unwrap();
     let before = store.get_transfer("a").unwrap().unwrap();
@@ -353,7 +413,8 @@ fn re_tick_writes_nothing_to_the_store() {
         {
             Some(lease) => lease,
             None => {
-                cursor = String::new();
+                // Same wrap-around the scheduler does: an exhausted keyset
+                // restarts from the beginning.
                 store
                     .claim_next_job("owner-1", 20 + tick, 8, false, 120_000, "")
                     .unwrap()
@@ -365,7 +426,10 @@ fn re_tick_writes_nothing_to_the_store() {
     }
 
     let after = store.get_transfer("a").unwrap().unwrap();
-    assert_eq!(after.updated_at, before.updated_at, "re-tick must not write");
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "re-tick must not write"
+    );
     assert_eq!(after.state, before.state);
     assert_eq!(after.fence, before.fence);
 }
@@ -375,16 +439,24 @@ fn the_re_tick_cursor_wraps_and_rotates_over_owned_jobs() {
     // Keyset semantics: an empty cursor starts at the lowest id, and an exhausted
     // walk returns nothing so the scheduler resets the cursor.
     let store = store_with(vec![job_at("a", 1), job_at("b", 2)]);
-    let first = store.claim_next_job("owner-1", 10, 8, true, 120_000, "").unwrap().unwrap();
+    let first = store
+        .claim_next_job("owner-1", 10, 8, true, 120_000, "")
+        .unwrap()
+        .unwrap();
     assert_eq!(first.job_id, "a");
     // Promote both to owned work so they become re-tick candidates.
     store.mark_canceling("a", 1, "owner-1", "user", 11).ok();
-    let second = store.claim_next_job("owner-1", 12, 8, false, 120_000, "a").unwrap();
+    let second = store
+        .claim_next_job("owner-1", 12, 8, false, 120_000, "a")
+        .unwrap();
     if let Some(second) = second {
         assert!(second.job_id > first.job_id, "cursor only moves forward");
     }
     assert!(
-        store.claim_next_job("owner-1", 13, 8, false, 120_000, "zzz").unwrap().is_none(),
+        store
+            .claim_next_job("owner-1", 13, 8, false, 120_000, "zzz")
+            .unwrap()
+            .is_none(),
         "an exhausted cursor yields nothing so the caller can wrap"
     );
 }
@@ -396,9 +468,13 @@ fn only_a_user_cancel_sets_cancel_requested() {
     // branch competed with the owner-lost advance and could Cancel the job
     // instead of re-planning it.
     let store = store_with(vec![job("a")]);
-    store.claim_next_job("owner-1", 10, 8, true, 120_000, "").unwrap();
+    store
+        .claim_next_job("owner-1", 10, 8, true, 120_000, "")
+        .unwrap();
 
-    assert!(store.mark_canceling("a", 1, "sweeper", "owner_lost", 20).unwrap());
+    assert!(store
+        .mark_canceling("a", 1, "sweeper", "owner_lost", 20)
+        .unwrap());
     let record = store.get_transfer("a").unwrap().unwrap();
     assert_eq!(record.state, TransferState::Canceling);
     assert_eq!(record.cancel_reason, "owner_lost");
@@ -407,13 +483,17 @@ fn only_a_user_cancel_sets_cancel_requested() {
     // A TTL expiry is not a user cancel either.
     assert!(store.fail_job("a", 1, "ttl_expired", 30).is_ok());
     let b = store_with(vec![job("b")]);
-    b.claim_next_job("owner-1", 10, 8, true, 120_000, "").unwrap();
-    assert!(b.mark_canceling("b", 1, "sweeper", "ttl_expired", 20).unwrap());
+    b.claim_next_job("owner-1", 10, 8, true, 120_000, "")
+        .unwrap();
+    assert!(b
+        .mark_canceling("b", 1, "sweeper", "ttl_expired", 20)
+        .unwrap());
     assert!(!b.get_transfer("b").unwrap().unwrap().cancel_requested);
 
     // A real user cancel does set it.
     let c = store_with(vec![job("c")]);
-    c.claim_next_job("owner-1", 10, 8, true, 120_000, "").unwrap();
+    c.claim_next_job("owner-1", 10, 8, true, 120_000, "")
+        .unwrap();
     assert!(c.mark_canceling("c", 1, "user", "user", 20).unwrap());
     assert!(c.get_transfer("c").unwrap().unwrap().cancel_requested);
 }
@@ -426,10 +506,17 @@ fn an_owner_lost_job_re_plans_instead_of_being_canceled() {
     use super::ownership::{cancel_outcome, CancelOutcome};
 
     let store = store_with(vec![job("a")]);
-    store.claim_next_job("owner-1", 10, 8, true, 120_000, "").unwrap();
-    store.mark_canceling("a", 1, "sweeper", "owner_lost", 20).unwrap();
+    store
+        .claim_next_job("owner-1", 10, 8, true, 120_000, "")
+        .unwrap();
+    store
+        .mark_canceling("a", 1, "sweeper", "owner_lost", 20)
+        .unwrap();
     let record = store.get_transfer("a").unwrap().unwrap();
-    assert!(!record.cancel_requested, "the cancel branch cannot claim this job");
+    assert!(
+        !record.cancel_requested,
+        "the cancel branch cannot claim this job"
+    );
 
     let replan_allowed = record.cancel_reason != "ttl_expired";
     assert_eq!(
