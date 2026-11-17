@@ -21,6 +21,8 @@ export default {
       enablePath: '开启统计',
       disablePath: '关闭统计',
       pending: '统计中',
+      off: '未开启',
+      failed: '统计失败',
       tag: '统计',
       summaryTitle: '{dirs} 个目录，{files} 个文件',
       pathUpdated: '已更新 {path} 的目录统计',

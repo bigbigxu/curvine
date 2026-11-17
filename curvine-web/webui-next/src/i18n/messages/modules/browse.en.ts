@@ -21,6 +21,8 @@ export default {
       enablePath: 'Track',
       disablePath: 'Untrack',
       pending: 'Scanning',
+      off: 'Not tracked',
+      failed: 'Scan failed',
       tag: 'Stats',
       summaryTitle: '{dirs} directories, {files} files',
       pathUpdated: 'Updated directory statistics for {path}',

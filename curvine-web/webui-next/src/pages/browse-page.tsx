@@ -629,19 +629,27 @@ export function BrowsePage() {
       return
     }
     let cancelled = false
-    void api
-      .fetchDirSpaceSummaries([...wanted])
-      .then((result) => {
+    const load = async () => {
+      try {
+        const result = await api.fetchDirSpaceSummaries([...wanted])
         if (cancelled) return
         const next: Record<string, DirSpaceSummary> = {}
         for (const item of result.items || []) next[item.path] = item
+        // Full replace on success: the response covers every wanted path with
+        // its own state (ready/pending/off/failed).
         setDirSpaceSummaries(next)
-      })
-      .catch(() => {
-        if (!cancelled) setDirSpaceSummaries({})
-      })
+      } catch {
+        // A transient batch failure (one slow RPC, a leader flip) must never
+        // wipe the numbers already on screen; keep the last good snapshot.
+      }
+    }
+    void load()
+    // Follow the dir-space status poll cadence so published results show up
+    // without the user having to re-navigate the listing.
+    const timer = window.setInterval(load, 3000)
     return () => {
       cancelled = true
+      window.clearInterval(timer)
     }
   }, [api, dirSpace?.enabled, items, pathFromUrl, trackedDirPaths])
 
@@ -1312,7 +1320,26 @@ export function BrowsePage() {
   function directorySize(path: string) {
     if (!dirSpace?.enabled || !trackedDirPaths.has(path)) return null
     const summary = dirSpaceSummaries[path]
-    if (!summary || summary.state !== 'ready') {
+    if (!summary || summary.state === 'pending') {
+      return <span className="text-muted-foreground">{t('browse.dirSpace.pending')}</span>
+    }
+    if (summary.state === 'off') {
+      return <span className="text-muted-foreground">{t('browse.dirSpace.off')}</span>
+    }
+    if (summary.state === 'failed') {
+      return (
+        <span
+          className="text-destructive"
+          title={summary.error || t('browse.dirSpace.failed')}
+          data-testid={`browse-dir-size-error-${path}`}
+        >
+          {t('browse.dirSpace.failed')}
+        </span>
+      )
+    }
+    if (summary.state !== 'ready') {
+      // Unknown state from a newer backend: stay conservative, keep the old
+      // numbers when present instead of flashing "scanning".
       return <span className="text-muted-foreground">{t('browse.dirSpace.pending')}</span>
     }
     return (

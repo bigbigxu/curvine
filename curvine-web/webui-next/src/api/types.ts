@@ -300,10 +300,13 @@ export interface DirSpaceUpdate {
 
 export interface DirSpaceSummary {
   path: string
-  state: 'ready' | 'pending' | 'off'
+  /** `failed` carries `error`; stale caches may still yield the legacy states. */
+  state: 'ready' | 'pending' | 'off' | 'failed' | string
   logical_bytes?: number
   directory_count?: number
   file_count?: number
+  /** Populated only with `state: 'failed'`: why this path could not be probed. */
+  error?: string
 }
 
 export interface MountInfo {
