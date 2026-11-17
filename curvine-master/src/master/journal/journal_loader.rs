@@ -1440,7 +1440,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
     /// `/phase` and `/recoveryz` must not disagree: the UFS watermark moves on
     /// the marker path, which never goes through `set_applied` (#CV-94 e2e).
     #[test]
@@ -1476,6 +1475,7 @@ mod tests {
         Ok(())
     }
 
+    #[test]
     fn ufs_replayer_advances_its_own_watermark() -> FsResult<()> {
         let (conf, root) = ignore_reply_error_conf("ufs-replay", true);
         let js = JournalSystem::from_conf(&conf)?;
