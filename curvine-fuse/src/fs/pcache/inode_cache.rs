@@ -594,9 +594,31 @@ impl InodeCache {
         }
     }
 
+    /// True when the final reference must publish a backend `complete`: the
+    /// cache came from a writable open, a writer was materialized for it,
+    /// pages were accepted, or writes are still unpublished.
+    ///
+    /// A cache created only by read-only opens has none of these. Opening a
+    /// writer just to close it again costs one extra backend Open RPC per read
+    /// (issued with read-only flags), so completion must be skipped for it.
+    async fn needs_complete(&self) -> bool {
+        if self.flags.write() || self.writer_ver.get() > self.all_ver.get() {
+            return true;
+        }
+        if !self.state.read().is_empty() {
+            return true;
+        }
+        self.writer.lock().await.is_some()
+    }
+
     pub async fn complete(self: &Arc<Self>, opts: Option<SetAttrOpts>) -> FuseResult<()> {
         if self.is_deleted() {
             self.free_pages(true);
+            return Ok(());
+        }
+
+        if !self.needs_complete().await {
+            let _ = self.free_pages(true);
             return Ok(());
         }
 

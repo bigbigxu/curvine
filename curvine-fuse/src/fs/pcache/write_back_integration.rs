@@ -14,7 +14,7 @@
 
 use crate::fs::operator::Write;
 use crate::fs::pcache::{CacheManager, InodeCache, WriteBackWork};
-use crate::fs::state::{FileHandle, NodeState};
+use crate::fs::state::{CacheHandle, FileHandle, NodeState};
 use crate::fs::{CurvineFileSystem, FuseWriter};
 use crate::raw::fuse_abi::{fuse_in_header, fuse_write_in};
 use crate::session::{FuseResponse, FuseTask};
@@ -1261,5 +1261,159 @@ fn write_back_complete_failure_clears_dirty_inode() {
             ctx.cm.get_cache(ino).await.is_none(),
             "the cache entry must be released"
         );
+    });
+}
+
+/// A writable cache must still publish its data through `complete` when the
+/// last reference closes.
+#[test]
+fn writer_backed_cache_release_still_completes() {
+    let rt = Arc::new(AsyncRuntime::single());
+    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
+    rt.block_on(async move {
+        let handle = ctx.create_file("release_writer.bin").await;
+        let ino = handle.ino();
+        let (_writer, backend) = ctx.inject_backend(ino, "backend_release_writer.bin").await;
+
+        let data = pattern_data(4096);
+        ctx.write_via_fuse(&handle, 0, &data).await;
+
+        let cache = ctx.cm.get_cache(ino).await.unwrap();
+        ctx.cm.release_cache(&cache).await.unwrap();
+
+        assert_backend_eq(&backend, &data);
+        assert!(ctx.cm.get_cache(ino).await.is_none());
+    });
+}
+
+/// A cache created by a read-only open has nothing to publish. Releasing it
+/// must not reach the backend: opening a writer just to close it costs one
+/// extra Open RPC per read and used to use the read-only flags for it.
+#[test]
+fn read_only_cache_release_skips_backend_complete() {
+    let rt = Arc::new(AsyncRuntime::single());
+    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
+    rt.block_on(async move {
+        let handle = ctx.create_file("release_reader.bin").await;
+        let ino = handle.ino();
+        let (_writer, backend) = ctx.inject_backend(ino, "backend_release_reader.bin").await;
+
+        let data = pattern_data(1024);
+        ctx.write_via_fuse(&handle, 0, &data).await;
+
+        // Commit and drop the writer session first, as a close would.
+        let writer_cache = ctx.cm.get_cache(ino).await.unwrap();
+        ctx.cm.release_cache(&writer_cache).await.unwrap();
+        assert_backend_eq(&backend, &data);
+        assert!(ctx.cm.get_cache(ino).await.is_none());
+
+        // A later read-only open materializes a cache entry with RDONLY flags
+        // and no writer.
+        let reader = ctx
+            .cm
+            .get_or_create(
+                ino,
+                OpenFlags::RDONLY,
+                CreateFileOpts::with_create(false),
+                data.len() as u64,
+            )
+            .await
+            .unwrap();
+        assert!(reader.writer.lock().await.is_none());
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            ctx.cm.release_cache(&reader),
+        )
+        .await
+        .expect("a read-only release must not reach the backend");
+        res.unwrap();
+        assert!(
+            reader.writer.lock().await.is_none(),
+            "a read-only cache must not open a backend writer"
+        );
+        assert!(ctx.cm.get_cache(ino).await.is_none());
+    });
+}
+
+/// A read-only close must not rewrite the shared inode's dirty length/mtime;
+/// doing so invalidates metadata on every read.
+#[test]
+fn read_only_cache_flush_keeps_dirty_metadata() {
+    let rt = Arc::new(AsyncRuntime::single());
+    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
+    rt.block_on(async move {
+        let handle = ctx.create_file("release_flush.bin").await;
+        let ino = handle.ino();
+        ctx.write_via_fuse(&handle, 0, &pattern_data(1024)).await;
+
+        let cache = ctx.cm.get_cache(ino).await.unwrap();
+        let before = ctx
+            .state
+            .dir_read()
+            .get_inode(ino, None)
+            .expect("inode is cached")
+            .mtime;
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let reader = CacheHandle::new(
+            ino,
+            1,
+            cache,
+            handle.status(),
+            OpenFlags::RDONLY,
+            CreateFileOpts::with_create(false),
+        );
+        reader.flush(None).await.unwrap();
+
+        let after = ctx
+            .state
+            .dir_read()
+            .get_inode(ino, None)
+            .expect("inode is cached")
+            .mtime;
+        assert_eq!(
+            before, after,
+            "a read-only flush must not rewrite the dirty length/mtime"
+        );
+    });
+}
+
+/// When a writer and a reader share the cache entry, the reader may be the
+/// last reference. The pending write-back data must still be committed then.
+#[test]
+fn reader_close_last_still_commits_writer_data() {
+    let rt = Arc::new(AsyncRuntime::single());
+    let ctx = WriteBackTestContext::new(rt.clone(), PAGE_SIZE, PAGE_SIZE * 4096);
+    rt.block_on(async move {
+        let handle = ctx.create_file("mixed_refs.bin").await;
+        let ino = handle.ino();
+        let (_writer, backend) = ctx.inject_backend(ino, "backend_mixed_refs.bin").await;
+
+        let data = pattern_data(2048);
+        ctx.write_via_fuse(&handle, 0, &data).await;
+
+        let writer_cache = ctx.cm.get_cache(ino).await.unwrap();
+        // A concurrent read-only open takes a second reference to the same entry.
+        let reader_cache = ctx
+            .cm
+            .get_or_create(
+                ino,
+                OpenFlags::RDONLY,
+                CreateFileOpts::with_create(false),
+                data.len() as u64,
+            )
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&writer_cache, &reader_cache));
+
+        // Writer closes first: non-last release only flushes, no complete.
+        ctx.cm.release_cache(&writer_cache).await.unwrap();
+        // Reader closes last: the pending write-back data must be committed.
+        ctx.cm.release_cache(&reader_cache).await.unwrap();
+
+        assert_backend_eq(&backend, &data);
+        assert!(ctx.cm.get_cache(ino).await.is_none());
     });
 }
