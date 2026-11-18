@@ -24,6 +24,7 @@ use axum::{Extension, Json, Router};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;
 use curvine_net::net::{InetAddr, NetUtils};
+use curvine_raft::conf::JournalConfExt;
 use curvine_raft::raft::storage::{LogStorage, RocksLogStorage};
 use curvine_rpc::server::ServerConf;
 use curvine_runtime::common::LocalTime;
@@ -96,18 +97,59 @@ async fn rolloutz(
     rollout_status(probe_view(&handler.fs, &handler.journal_store))
 }
 
-fn runtime_payload(runtime: &MasterRuntimeMetadata) -> Value {
+/// The HA identity a master publishes about *itself*.
+///
+/// The console cannot derive this from the leader's raft id: its cluster config
+/// maps raft ids to master addresses in journal order, and pod recreation
+/// reassigns IPs, so that mapping goes stale and the Active badge lands on a
+/// standby. Each master therefore answers with its own view.
+struct MasterIdentity {
+    is_active: bool,
+    raft_id: Option<u64>,
+    hostname: String,
+    role: String,
+    master_state: String,
+}
+
+fn master_identity(handler: &MasterMetricsHandler) -> MasterIdentity {
+    let monitor = &handler.fs.master_monitor;
+    let conf = &handler.config_view.conf;
+    let raft_id = if conf.journal.enable {
+        conf.journal.node_id().ok()
+    } else {
+        None
+    };
+    MasterIdentity {
+        is_active: monitor.is_active(),
+        raft_id,
+        hostname: InetAddr::from_str(&handler.node)
+            .map(|addr| addr.hostname)
+            .unwrap_or_else(|_| handler.node.clone()),
+        role: format!("{:?}", monitor.journal_role()),
+        master_state: format!("{:?}", monitor.journal_state()),
+    }
+}
+
+fn runtime_payload(runtime: &MasterRuntimeMetadata, identity: &MasterIdentity) -> Value {
     let master_version = curvine_sys::version::component_version("master");
     json!({
         "version": master_version.release_version,
         "version_commit": master_version.git_commit,
         "start_time": runtime.start_time.as_str(),
         "start_time_ms": runtime.start_time_ms,
+        "is_active": identity.is_active,
+        "raft_id": identity.raft_id,
+        "hostname": identity.hostname.as_str(),
+        "role": identity.role.as_str(),
+        "master_state": identity.master_state.as_str(),
     })
 }
 
 async fn master_runtime(Extension(handler): Extension<Arc<MasterMetricsHandler>>) -> Json<Value> {
-    Json(runtime_payload(&handler.runtime))
+    Json(runtime_payload(
+        &handler.runtime,
+        &master_identity(&handler),
+    ))
 }
 
 /// Everything an operator needs to answer "what is this master doing", built
@@ -1349,13 +1391,25 @@ mod tests {
             start_time_ms: 1_727_085_296_789,
         };
         let master_version = curvine_sys::version::component_version("master");
+        let identity = MasterIdentity {
+            is_active: true,
+            raft_id: Some(3),
+            hostname: "cv-master-2".to_string(),
+            role: "Leader".to_string(),
+            master_state: "Active".to_string(),
+        };
 
-        let payload = runtime_payload(&runtime);
+        let payload = runtime_payload(&runtime, &identity);
 
         assert_eq!(payload["version"], json!(master_version.release_version));
         assert_eq!(payload["version_commit"], json!(master_version.git_commit));
         assert_eq!(payload["start_time"], json!(runtime.start_time.as_str()));
         assert_eq!(payload["start_time_ms"], json!(runtime.start_time_ms));
+        assert_eq!(payload["is_active"], json!(true));
+        assert_eq!(payload["raft_id"], json!(3));
+        assert_eq!(payload["hostname"], json!("cv-master-2"));
+        assert_eq!(payload["role"], json!("Leader"));
+        assert_eq!(payload["master_state"], json!("Active"));
     }
 
     /// The master's `/api/v1/master/config` route must publish the full view, not
