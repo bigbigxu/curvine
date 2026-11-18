@@ -375,6 +375,16 @@ export function OverviewPage() {
           </Button>
         </div>
 
+        {masterHa.warning ? (
+          <p
+            className="rounded border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning"
+            title={masterHa.warning}
+            data-testid="overview-ha-warning"
+          >
+            {t('overview.ha.configWarning')}
+          </p>
+        ) : null}
+
         <ResourceTable
           loading={loading}
           error={null}

@@ -55,6 +55,8 @@ export interface MasterHaNode {
   current?: boolean
   switchable?: boolean
   raft_id?: number | null
+  /** Role reported by the master itself; null on builds without self-report. */
+  self_reported_role?: string | null
 }
 
 export interface MasterHaData {
@@ -68,6 +70,9 @@ export interface MasterHaData {
   failover_supported?: boolean
   active_raft_id?: number | null
   local_hostname?: string | null
+  /** Set when masters self-report a role that disagrees with the console's
+   * cluster config (e.g. stale pod IPs after recreation). */
+  warning?: string | null
 }
 
 export interface WorkerAddress {

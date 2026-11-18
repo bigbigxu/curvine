@@ -25,6 +25,7 @@ use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_fault::FaultHttpControl;
 use curvine_model::{FileBlocks, FileStatus, Trigger, WorkerInfo};
+use curvine_raft::conf::JournalConfExt;
 use curvine_raft::raft::storage::RocksLogStorage;
 use curvine_runtime::common::LocalTime;
 use curvine_web::router::RouterHandler;
@@ -203,11 +204,23 @@ async fn master_runtime(
     Extension(instance): Extension<Arc<MasterRouterHandler>>,
 ) -> FsResult<Json<Value>> {
     let master_version = curvine_sys::version::component_version("master");
+    // Self-reported HA identity. The console probes this endpoint per master
+    // IP to decide Active/Standby without depending on its own (possibly
+    // stale) raft_id-to-address mapping.
+    let is_active = instance.fs.master_monitor.is_active();
+    let raft_id = if instance.conf.journal.enable {
+        instance.conf.journal.node_id().ok()
+    } else {
+        None
+    };
     Ok(Json(json!({
         "version": master_version.release_version,
         "version_commit": master_version.git_commit,
         "start_time": instance.start_time,
         "start_time_ms": instance.start_time_ms,
+        "is_active": is_active,
+        "raft_id": raft_id,
+        "hostname": instance.conf.master.hostname,
     })))
 }
 

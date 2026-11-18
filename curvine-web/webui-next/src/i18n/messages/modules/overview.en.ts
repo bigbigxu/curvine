@@ -35,6 +35,7 @@ export default {
     ha: {
       title: 'Master HA',
       subtitle: 'Active and standby masters discovered from cluster configuration',
+      configWarning: 'HA probe conflict: the self-reported Active role disagrees with the cluster config; the console config is likely stale (e.g. pod IPs changed). Roles follow the self-report.',
       master: 'Master',
       journal: 'Journal',
       role: 'Role',

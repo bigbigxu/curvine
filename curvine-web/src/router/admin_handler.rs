@@ -430,6 +430,11 @@ struct MasterRuntimeInfo {
     version_commit: Option<String>,
     start_time: Option<String>,
     start_time_ms: Option<u64>,
+    /// Self-reported HA role from the probed master (`/api/v1/master/runtime`).
+    /// `None` when the master runs a build older than the self-report fields.
+    is_active: Option<bool>,
+    raft_id: Option<u64>,
+    hostname: Option<String>,
 }
 
 impl MasterRuntimeInfo {
@@ -451,6 +456,9 @@ impl MasterRuntimeInfo {
             version_commit: as_non_empty("version_commit"),
             start_time: as_non_empty("start_time"),
             start_time_ms,
+            is_active: value.get("is_active").and_then(|v| v.as_bool()),
+            raft_id: value.get("raft_id").and_then(|v| v.as_u64()),
+            hostname: as_non_empty("hostname"),
         }
     }
 
@@ -978,17 +986,28 @@ async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &Filesyst
     let probed = futures::future::join_all(node_futures).await;
 
     let mut nodes = Vec::with_capacity(probed.len());
+    // Self-reported Active nodes (masters that answered with is_active=true).
+    // When any node reports its role, that report decides the role and the
+    // console's own raft_id-to-address mapping is only a display fallback —
+    // a stale console config can no longer flip the roles.
+    let mut self_reported_active: Vec<String> = Vec::new();
     for (addr, addr_text, raft_id, reachable, leader_id, reachable_error, runtime) in probed {
         let display_addr = display_inet_addr_with_hint(&addr, &display_hostname);
         let journal_addr = raft_id
             .and_then(|id| journal_addr_for_id(conf, id))
             .unwrap_or_default();
-        let is_current = match (active_raft_id, raft_id) {
-            (Some(active_id), Some(node_id)) => active_id == node_id,
-            _ if active_master.is_empty() => false,
-            _ => master_is_active_target(conf, &active_master, active_raft_id, &addr_text, raft_id),
+        // Identity: prefer the master's self-reported raft_id; fall back to the
+        // console's static mapping for older builds.
+        let node_raft_id = runtime.raft_id.or(raft_id);
+        let is_current = match runtime.is_active {
+            Some(active) => active,
+            None => match (active_raft_id, node_raft_id) {
+                (Some(active_id), Some(node_id)) => active_id == node_id,
+                _ if active_master.is_empty() => false,
+                _ => master_is_active_target(conf, &active_master, active_raft_id, &addr_text, raft_id),
+            },
         };
-        let role = if active_master.is_empty() {
+        let role = if active_master.is_empty() && runtime.is_active.is_none() {
             "Unknown"
         } else if is_current {
             "Active"
@@ -996,11 +1015,18 @@ async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &Filesyst
             "Standby"
         };
 
+        if runtime.is_active == Some(true) {
+            if let Some(hostname) = runtime.hostname.as_ref() {
+                self_reported_active.push(hostname.clone());
+            }
+            self_reported_active.push(addr_text.clone());
+        }
+
         nodes.push(json!({
             "addr": addr_text,
             "display_addr": display_addr,
             "journal_addr": journal_addr,
-            "raft_id": raft_id,
+            "raft_id": node_raft_id,
             "raft_leader_id": leader_id,
             "role": role,
             "reachable": reachable,
@@ -1011,13 +1037,43 @@ async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &Filesyst
             "version_commit": runtime.version_commit_json(),
             "start_time": runtime.start_time_json(),
             "start_time_ms": runtime.start_time_ms_json(),
+            "self_reported_role": runtime.is_active.map(|active| json!(if active { "Active" } else { "Standby" })).unwrap_or(Value::Null),
         }));
     }
+
+    // Cross-check: the self-reported Active node must agree with the
+    // GetFilesystemInfo answer. A disagreement means the console's cluster
+    // config does not describe the running cluster (e.g. stale pod IPs).
+    let ha_warning = if self_reported_active.is_empty() {
+        None
+    } else {
+        let active_host = InetAddr::from_str(active_master.trim())
+            .ok()
+            .map(|addr| addr.hostname);
+        let agreed = active_host
+            .as_deref()
+            .map(|host| {
+                self_reported_active
+                    .iter()
+                    .any(|candidate| hosts_match_for_cluster_mapping(candidate, host))
+            })
+            .unwrap_or(false);
+        if agreed {
+            None
+        } else {
+            Some(format!(
+                "HA probe conflict: nodes self-report {:?} as Active but GetFilesystemInfo reports {:?}; the console cluster config may be stale",
+                self_reported_active.first().cloned().unwrap_or_default(),
+                active_master
+            ))
+        }
+    };
 
     json!({
         "active_master": active_master,
         "active_raft_id": active_raft_id,
         "active_master_configured": active_master_configured,
+        "warning": ha_warning,
         "active_master_display": if active_master.is_empty() {
             String::new()
         } else {
@@ -6946,6 +7002,38 @@ mod config_view_proxy_tests {
         conf.client.master_web_addrs = vec![InetAddr::new("127.0.0.1", port)];
         conf.client.master_addrs = vec![InetAddr::new("127.0.0.1", 8995)];
         conf
+    }
+
+    #[test]
+    fn master_runtime_info_parses_self_reported_ha_fields() {
+        let info = MasterRuntimeInfo::from_json(&serde_json::json!({
+            "version": "0.2.2",
+            "version_commit": "0734f222b",
+            "start_time": "2026-11-17",
+            "start_time_ms": 1_000,
+            "is_active": true,
+            "raft_id": 1,
+            "hostname": "cv-master-0.cv-master.curvine.svc.cluster.local"
+        }));
+        assert_eq!(info.is_active, Some(true));
+        assert_eq!(info.raft_id, Some(1));
+        assert_eq!(
+            info.hostname.as_deref(),
+            Some("cv-master-0.cv-master.curvine.svc.cluster.local")
+        );
+    }
+
+    #[test]
+    fn master_runtime_info_without_self_report_keeps_none() {
+        // Older masters answer with version/start_time only; the console must
+        // fall back to its existing role logic.
+        let info = MasterRuntimeInfo::from_json(&serde_json::json!({
+            "version": "0.2.1",
+            "start_time_ms": 1_000
+        }));
+        assert_eq!(info.is_active, None);
+        assert_eq!(info.raft_id, None);
+        assert_eq!(info.hostname, None);
     }
 
     #[tokio::test]

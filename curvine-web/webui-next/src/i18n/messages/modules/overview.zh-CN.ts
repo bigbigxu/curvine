@@ -35,6 +35,7 @@ export default {
     ha: {
       title: 'Master 高可用',
       subtitle: '从集群配置发现的 Active 与 Standby Master',
+      configWarning: 'HA 探测冲突：节点自报的 Active 角色与集群配置不一致，console 集群配置可能已过期（如 pod IP 变更后未更新）。角色以节点自报为准。',
       master: 'Master',
       journal: 'Journal',
       role: '角色',
