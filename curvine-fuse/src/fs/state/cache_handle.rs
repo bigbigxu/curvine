@@ -134,7 +134,16 @@ impl CacheHandle {
     }
 
     pub async fn flush(&self, reply: Option<FuseResponse>) -> FuseResult<()> {
-        self.cache.queue_flush()?;
+        // Only writable handles own write-back data. A read-only close must not
+        // rewrite the shared inode's dirty length/mtime, or every read bumps the
+        // metadata and invalidates kernel/dcache state.
+        if self.flags.write() {
+            self.cache.queue_flush()?;
+        } else {
+            // Read-only handles own no write-back data, but a latched cache
+            // error must still surface at FLUSH like any other handle.
+            self.cache.check_error()?;
+        }
 
         if let Some(reply) = reply {
             reply.send_rep(Ok::<(), FuseError>(())).await?;
