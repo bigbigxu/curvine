@@ -42,7 +42,8 @@ use crate::router::RouterHandler;
 use crate::util::addr::{
     configured_master_addrs, display_addr_text_for_cluster, display_inet_addr_with_hint,
     display_master_endpoint, hosts_match_for_cluster_mapping, master_config_view_scrape_url,
-    master_runtime_scrape_url, resolve_display_hostname, resolve_display_ip,
+    master_phase_scrape_url, master_runtime_scrape_url, resolve_display_hostname,
+    resolve_display_ip,
 };
 use curvine_config::ClusterConf;
 use curvine_core_error::err_box;
@@ -529,7 +530,25 @@ async fn fetch_master_runtime_info_with_client(
     {
         Ok(Ok(response)) if response.status().is_success() => {
             match response.json::<Value>().await {
-                Ok(body) => MasterRuntimeInfo::from_json(&body),
+                Ok(body) => {
+                    let mut info = MasterRuntimeInfo::from_json(&body);
+                    // Not every build answers `is_active` on `/runtime` (the
+                    // field shipped on a handler no binary binds), but the
+                    // phase endpoint reports the raft role on every build that
+                    // has it, so the console never has to guess the role from
+                    // its own raft_id-to-address ordering.
+                    if info.is_active.is_none() {
+                        let (is_active, hostname) =
+                            fetch_master_phase_identity(client, conf, master_addr, raft_id).await;
+                        if info.is_active.is_none() {
+                            info.is_active = is_active;
+                        }
+                        if info.hostname.is_none() {
+                            info.hostname = hostname;
+                        }
+                    }
+                    info
+                }
                 Err(err) => {
                     log::debug!("master runtime parse failed for {url}: {err}");
                     MasterRuntimeInfo::default()
@@ -553,6 +572,91 @@ async fn fetch_master_runtime_info_with_client(
             MasterRuntimeInfo::default()
         }
     }
+}
+
+/// Identity a master publishes on `/api/v1/master/phase`: the raft role it
+/// believes it has, and the `host:web_port` it answers on.
+fn phase_identity(body: &Value) -> (Option<bool>, Option<String>) {
+    let role = body.get("role").and_then(|v| v.as_str()).map(str::trim);
+    let is_active = match role {
+        Some(role) if role.eq_ignore_ascii_case("leader") => Some(true),
+        Some(role) if role.eq_ignore_ascii_case("follower") => Some(false),
+        _ => body
+            .get("master_state")
+            .and_then(|v| v.as_str())
+            .map(|state| state.eq_ignore_ascii_case("active")),
+    };
+    let hostname = body
+        .get("node")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|node| !node.is_empty())
+        .map(|node| {
+            InetAddr::from_str(node)
+                .map(|addr| addr.hostname)
+                .unwrap_or_else(|_| node.to_string())
+        });
+    (is_active, hostname)
+}
+
+async fn fetch_master_phase_identity(
+    client: &reqwest::Client,
+    conf: &ClusterConf,
+    master_addr: &str,
+    raft_id: Option<u64>,
+) -> (Option<bool>, Option<String>) {
+    let url = master_phase_scrape_url(conf, master_addr, raft_id);
+    match timeout(
+        Duration::from_secs(MASTER_HA_PING_TIMEOUT_SECS),
+        client.get(&url).send(),
+    )
+    .await
+    {
+        Ok(Ok(response)) if response.status().is_success() => match response.json::<Value>().await {
+            Ok(body) => phase_identity(&body),
+            Err(err) => {
+                log::debug!("master phase parse failed for {url}: {err}");
+                (None, None)
+            }
+        },
+        Ok(Ok(response)) => {
+            log::debug!("master phase probe HTTP {} for {}", response.status(), url);
+            (None, None)
+        }
+        Ok(Err(err)) => {
+            log::debug!("master phase probe failed for {url}: {err}");
+            (None, None)
+        }
+        Err(_) => {
+            log::debug!("master phase probe timed out for {url}");
+            (None, None)
+        }
+    }
+}
+
+/// Address of the configured master that reports itself Active, with the
+/// runtime metadata it answered with.
+///
+/// The console's config maps raft ids to addresses by journal order, which goes
+/// stale when pod IPs are reassigned; asking each master for its own role is the
+/// only mapping that stays correct.
+async fn probe_active_master(conf: &ClusterConf) -> Option<(String, MasterRuntimeInfo)> {
+    let client = master_runtime_http_client()?;
+    let futures = configured_master_addrs(conf).into_iter().map(|addr| {
+        let client = client.clone();
+        let conf = conf.clone();
+        async move {
+            let addr_text = addr.to_string();
+            let raft_id = target_master_node_id(&conf, &addr_text);
+            let info =
+                fetch_master_runtime_info_with_client(&client, &conf, &addr_text, raft_id).await;
+            (addr_text, info)
+        }
+    });
+    futures::future::join_all(futures)
+        .await
+        .into_iter()
+        .find(|(_, info)| info.is_active == Some(true))
 }
 
 fn master_runtime_http_client() -> Option<reqwest::Client> {
@@ -991,7 +1095,20 @@ async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &Filesyst
     // console's own raft_id-to-address mapping is only a display fallback —
     // a stale console config can no longer flip the roles.
     let mut self_reported_active: Vec<String> = Vec::new();
+    let mut hostname_to_addr: HashMap<String, String> = HashMap::new();
     for (addr, addr_text, raft_id, reachable, leader_id, reachable_error, runtime) in probed {
+        // The HTTP probe answered, so the process is up even when the raft ping
+        // went out with a journal id the console config has since mislabelled.
+        let (reachable, reachable_error) = if !reachable && runtime.is_active.is_some() {
+            (true, None)
+        } else {
+            (reachable, reachable_error)
+        };
+        if let Some(hostname) = runtime.hostname.as_ref() {
+            hostname_to_addr
+                .entry(hostname.to_lowercase())
+                .or_insert_with(|| addr_text.clone());
+        }
         let display_addr = display_inet_addr_with_hint(&addr, &display_hostname);
         let journal_addr = raft_id
             .and_then(|id| journal_addr_for_id(conf, id))
@@ -1069,6 +1186,10 @@ async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &Filesyst
         }
     };
 
+    let self_reported_active_addr = InetAddr::from_str(active_master.trim())
+        .ok()
+        .and_then(|addr| hostname_to_addr.get(&addr.hostname.to_lowercase()).cloned());
+
     json!({
         "active_master": active_master,
         "active_raft_id": active_raft_id,
@@ -1077,7 +1198,9 @@ async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &Filesyst
         "active_master_display": if active_master.is_empty() {
             String::new()
         } else {
-            display_addr_text_for_cluster(&active_master_configured, conf, &active_master)
+            self_reported_active_addr.clone().unwrap_or_else(|| {
+                display_addr_text_for_cluster(&active_master_configured, conf, &active_master)
+            })
         },
         "current_master": active_master_configured.clone(),
         "configured_master": configured_master,
@@ -2293,8 +2416,18 @@ impl AdminRouterHandler {
         } else {
             "Active"
         };
-        let runtime =
-            fetch_master_runtime_info(conf, &active_master, master_info.active_raft_id).await;
+        // Show the address whose process reports itself as Active, not the
+        // address the console config happens to list at the leader's raft id.
+        let (active_master_display, runtime) = match probe_active_master(conf).await {
+            Some((addr_text, info)) => (addr_text, info),
+            None if active_master.is_empty() => {
+                (String::new(), MasterRuntimeInfo::default())
+            }
+            None => (
+                display_addr_text_for_cluster(&active_master, conf, &active_master),
+                fetch_master_runtime_info(conf, &active_master, master_info.active_raft_id).await,
+            ),
+        };
         let start_time_source = if runtime.start_time.is_some() {
             "active_master"
         } else {
@@ -2305,11 +2438,7 @@ impl AdminRouterHandler {
             "cluster_id": conf.cluster_id,
             "master_addr": display_master_endpoint(conf, &active_master),
             "active_master": active_master,
-            "active_master_display": if active_master.is_empty() {
-                String::new()
-            } else {
-                display_addr_text_for_cluster(&active_master, conf, &active_master)
-            },
+            "active_master_display": active_master_display,
             "local_hostname": resolve_display_hostname(conf, &active_master),
             // Host + port of the active master's `web_port`, where its `/metrics`
             // and profiling endpoint listen. Reported explicitly because it is
@@ -6362,6 +6491,39 @@ impl RouterHandler for AdminRouterHandler {
 
 #[cfg(test)]
 mod master_ha_tests {
+    #[test]
+    fn phase_identity_prefers_the_reported_role() {
+        let (active, host) = phase_identity(&json!({
+            "role": "Leader",
+            "node": "cv-master-2.cv-master.curvine.svc.cluster.local:9001",
+            "master_state": "Standby",
+        }));
+        assert_eq!(active, Some(true));
+        assert_eq!(
+            host.as_deref(),
+            Some("cv-master-2.cv-master.curvine.svc.cluster.local")
+        );
+
+        let (active, host) =
+            phase_identity(&json!({"role": "Follower", "node": "10.209.150.227:9001"}));
+        assert_eq!(active, Some(false));
+        assert_eq!(host.as_deref(), Some("10.209.150.227"));
+    }
+
+    #[test]
+    fn phase_identity_falls_back_to_master_state_then_gives_up() {
+        assert_eq!(
+            phase_identity(&json!({"master_state": "Active"})),
+            (Some(true), None)
+        );
+        assert_eq!(
+            phase_identity(&json!({"master_state": "Standby"})),
+            (Some(false), None)
+        );
+        assert_eq!(phase_identity(&json!({})), (None, None));
+        assert_eq!(phase_identity(&json!({"role": "Unknown"})), (None, None));
+    }
+
     use super::*;
     use curvine_config::{ClientConf, MasterConf, RaftPeer};
 

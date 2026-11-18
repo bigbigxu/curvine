@@ -492,6 +492,20 @@ pub fn master_runtime_scrape_url(
     )
 }
 
+/// HTTP URL for master `/api/v1/master/phase`, which self-reports the raft
+/// role this process believes it has (`Leader` / `Follower`).
+pub fn master_phase_scrape_url(
+    conf: &ClusterConf,
+    master_addr: &str,
+    raft_id: Option<u64>,
+) -> String {
+    format!(
+        "http://{}:{}/api/v1/master/phase",
+        resolve_master_scrape_hostname(conf, master_addr, raft_id),
+        master_scrape_web_port(conf, master_addr, raft_id)
+    )
+}
+
 /// HTTP URL for the master's published effective configuration view.
 ///
 /// This is the full view (`values` + `sources` + `runtime` + `writable`), not the
