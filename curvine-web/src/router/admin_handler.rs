@@ -425,6 +425,119 @@ fn worker_payload(worker: WorkerInfo, state: &str) -> Value {
     })
 }
 
+/// The master's self-reported service phase, as the console needs it.
+///
+/// Everything here comes from `GET /api/v1/master/phase`, which is served by the
+/// web port and therefore stays available while a master replays its journal or
+/// waits for an election -- exactly when the RPC port is closed. A node that
+/// predates the endpoint reports nothing, and the console shows no timeline
+/// instead of a fabricated one.
+#[derive(Clone, Debug, Default)]
+struct MasterPhaseInfo {
+    phase: Option<String>,
+    blocking_on: Option<String>,
+    detail: Option<String>,
+    needs_operator: bool,
+    stalled: bool,
+    estimating: bool,
+    denominator: Option<String>,
+    progress_current: Option<u64>,
+    progress_total: Option<u64>,
+    progress_ratio: Option<f64>,
+    lag: Option<u64>,
+    ufs_lag: Option<u64>,
+    apply_rate: Option<f64>,
+    eta_secs: Option<f64>,
+    applied: Option<u64>,
+    committed: Option<u64>,
+    entered_at_ms: Option<u64>,
+    observed_at_ms: Option<u64>,
+}
+
+impl MasterPhaseInfo {
+    fn from_json(value: &Value) -> Self {
+        let text = |key: &str| {
+            value
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        };
+        let number = |key: &str| value.get(key).and_then(|v| v.as_f64());
+        let unsigned = |key: &str| value.get(key).and_then(|v| v.as_u64());
+        let flag = |key: &str| value.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let progress = value.get("progress");
+        let progress_unsigned =
+            |key: &str| progress.and_then(|p| p.get(key)).and_then(|v| v.as_u64());
+        let reason = value.get("reason");
+
+        Self {
+            phase: text("phase"),
+            blocking_on: reason
+                .and_then(|r| r.get("blocking_on"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            detail: reason
+                .and_then(|r| r.get("detail"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            needs_operator: reason
+                .and_then(|r| r.get("needs_operator"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            stalled: flag("stalled"),
+            estimating: flag("estimating"),
+            denominator: progress
+                .and_then(|p| p.get("denominator"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            progress_current: progress_unsigned("current"),
+            progress_total: progress_unsigned("total"),
+            progress_ratio: progress
+                .and_then(|p| p.get("ratio"))
+                .and_then(|v| v.as_f64()),
+            lag: unsigned("lag"),
+            ufs_lag: unsigned("ufs_lag"),
+            apply_rate: number("rate").or_else(|| {
+                value
+                    .get("rate")
+                    .and_then(|r| r.get("entries_per_sec"))
+                    .and_then(|v| v.as_f64())
+            }),
+            eta_secs: number("eta_secs"),
+            applied: unsigned("applied"),
+            committed: unsigned("committed"),
+            entered_at_ms: unsigned("entered_at_ms"),
+            observed_at_ms: unsigned("observed_at_ms"),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "phase": self.phase,
+            "blocking_on": self.blocking_on,
+            "detail": self.detail,
+            "needs_operator": self.needs_operator,
+            "stalled": self.stalled,
+            "estimating": self.estimating,
+            "denominator": self.denominator,
+            "progress_current": self.progress_current,
+            "progress_total": self.progress_total,
+            "progress_ratio": self.progress_ratio,
+            "lag": self.lag,
+            "ufs_lag": self.ufs_lag,
+            "apply_rate": self.apply_rate,
+            "eta_secs": self.eta_secs,
+            "applied": self.applied,
+            "committed": self.committed,
+            "entered_at_ms": self.entered_at_ms,
+            "observed_at_ms": self.observed_at_ms,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct MasterRuntimeInfo {
     version: Option<String>,
@@ -508,7 +621,7 @@ async fn fetch_master_runtime_info(
         Ok(client) => client,
         Err(_) => return MasterRuntimeInfo::default(),
     };
-    fetch_master_runtime_info_with_client(&client, conf, master_addr, raft_id).await
+    fetch_master_runtime_info_with_client(&client, conf, master_addr, raft_id, None).await
 }
 
 async fn fetch_master_runtime_info_with_client(
@@ -516,6 +629,7 @@ async fn fetch_master_runtime_info_with_client(
     conf: &ClusterConf,
     master_addr: &str,
     raft_id: Option<u64>,
+    phase_body: Option<&Value>,
 ) -> MasterRuntimeInfo {
     let master_addr = master_addr.trim();
     if master_addr.is_empty() {
@@ -538,8 +652,13 @@ async fn fetch_master_runtime_info_with_client(
                     // has it, so the console never has to guess the role from
                     // its own raft_id-to-address ordering.
                     if info.is_active.is_none() {
-                        let (is_active, hostname) =
-                            fetch_master_phase_identity(client, conf, master_addr, raft_id).await;
+                        let (is_active, hostname) = match phase_body {
+                            Some(body) => phase_identity(body),
+                            None => {
+                                fetch_master_phase_identity(client, conf, master_addr, raft_id)
+                                    .await
+                            }
+                        };
                         if info.is_active.is_none() {
                             info.is_active = is_active;
                         }
@@ -599,38 +718,67 @@ fn phase_identity(body: &Value) -> (Option<bool>, Option<String>) {
     (is_active, hostname)
 }
 
+/// One master's `GET /api/v1/master/phase`, body as published.
+///
+/// `None` when the master is unreachable or predates `/phase`. The ops token
+/// from the console's own configuration is forwarded, because `/phase` honours
+/// the same gate as the ops endpoints.
+async fn fetch_master_phase_body(
+    client: &reqwest::Client,
+    conf: &ClusterConf,
+    master_addr: &str,
+    raft_id: Option<u64>,
+) -> Option<Value> {
+    let master_addr = master_addr.trim();
+    if master_addr.is_empty() {
+        return None;
+    }
+    let url = master_phase_scrape_url(conf, master_addr, raft_id);
+    let mut request = client.get(&url);
+    if let Some(token) = conf.master.ops_token.as_deref().map(str::trim) {
+        if !token.is_empty() {
+            request = request.header("x-curvine-ops-token", token);
+        }
+    }
+    match timeout(
+        Duration::from_secs(MASTER_HA_PING_TIMEOUT_SECS),
+        request.send(),
+    )
+    .await
+    {
+        Ok(Ok(response)) if response.status().is_success() => {
+            match response.json::<Value>().await {
+                Ok(body) => Some(body),
+                Err(err) => {
+                    log::debug!("master phase parse failed for {url}: {err}");
+                    None
+                }
+            }
+        }
+        Ok(Ok(response)) => {
+            log::debug!("master phase probe HTTP {} for {}", response.status(), url);
+            None
+        }
+        Ok(Err(err)) => {
+            log::debug!("master phase probe failed for {url}: {err}");
+            None
+        }
+        Err(_) => {
+            log::debug!("master phase probe timed out for {url}");
+            None
+        }
+    }
+}
+
 async fn fetch_master_phase_identity(
     client: &reqwest::Client,
     conf: &ClusterConf,
     master_addr: &str,
     raft_id: Option<u64>,
 ) -> (Option<bool>, Option<String>) {
-    let url = master_phase_scrape_url(conf, master_addr, raft_id);
-    match timeout(
-        Duration::from_secs(MASTER_HA_PING_TIMEOUT_SECS),
-        client.get(&url).send(),
-    )
-    .await
-    {
-        Ok(Ok(response)) if response.status().is_success() => match response.json::<Value>().await {
-            Ok(body) => phase_identity(&body),
-            Err(err) => {
-                log::debug!("master phase parse failed for {url}: {err}");
-                (None, None)
-            }
-        },
-        Ok(Ok(response)) => {
-            log::debug!("master phase probe HTTP {} for {}", response.status(), url);
-            (None, None)
-        }
-        Ok(Err(err)) => {
-            log::debug!("master phase probe failed for {url}: {err}");
-            (None, None)
-        }
-        Err(_) => {
-            log::debug!("master phase probe timed out for {url}");
-            (None, None)
-        }
+    match fetch_master_phase_body(client, conf, master_addr, raft_id).await {
+        Some(body) => phase_identity(&body),
+        None => (None, None),
     }
 }
 
@@ -649,7 +797,8 @@ async fn probe_active_master(conf: &ClusterConf) -> Option<(String, MasterRuntim
             let addr_text = addr.to_string();
             let raft_id = target_master_node_id(&conf, &addr_text);
             let info =
-                fetch_master_runtime_info_with_client(&client, &conf, &addr_text, raft_id).await;
+                fetch_master_runtime_info_with_client(&client, &conf, &addr_text, raft_id, None)
+                    .await;
             (addr_text, info)
         }
     });
@@ -1070,11 +1219,24 @@ async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &Filesyst
                     Some("master address cannot be mapped to a raft node".to_string()),
                 ),
             };
-            let runtime = match http_client.as_ref() {
+            // One `/phase` fetch feeds both the role identity (older builds do
+            // not report it on `/runtime`) and the timeline, so the console does
+            // not ask the same endpoint twice.
+            let (runtime, phase) = match http_client.as_ref() {
                 Some(client) => {
-                    fetch_master_runtime_info_with_client(client, &conf, &addr_text, raft_id).await
+                    let body = fetch_master_phase_body(client, &conf, &addr_text, raft_id).await;
+                    let runtime = fetch_master_runtime_info_with_client(
+                        client,
+                        &conf,
+                        &addr_text,
+                        raft_id,
+                        body.as_ref(),
+                    )
+                    .await;
+                    let phase = body.as_ref().map(MasterPhaseInfo::from_json);
+                    (runtime, phase)
                 }
-                None => MasterRuntimeInfo::default(),
+                None => (MasterRuntimeInfo::default(), None),
             };
             (
                 addr,
@@ -1084,6 +1246,7 @@ async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &Filesyst
                 leader_id,
                 reachable_error,
                 runtime,
+                phase,
             )
         });
     }
@@ -1096,7 +1259,9 @@ async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &Filesyst
     // a stale console config can no longer flip the roles.
     let mut self_reported_active: Vec<String> = Vec::new();
     let mut hostname_to_addr: HashMap<String, String> = HashMap::new();
-    for (addr, addr_text, raft_id, reachable, leader_id, reachable_error, runtime) in probed {
+    let mut active_phase: Option<Value> = None;
+    for (addr, addr_text, raft_id, reachable, leader_id, reachable_error, runtime, phase) in probed
+    {
         // The HTTP probe answered, so the process is up even when the raft ping
         // went out with a journal id the console config has since mislabelled.
         let (reachable, reachable_error) = if !reachable && runtime.is_active.is_some() {
@@ -1121,7 +1286,13 @@ async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &Filesyst
             None => match (active_raft_id, node_raft_id) {
                 (Some(active_id), Some(node_id)) => active_id == node_id,
                 _ if active_master.is_empty() => false,
-                _ => master_is_active_target(conf, &active_master, active_raft_id, &addr_text, raft_id),
+                _ => master_is_active_target(
+                    conf,
+                    &active_master,
+                    active_raft_id,
+                    &addr_text,
+                    raft_id,
+                ),
             },
         };
         let role = if active_master.is_empty() && runtime.is_active.is_none() {
@@ -1131,6 +1302,12 @@ async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &Filesyst
         } else {
             "Standby"
         };
+        // Phase of the node the console considers active, for the summary card;
+        // the per-node value stays in `nodes`.
+        let phase_json = phase.as_ref().map(MasterPhaseInfo::to_json);
+        if is_current {
+            active_phase = phase_json.clone();
+        }
 
         if runtime.is_active == Some(true) {
             if let Some(hostname) = runtime.hostname.as_ref() {
@@ -1155,6 +1332,9 @@ async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &Filesyst
             "start_time": runtime.start_time_json(),
             "start_time_ms": runtime.start_time_ms_json(),
             "self_reported_role": runtime.is_active.map(|active| json!(if active { "Active" } else { "Standby" })).unwrap_or(Value::Null),
+            // `null` on a master that is unreachable or older than /phase, so the
+            // console renders "unknown" instead of guessing a state.
+            "phase": phase_json.unwrap_or(Value::Null),
         }));
     }
 
@@ -1205,6 +1385,7 @@ async fn master_ha_payload(instance: &AdminRouterHandler, master_info: &Filesyst
         "current_master": active_master_configured.clone(),
         "configured_master": configured_master,
         "local_hostname": display_hostname,
+        "active_phase": active_phase,
         "journal_nodes": master_info.journal_nodes.clone(),
         "nodes": nodes,
         "failover_supported": failover_supported,
@@ -2420,9 +2601,7 @@ impl AdminRouterHandler {
         // address the console config happens to list at the leader's raft id.
         let (active_master_display, runtime) = match probe_active_master(conf).await {
             Some((addr_text, info)) => (addr_text, info),
-            None if active_master.is_empty() => {
-                (String::new(), MasterRuntimeInfo::default())
-            }
+            None if active_master.is_empty() => (String::new(), MasterRuntimeInfo::default()),
             None => (
                 display_addr_text_for_cluster(&active_master, conf, &active_master),
                 fetch_master_runtime_info(conf, &active_master, master_info.active_raft_id).await,
@@ -5059,9 +5238,7 @@ async fn dir_space_summary_item(
 
     // Per-item probe pass: one isolated retry for this path only.
     match client.get_content_summary_cv(&fs_path).await {
-        Ok(summary) if summary.snapshot.is_some() => {
-            dir_space_ready_item(&path, &summary)
-        }
+        Ok(summary) if summary.snapshot.is_some() => dir_space_ready_item(&path, &summary),
         Ok(_) => json!({ "path": path, "state": "pending" }),
         Err(err) if dir_space_probe_is_pending(&err) => {
             json!({ "path": path, "state": "pending" })
@@ -6492,6 +6669,67 @@ impl RouterHandler for AdminRouterHandler {
 #[cfg(test)]
 mod master_ha_tests {
     #[test]
+    /// Shape taken from a live `GET /api/v1/master/phase` during a journal
+    /// replay: the console must be able to draw a timeline for a master whose
+    /// RPC port is still closed.
+    #[test]
+    fn master_phase_payload_round_trips() {
+        let body = json!({
+            "node": "cv-master-1:9001",
+            "phase": "Replaying",
+            "phase_code": 2,
+            "role": "Init",
+            "term": 0,
+            "applied": 1200,
+            "committed": 5000,
+            "lag": 3800,
+            "progress": {
+                "current": 200, "total": 4000, "unit": "entries",
+                "denominator": "static", "ratio": 0.05
+            },
+            "rate": {"entries_per_sec": 200.0, "samples": 12, "window_ms": 4000},
+            "eta_secs": 19.0,
+            "estimating": false,
+            "stalled": false,
+            "ufs_lag": 0,
+            "reason": {
+                "blocking_on": "replaying",
+                "detail": "applying committed journal entries",
+                "needs_operator": false,
+                "since_ms": 1
+            },
+            "entered_at_ms": 1,
+            "observed_at_ms": 2
+        });
+
+        let info = MasterPhaseInfo::from_json(&body);
+        assert_eq!(info.phase.as_deref(), Some("Replaying"));
+        assert_eq!(info.blocking_on.as_deref(), Some("replaying"));
+        assert_eq!(info.progress_current, Some(200));
+        assert_eq!(info.progress_total, Some(4000));
+        assert_eq!(info.progress_ratio, Some(0.05));
+        assert_eq!(info.lag, Some(3800));
+        assert_eq!(info.apply_rate, Some(200.0));
+        assert_eq!(info.eta_secs, Some(19.0));
+        assert!(!info.needs_operator);
+
+        let again = info.to_json();
+        assert_eq!(again["phase"], json!("Replaying"));
+        assert_eq!(again["progress_ratio"], json!(0.05));
+    }
+
+    /// An older master answers 404 and an unreachable one times out; both must
+    /// land on "no phase" rather than a fabricated state.
+    #[test]
+    fn absent_phase_is_null_not_a_guess() {
+        let info = MasterPhaseInfo::from_json(&json!({}));
+        assert!(info.phase.is_none());
+        assert_eq!(info.to_json()["phase"], Value::Null);
+
+        let old = MasterPhaseInfo::from_json(&json!({"error": "not found"}));
+        assert!(old.phase.is_none());
+    }
+
     fn phase_identity_prefers_the_reported_role() {
         let (active, host) = phase_identity(&json!({
             "role": "Leader",

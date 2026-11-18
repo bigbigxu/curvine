@@ -30,7 +30,8 @@ export default {
       activeMaster: '当前 Master',
       version: '版本',
       startTime: '启动时间',
-      blockTotal: '块总数'
+      blockTotal: '块总数',
+      phase: '服务阶段'
     },
     ha: {
       title: 'Master 高可用',
@@ -39,6 +40,7 @@ export default {
       master: 'Master',
       journal: 'Journal',
       role: '角色',
+      phase: '阶段',
       version: '版本',
       startTime: '启动时间',
       reachable: '可达性',
@@ -53,6 +55,30 @@ export default {
     role: {
       active: 'Active',
       standby: 'Standby'
+    },
+    // 服务阶段：启动 → 回放 → 追平 → 服务，与 /api/v1/master/phase 一一对应。
+    phase: {
+      starting: '启动',
+      replaying: '回放中',
+      catchingUp: '追平中',
+      serving: '服务中',
+      standingBy: '备节点',
+      quarantined: '隔离恢复',
+      safeMode: '安全模式',
+      exiting: '已退出',
+      needsOperator: '需要人工介入'
+    },
+    blocking: {
+      none: '无阻塞',
+      replaying: '正在回放日志',
+      awaiting_role: '等待选主',
+      awaitingLeader: '等待选主',
+      catching_up: '正在追平已提交日志',
+      not_leader: '备节点，由 Active 提供服务',
+      quarantined: '正在从健康节点重建本地状态',
+      ufs_replay_pending: '等待 UFS 导出追平',
+      safe_mode_damage: '本地元数据损坏',
+      exiting: '进程正在退出'
     },
     tooltips: {
       failoverUnavailable: '故障转移 API 不可用',

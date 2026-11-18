@@ -1056,6 +1056,64 @@ describe('Console shell', () => {
     expect(client.downloadFile).not.toHaveBeenCalled()
   })
 
+  it('shows the master phase timeline for each HA node and for the active master', async () => {
+    const client = createStubClient({
+      fetchMasterHa: vi.fn(async () => ({
+        nodes: [
+          {
+            addr: 'master-01:8995',
+            display_addr: 'master-01:8995',
+            role: 'Active',
+            reachable: true,
+            current: true,
+            phase: {
+              phase: 'Replaying',
+              blocking_on: 'replaying',
+              detail: 'applying committed journal entries',
+              progress_current: 1200,
+              progress_total: 5000,
+              progress_ratio: 0.24,
+              apply_rate: 900
+            }
+          },
+          {
+            addr: 'master-02:8995',
+            display_addr: 'master-02:8995',
+            role: 'Standby',
+            reachable: true,
+            phase: { phase: 'SafeMode', blocking_on: 'safe_mode_damage', needs_operator: true }
+          },
+          {
+            // An older build: no phase endpoint, so the cell must stay empty
+            // instead of showing an invented state.
+            addr: 'master-03:8995',
+            display_addr: 'master-03:8995',
+            role: 'Standby',
+            reachable: true,
+            phase: null
+          }
+        ],
+        active_phase: { phase: 'Replaying', blocking_on: 'replaying' },
+        failover_supported: true
+      }))
+    })
+
+    renderApp('/overview', client)
+
+    // Per-node timelines, keyed by address.
+    const active = await screen.findByTestId('overview-ha-phase-master-01:8995')
+    expect(active.querySelectorAll('[data-stage]').length).toBe(4)
+    expect(active.querySelectorAll('[data-state="done"]').length).toBe(1)
+
+    const damaged = screen.getByTestId('overview-ha-phase-master-02:8995')
+    expect(damaged.querySelectorAll('[data-state="problem"]').length).toBe(1)
+
+    expect(screen.queryByTestId('overview-ha-phase-master-03:8995')).toBeNull()
+
+    // The active master summary card carries the same phase.
+    expect(screen.getByTestId('overview-master-phase')).toBeInTheDocument()
+  })
+
   it('switches the theme from the topbar and remembers the choice', async () => {
     // Start from a clean slate: the storage and the <html> class are shared
     // across the cases in this file.

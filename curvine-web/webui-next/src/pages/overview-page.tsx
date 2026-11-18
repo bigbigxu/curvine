@@ -5,6 +5,7 @@ import type { MasterHaData, MasterHaNode, OverviewData } from '@/api/types'
 import { DetailList, DetailRow } from '@/components/detail-list'
 import { ErrorAlert } from '@/components/data-state'
 import { Meter } from '@/components/meter'
+import { MasterPhaseTimeline } from '@/components/master-phase-timeline'
 import { MetricCard, type MetricTone } from '@/components/metric-card'
 import { PageHeader } from '@/components/page-header'
 import { ProfileDialog } from '@/pages/profile-dialog'
@@ -114,6 +115,13 @@ export function OverviewPage() {
   }, [data, setFromOverview])
 
   const masterNodes: MasterHaNode[] = Array.isArray(masterHa.nodes) ? masterHa.nodes : []
+  // Phase of the active master: reported by the node itself, so a master that is
+  // still replaying or waiting for an election still shows a timeline.
+  const activePhase =
+    masterHa.active_phase ??
+    masterNodes.find((node) => node.current)?.phase ??
+    masterNodes.find((node) => node.role === 'Active')?.phase ??
+    null
   const activeMaster =
     masterHa.active_master_configured ||
     masterHa.active_master ||
@@ -341,6 +349,14 @@ export function OverviewPage() {
               <DetailRow label={t('overview.masterDetails.activeMaster')}>
                 {activeMasterDisplay || '-'}
               </DetailRow>
+              <DetailRow label={t('overview.masterDetails.phase')}>
+                <MasterPhaseTimeline
+                  phase={activePhase?.phase}
+                  info={activePhase}
+                  label={t}
+                  testId="overview-master-phase"
+                />
+              </DetailRow>
               <DetailRow label={t('overview.masterDetails.version')}>
                 <span>{overview.version || t('common.notReported')}</span>
                 {overview.version_commit && (
@@ -393,6 +409,7 @@ export function OverviewPage() {
             t('overview.ha.master'),
             t('overview.ha.journal'),
             t('overview.ha.role'),
+            t('overview.ha.phase'),
             t('overview.ha.version'),
             t('overview.ha.startTime'),
             t('overview.ha.reachable'),
@@ -408,6 +425,20 @@ export function OverviewPage() {
                   value={translateRole(t, node.role || '')}
                   tone={node.role === 'Active' ? 'positive' : node.role === 'Standby' ? 'warning' : 'neutral'}
                 />
+              </TableCell>
+              <TableCell>
+                {/* A node that answered without a phase (unreachable or older
+                    build) keeps an empty cell rather than a fake timeline. */}
+                {node.phase?.phase ? (
+                  <MasterPhaseTimeline
+                    phase={node.phase.phase}
+                    info={node.phase}
+                    label={t}
+                    testId={`overview-ha-phase-${node.addr}`}
+                  />
+                ) : (
+                  <span className="text-xs text-muted-foreground">-</span>
+                )}
               </TableCell>
               <TableCell className="text-muted-foreground">
                 {node.version || t('common.notReported')}

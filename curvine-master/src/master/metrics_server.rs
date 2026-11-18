@@ -271,9 +271,15 @@ fn replay_progress(
     };
     // Below a few samples the window is dominated by the first batch, so say so
     // instead of showing a number that will change by an order of magnitude.
-    let estimating = stall
-        || (eta_secs.is_none() && remaining > 0)
-        || rate.is_none_or(|rate| rate.samples < RATE_MIN_SAMPLES);
+    // Nothing left to do is not an estimate: an idle, caught-up master must not
+    // claim it is still working one out.
+    let estimating = if remaining == 0 && !stall {
+        false
+    } else {
+        stall
+            || (eta_secs.is_none() && remaining > 0)
+            || rate.is_none_or(|rate| rate.samples < RATE_MIN_SAMPLES)
+    };
 
     (progress, eta_secs, estimating)
 }
@@ -1305,6 +1311,11 @@ mod tests {
             let progress = progress_for(phase, 5_000, 5_000, 1_000);
             assert_eq!(progress["ratio"], json!(1.0), "{phase:?}");
             assert_eq!(progress["current"], json!(4_000));
+
+            // A caught-up master is not "estimating" anything.
+            let (_, eta, estimating) = replay_progress(phase, 5_000, 5_000, 1_000, None, false);
+            assert_eq!(eta, None);
+            assert!(!estimating, "{phase:?}");
         }
 
         // A brand new master has nothing to replay and must not divide by zero.

@@ -30,7 +30,8 @@ export default {
       activeMaster: 'Active Master',
       version: 'Version',
       startTime: 'Start Time',
-      blockTotal: 'Block Total'
+      blockTotal: 'Block Total',
+      phase: 'Phase'
     },
     ha: {
       title: 'Master HA',
@@ -39,6 +40,7 @@ export default {
       master: 'Master',
       journal: 'Journal',
       role: 'Role',
+      phase: 'Phase',
       version: 'Version',
       startTime: 'Start Time',
       reachable: 'Reachable',
@@ -53,6 +55,31 @@ export default {
     role: {
       active: 'Active',
       standby: 'Standby'
+    },
+    // Service phase: start -> replay -> catch up -> serving, matching
+    // /api/v1/master/phase.
+    phase: {
+      starting: 'Starting',
+      replaying: 'Replaying',
+      catchingUp: 'Catching up',
+      serving: 'Serving',
+      standingBy: 'Standby',
+      quarantined: 'Rebuilding',
+      safeMode: 'Safe mode',
+      exiting: 'Exited',
+      needsOperator: 'needs operator'
+    },
+    blocking: {
+      none: 'nothing blocking',
+      replaying: 'replaying the journal',
+      awaiting_role: 'waiting for an election',
+      awaitingLeader: 'waiting for an election',
+      catching_up: 'applying the committed tail',
+      not_leader: 'standby; the active master serves',
+      quarantined: 'rebuilding local state from a peer',
+      ufs_replay_pending: 'waiting for UFS exports',
+      safe_mode_damage: 'local metadata is damaged',
+      exiting: 'the process is going away'
     },
     tooltips: {
       failoverUnavailable: 'Failover API is unavailable',

@@ -43,6 +43,34 @@ export interface OverviewData {
   [key: string]: unknown
 }
 
+/**
+ * A master's self-reported phase from `GET /api/v1/master/phase`.
+ *
+ * Present on builds that expose the phase endpoint; `null` for an unreachable
+ * master or an older build, which the console renders as "unknown" instead of
+ * guessing a state.
+ */
+export interface MasterPhaseInfo {
+  phase?: string | null
+  blocking_on?: string | null
+  detail?: string | null
+  needs_operator?: boolean
+  stalled?: boolean
+  estimating?: boolean
+  denominator?: string | null
+  progress_current?: number | null
+  progress_total?: number | null
+  progress_ratio?: number | null
+  lag?: number | null
+  ufs_lag?: number | null
+  apply_rate?: number | null
+  eta_secs?: number | null
+  applied?: number | null
+  committed?: number | null
+  entered_at_ms?: number | null
+  observed_at_ms?: number | null
+}
+
 export interface MasterHaNode {
   addr: string
   display_addr?: string | null
@@ -57,10 +85,14 @@ export interface MasterHaNode {
   raft_id?: number | null
   /** Role reported by the master itself; null on builds without self-report. */
   self_reported_role?: string | null
+  /** Service phase; null when the master is unreachable or predates /phase. */
+  phase?: MasterPhaseInfo | null
 }
 
 export interface MasterHaData {
   nodes?: MasterHaNode[]
+  /** Phase of the node the console considers active, for the summary card. */
+  active_phase?: MasterPhaseInfo | null
   active_master?: string | null
   active_master_configured?: string | null
   active_master_display?: string | null
