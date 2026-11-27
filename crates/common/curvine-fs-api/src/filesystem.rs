@@ -94,7 +94,10 @@ pub trait FileSystem<Writer, Reader> {
                 .map(ProtoUtils::file_status_to_pb)
                 .collect();
 
-            let rep = ListOptionsResponse { statuses };
+            let rep = ListOptionsResponse {
+                statuses,
+                has_more: None,
+            };
             Ok(ProtoUtils::encode(rep)?)
         }
     }

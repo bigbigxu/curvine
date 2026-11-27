@@ -1418,6 +1418,30 @@ impl MasterFilesystem {
         }
     }
 
+    /// Lists one page plus whether more entries follow it. The page can be
+    /// shorter than `limit` when `/.Trash` staging dirs were hidden, so the
+    /// caller cannot infer the end from its length; a one-entry probe after the
+    /// last visible name answers it instead.
+    pub fn list_options_page<T: AsRef<str>>(
+        &self,
+        path: T,
+        opts: ListOptions,
+    ) -> FsResult<(Vec<FileStatus>, bool)> {
+        let path = path.as_ref();
+        let page = self.list_options(path, opts.clone())?;
+        let has_more = match (opts.limit, page.last()) {
+            (None, _) | (_, None) => false,
+            (Some(_), Some(last)) => {
+                let probe = ListOptions {
+                    limit: Some(1),
+                    start_after: Some(last.name.clone()),
+                };
+                !self.list_options(path, probe)?.is_empty()
+            }
+        };
+        Ok((page, has_more))
+    }
+
     /// Resolves a client-supplied path. `/.Trash/.pending` and
     /// `/.Trash/.purging` are master-owned staging for deletes and reclamation,
     /// so they resolve as missing: clients can neither stat, list, open, rename
@@ -7136,6 +7160,65 @@ mod tests {
 
         // The staged entry is still drained by the purger.
         assert_eq!(fs.scan_pending_trash(16, None).unwrap().paths.len(), 1);
+    }
+
+    // `/.Trash` can return a page shorter than `limit` after hiding staging
+    // dirs, so `has_more` answers directly instead of letting clients infer the
+    // end from the page length.
+    #[test]
+    fn list_options_page_reports_more_past_hidden_staging_dirs() {
+        let fs = test_fs_with_trash("list-page-more");
+        for i in 1..=25 {
+            seed_trash_entry(&fs, &format!("1700000000000-{:02}", i));
+        }
+        {
+            let mut fs_dir = fs.fs_dir.write();
+            for staging in [trash::TRASH_PENDING_ROOT, trash::TRASH_PURGING_ROOT] {
+                let inp = InodePath::resolve(fs_dir.root_ptr(), staging, &fs_dir.store).unwrap();
+                fs_dir.mkdir(inp, MkdirOpts::with_create(false)).unwrap();
+            }
+        }
+
+        let mut listed = Vec::new();
+        let mut more = Vec::new();
+        let mut start_after = None;
+        loop {
+            let (page, has_more) = fs
+                .list_options_page(
+                    trash::TRASH_ROOT,
+                    ListOptions {
+                        limit: Some(10),
+                        start_after: start_after.clone(),
+                    },
+                )
+                .unwrap();
+            assert!(
+                !page
+                    .iter()
+                    .any(|s| s.name == trash::TRASH_PENDING_NAME
+                        || s.name == trash::TRASH_PURGING_NAME),
+                "staging dirs must stay hidden"
+            );
+            more.push(has_more);
+            if page.is_empty() {
+                break;
+            }
+            start_after = page.last().map(|s| s.name.clone());
+            listed.extend(page.into_iter().map(|s| s.name));
+            if !has_more {
+                break;
+            }
+        }
+
+        let expected: Vec<String> = (1..=25)
+            .map(|i| format!("1700000000000-{:02}", i))
+            .collect();
+        assert_eq!(listed, expected);
+        assert_eq!(
+            more,
+            vec![true, true, false],
+            "the first page is short because both staging dirs were hidden"
+        );
     }
 
     // A blocking empty-trash owns `/.Trash/.pending` from the staging rename to

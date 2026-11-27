@@ -305,6 +305,14 @@ impl CurvineFileSystem {
         self.fs_client.list_options(path, opts).await
     }
 
+    pub async fn list_options_page(
+        &self,
+        path: &Path,
+        opts: ListOptions,
+    ) -> FsResult<(Vec<FileStatus>, Option<bool>)> {
+        self.fs_client.list_options_page(path, opts).await
+    }
+
     pub async fn list_stream(&self, path: &Path, options: ListOptions) -> FsResult<ListStream> {
         let fs = self.clone();
         let path = path.clone();
@@ -316,7 +324,7 @@ impl CurvineFileSystem {
                     limit,
                     start_after: start_after.clone(),
                 };
-                let list = match fs.list_options(&path, options).await {
+                let (list, has_more) = match fs.list_options_page(&path, options).await {
                     Ok(p) => p,
                     Err(e) => {
                         yield Err(e);
@@ -324,20 +332,20 @@ impl CurvineFileSystem {
                     }
                 };
 
+                // A short page is not EOF: the master hides trash staging
+                // entries after truncating. `has_more` answers directly; older
+                // masters omit it, so keep paging until an empty page.
                 if list.is_empty() {
                     break;
                 }
 
-                let n = list.len();
                 let last_name = list.last().map(|s| s.name.clone());
                 for status in list {
                     yield Ok(status);
                 }
 
-                if let Some(l) = limit {
-                    if n < l {
-                        break;
-                    }
+                if has_more == Some(false) {
+                    break;
                 }
                 start_after = last_name;
             }
